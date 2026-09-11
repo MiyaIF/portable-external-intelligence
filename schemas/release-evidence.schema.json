@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["evidence_type", "subject_commit_sha", "manifest_sha256", "workflow_sha256", "certification_sha256"],
+      "properties": {
+        "evidence_type": {"const": "subject_manifest"},
+        "subject_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "workflow_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "certification_sha256": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}}
+      },
+      "not": {"required": ["evidence_commit_sha"]},
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["evidence_type", "subject_commit_sha", "evidence_commit_sha", "manifest_sha256", "workflow_sha256", "certification_sha256", "attested_at"],
+      "properties": {
+        "evidence_type": {"const": "post_push_attestation"},
+        "subject_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "evidence_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "manifest_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "workflow_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "certification_sha256": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+        "attested_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    {
+      "$ref": "release-evidence-index.schema.json"
+    }
+  ]
+}

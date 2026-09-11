@@ -1,0 +1,4 @@
+# Reproducible build and lock-generation toolchain.
+setuptools==84.0.0
+pip-tools==7.6.1
+pip-tools==7.6.1

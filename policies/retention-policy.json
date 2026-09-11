@@ -1,0 +1,9 @@
+{
+  "schema_version": 2,
+  "candidate_retention_days": 180,
+  "superseded_unused_days": 90,
+  "deprecated_unused_days": 365,
+  "tombstone_retention_days": 365,
+  "block_auto_tombstone_when": ["pinned", "legal_hold", "unresolved_contradictions"],
+  "history_policy": "append_only_no_physical_event_deletion"
+}

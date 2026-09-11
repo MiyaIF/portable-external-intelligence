@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "hosts": {
+    "codex-cli": {
+      "host_id": "codex-cli",
+      "display_name": "Codex CLI",
+      "host_family": "codex-compatible",
+      "adapter_id": "codex-cli",
+      "executable_names": ["codex"],
+      "hook_config_path": "hooks.json",
+      "global_context_path": "AGENTS.md",
+      "skill_roots": ["../.agents/skills"],
+      "event_mapping": {
+        "SessionStart": "session.start",
+        "UserPromptSubmit": "prompt.before",
+        "Stop": "turn.stop",
+        "SessionEnd": "session.end"
+      },
+      "hook_feature_key": "features.hooks",
+      "hook_feature_default": false,
+      "skill_activation_mode": "AUTO_ALLOWED",
+      "capture_primary_path": "HOOK_DIRECT",
+      "capture_order": ["HOOK_DIRECT", "AGENT_SKILL", "NATIVE_SOURCE"],
+      "minimum_supported_version": "0.1.0"
+    },
+    "claude-code": {
+      "host_id": "claude-code",
+      "display_name": "Claude Code",
+      "host_family": "claude-compatible",
+      "adapter_id": "claude-code",
+      "executable_names": ["claude"],
+      "hook_config_path": "settings.json",
+      "global_context_path": "CLAUDE.md",
+      "skill_roots": ["skills"],
+      "event_mapping": {
+        "SessionStart": "session.start",
+        "UserPromptSubmit": "prompt.before",
+        "Stop": "turn.stop",
+        "SessionEnd": "session.end"
+      },
+      "hook_feature_key": null,
+      "hook_feature_default": false,
+      "skill_activation_mode": "AUTO_ALLOWED",
+      "capture_primary_path": "HOOK_DIRECT",
+      "capture_order": ["HOOK_DIRECT", "AGENT_SKILL", "NATIVE_SOURCE"],
+      "minimum_supported_version": null
+    },
+    "gemini-cli": {
+      "host_id": "gemini-cli",
+      "display_name": "Gemini CLI",
+      "host_family": "gemini-compatible",
+      "adapter_id": "gemini-cli",
+      "executable_names": ["gemini"],
+      "hook_config_path": "settings.json",
+      "global_context_path": "GEMINI.md",
+      "skill_roots": ["skills"],
+      "event_mapping": {
+        "SessionStart": "session.start",
+        "BeforeAgent": "prompt.before",
+        "AfterAgent": "turn.stop",
+        "SessionEnd": "session.end"
+      },
+      "hook_feature_key": null,
+      "hook_feature_default": false,
+      "skill_activation_mode": "CONSENT_REQUIRED",
+      "capture_primary_path": "HOOK_DIRECT",
+      "capture_order": ["HOOK_DIRECT", "AGENT_SKILL", "NATIVE_SOURCE"],
+      "minimum_supported_version": null
+    },
+    "qwen-code": {
+      "host_id": "qwen-code",
+      "display_name": "Qwen Code",
+      "host_family": "qwen-compatible",
+      "adapter_id": "qwen-code",
+      "executable_names": ["qwen"],
+      "hook_config_path": "settings.json",
+      "global_context_path": "QWEN.md",
+      "skill_roots": ["skills"],
+      "event_mapping": {
+        "SessionStart": "session.start",
+        "UserPromptSubmit": "prompt.before",
+        "Stop": "turn.stop",
+        "SessionEnd": "session.end"
+      },
+      "hook_feature_key": null,
+      "hook_feature_default": false,
+      "skill_activation_mode": "AUTO_ALLOWED",
+      "capture_primary_path": "HOOK_DIRECT",
+      "capture_order": ["HOOK_DIRECT", "AGENT_SKILL", "NATIVE_SOURCE"],
+      "minimum_supported_version": null
+    }
+  }
+}

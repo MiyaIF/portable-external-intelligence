@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/knowledge-setup-operation.schema.json",
+  "title": "Knowledge setup operation receipt",
+  "oneOf": [
+    {"$ref": "#/$defs/knowledgeSetupOperationV1"},
+    {"$ref": "#/$defs/setupReconciliationOperationV2"}
+  ],
+  "$defs": {
+    "knowledgeSetupOperationV1": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "plan_digest", "status", "stage", "mode", "completed_actions", "started_at", "updated_at", "completed_at", "repository", "remote", "recovery", "errors"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "plan_digest": {"$ref": "#/$defs/digest"},
+        "status": {"type": "string", "enum": ["IN_PROGRESS", "COMPLETE", "BLOCKED", "FAILED"]},
+        "stage": {"$ref": "#/$defs/stage"},
+        "mode": {"type": "string", "enum": ["local", "github-new", "github-existing"]},
+        "completed_actions": {"type": "array", "items": {"$ref": "#/$defs/completedAction"}},
+        "started_at": {"type": "string", "format": "date-time"},
+        "updated_at": {"type": "string", "format": "date-time"},
+        "completed_at": {"type": ["string", "null"], "format": "date-time"},
+        "repository": {"$ref": "#/$defs/repository"},
+        "remote": {"$ref": "#/$defs/remote"},
+        "recovery": {"$ref": "#/$defs/recovery"},
+        "errors": {"type": "array", "items": {"$ref": "#/$defs/knowledgeError"}}
+      }
+    },
+    "setupReconciliationOperationV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "operation", "plan_digest", "status", "started_at", "completed_at", "reconciliation", "changed_paths", "retained_paths"],
+      "properties": {
+        "schema_version": {"const": 2},
+        "operation": {"const": "setup-reconciliation"},
+        "plan_digest": {"$ref": "#/$defs/digest"},
+        "status": {"type": "string", "enum": ["CREATED", "UPDATED", "ALREADY_CURRENT", "BLOCKED", "CHECK_ONLY", "FAILED"]},
+        "started_at": {"type": "string", "format": "date-time"},
+        "completed_at": {"type": "string", "format": "date-time"},
+        "reconciliation": {"$ref": "#/$defs/reconciliation"},
+        "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "retained_paths": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "stage": {
+      "type": "string",
+      "enum": ["PLANNED", "KNOWLEDGE_LOCAL_READY", "REMOTE_CREATED_OR_VERIFIED", "REMOTE_CONNECTED", "INITIAL_PUSH_VERIFIED", "HOSTS_INSTALLED", "MANIFEST_COMMITTED", "DIAGNOSTICS_COMPLETE"]
+    },
+    "completedAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target", "status", "completed_at"],
+      "properties": {
+        "kind": {"type": "string", "minLength": 1},
+        "target": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["COMPLETED", "SKIPPED"]},
+        "completed_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "repository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["root", "status", "git_initialized"],
+      "properties": {
+        "root": {"type": "string", "minLength": 1},
+        "status": {"type": "string", "enum": ["NOT_READY", "CREATED", "RESTORED", "ALREADY_CURRENT"]},
+        "git_initialized": {"type": "boolean"},
+        "root_digest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    },
+    "remote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["connected", "initial_push_complete"],
+      "properties": {
+        "repository": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9-]{1,39}/[A-Za-z0-9._-]{1,100}$"},
+        "remote_name": {"type": ["string", "null"], "minLength": 1},
+        "fingerprint": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "classification": {"type": ["string", "null"], "enum": [null, "private_verified", "private_attested", "local_path"]},
+        "branch": {"type": ["string", "null"], "minLength": 1},
+        "connected": {"type": "boolean"},
+        "initial_push_complete": {"type": "boolean"}
+      }
+    },
+    "recovery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["retryable", "resume_stage", "external_repository_retained"],
+      "properties": {
+        "retryable": {"type": "boolean"},
+        "resume_stage": {"type": ["string", "null"], "enum": [null, "PLANNED", "KNOWLEDGE_LOCAL_READY", "REMOTE_CREATED_OR_VERIFIED", "REMOTE_CONNECTED", "INITIAL_PUSH_VERIFIED", "HOSTS_INSTALLED", "MANIFEST_COMMITTED", "DIAGNOSTICS_COMPLETE"]},
+        "external_repository_retained": {"type": "boolean"},
+        "command": {"type": ["string", "null"], "maxLength": 4096}
+      }
+    },
+    "knowledgeError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "stage", "retryable"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,127}$"},
+        "stage": {"$ref": "#/$defs/stage"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "desired_state_digest", "live_state_digest", "actions", "changed_paths", "retained_paths", "errors"],
+      "properties": {
+        "status": {"type": "string", "enum": ["CREATED", "UPDATED", "ALREADY_CURRENT", "BLOCKED"]},
+        "desired_state_digest": {"$ref": "#/$defs/digest"},
+        "live_state_digest": {"$ref": "#/$defs/digest"},
+        "actions": {"type": "array", "items": {"$ref": "#/$defs/reconciliationAction"}},
+        "changed_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "retained_paths": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "errors": {"type": "array", "items": {"$ref": "#/$defs/reconciliationError"}}
+      }
+    },
+    "reconciliationAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "target", "before_hash", "after_hash", "owned"],
+      "properties": {
+        "kind": {"type": "string", "enum": ["prepare-personal", "prepare-team", "remove-host", "write-managed", "install-skill", "write-binding", "scheduler-enable", "scheduler-disable", "write-manifest"]},
+        "target": {"type": "string", "minLength": 1},
+        "before_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "after_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "owned": {"type": "boolean"}
+      }
+    },
+    "reconciliationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error_code", "retryable", "data_loss_risk", "user_action", "recovery_command", "target_kind"],
+      "properties": {
+        "error_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{2,127}$"},
+        "retryable": {"type": "boolean"},
+        "data_loss_risk": {"type": "boolean"},
+        "user_action": {"type": "string", "minLength": 1},
+        "recovery_command": {"type": "string", "minLength": 1},
+        "target_kind": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["spool_id", "algorithm", "nonce", "ciphertext", "aad_sha256", "content_sha256", "classification", "created_at", "expires_at", "key_id"],
+  "properties": {
+    "spool_id": {"type": "string", "minLength": 1},
+    "algorithm": {"type": "string", "const": "AES-256-GCM"},
+    "nonce": {"type": "string", "pattern": "^[A-Za-z0-9+/]{16}$", "minLength": 16, "maxLength": 16},
+    "ciphertext": {"type": "string", "pattern": "^[A-Za-z0-9+/]+={0,2}$", "minLength": 1},
+    "aad_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "content_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "classification": {"type": "string", "minLength": 1},
+    "created_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "key_id": {"type": "string", "minLength": 1}
+  },
+  "additionalProperties": false
+}

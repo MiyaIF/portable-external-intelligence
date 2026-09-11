@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "host": "qwen-code",
+  "sessions": [
+    {
+      "session_id": "qwen-session-1",
+      "scope_hash": "cwd:gamma",
+      "entries": [
+        {
+          "id": "qwen-memory-1",
+          "title": "safe projection",
+          "rule": "Project current state from append-only evidence.",
+          "domain": "engineering",
+          "benefit": "improved_correctness"
+        }
+      ]
+    }
+  ]
+}

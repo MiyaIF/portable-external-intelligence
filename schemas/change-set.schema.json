@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Arbitrary sibling membership equality between source host identifiers and applicable host lists is enforced by the authoritative Python validator; this schema intentionally enforces completeness and structural scope/list constraints.",
+  "$id": "https://example.invalid/external-intelligence/change-set.schema.json",
+  "title": "External Intelligence ChangeSet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["changeset_id", "candidate_id", "operations", "source_hashes", "policy_version", "generated_at", "provider_id"],
+  "properties": {
+    "changeset_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$"},
+    "candidate_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$"},
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "target_id", "payload"],
+        "properties": {
+          "operation": {"type": "string", "enum": ["CREATE_OBSERVATION", "ATTACH_EVIDENCE", "CREATE_CANDIDATE", "PROMOTE_PATTERN", "REVISE_PATTERN", "DEPRECATE_PATTERN", "TOMBSTONE_PATTERN", "REDACT_REFERENCE", "NO_CHANGE"]},
+          "target_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$"},
+          "payload": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "actor": {"type": "string", "maxLength": 160},
+              "provider_id": {"type": "string", "maxLength": 160},
+              "classification": {"type": "string", "enum": ["public", "private-reusable"]},
+              "source_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "source_ref_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "source_hashes": {"type": "array", "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+              "evidence_refs": {"type": "array", "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+              "provenances": {"type": "array", "items": {"type": "string", "maxLength": 240}},
+              "record_fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "session_id_hash": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
+              "turn_id_hash": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
+              "provenance_key": {"type": "string", "maxLength": 240},
+              "title": {"type": "string", "maxLength": 160},
+              "claim": {"type": "string", "maxLength": 1200},
+              "rule": {"type": "string", "maxLength": 12000},
+              "precondition": {"type": "string", "maxLength": 500},
+              "failure_mode": {"type": "string", "maxLength": 500},
+              "exception": {"type": "string", "maxLength": 500},
+              "version_constraint": {"type": ["string", "null"], "maxLength": 160},
+              "domain": {"type": "string", "maxLength": 160},
+              "scopes": {"type": "array", "items": {"type": "string", "maxLength": 240}},
+              "applicability": {"type": "array", "items": {"type": "string", "maxLength": 240}},
+              "benefit": {"type": "string", "maxLength": 240},
+              "benefit_count": {"type": "integer", "minimum": 0},
+              "source_kind": {"type": "string", "maxLength": 80},
+              "source_ref": {"type": "string", "maxLength": 240},
+              "outcome_status": {"type": "string", "maxLength": 80},
+              "reason_code": {"type": "string", "maxLength": 80},
+              "pattern_id": {"type": "string", "maxLength": 160},
+              "cluster_id": {"type": "string", "maxLength": 160},
+              "proposal_only": {"type": "boolean"},
+              "contradiction_count": {"type": "integer", "minimum": 0},
+              "revision": {"type": "integer", "minimum": 0},
+              "approved_by": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "approval_identity_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "cwd_fingerprint": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
+              "user_id_hash": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
+              "machine_id_hash": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
+              "host_id_hash": {"type": "string", "pattern": "^$|^sha256:[0-9a-f]{64}$"},
+              "reference_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "match_kind": {"type": "string", "enum": ["exact", "similar"]},
+              "source_host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+              "source_host_family": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+              "applicability_scope": {"type": "string", "enum": ["universal", "family", "host"]},
+              "applicable_host_ids": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}},
+              "applicable_host_families": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}}
+          },
+          "allOf": [
+            {
+              "oneOf": [
+                {
+                  "not": {
+                    "anyOf": [
+                      {"required": ["source_host_id"]},
+                      {"required": ["source_host_family"]},
+                      {"required": ["applicability_scope"]},
+                      {"required": ["applicable_host_ids"]},
+                      {"required": ["applicable_host_families"]}
+                    ]
+                  }
+                },
+                {
+                  "required": ["source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families"],
+                  "allOf": [
+                    {"if": {"properties": {"applicability_scope": {"const": "universal"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"maxItems": 0}}}},
+                    {"if": {"properties": {"applicability_scope": {"const": "family"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"minItems": 1}}}},
+                    {"if": {"properties": {"applicability_scope": {"const": "host"}}}, "then": {"properties": {"applicable_host_ids": {"minItems": 1}, "applicable_host_families": {"maxItems": 0}}}}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+        },
+        "allOf": [
+          {"if": {"properties": {"operation": {"enum": ["CREATE_OBSERVATION", "ATTACH_EVIDENCE", "CREATE_CANDIDATE", "PROMOTE_PATTERN", "REVISE_PATTERN"]}}}, "then": {"properties": {"payload": {"required": ["source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families"]}}}},
+          {"if": {"properties": {"operation": {"const": "CREATE_OBSERVATION"}}}, "then": {"properties": {"payload": {"required": ["title", "claim", "source_hashes"]}}}},
+          {"if": {"properties": {"operation": {"const": "ATTACH_EVIDENCE"}}}, "then": {"properties": {"target_id": {"type": "string", "minLength": 1}, "payload": {"required": ["match_kind", "evidence_refs"]}}}},
+          {"if": {"properties": {"operation": {"const": "CREATE_CANDIDATE"}}}, "then": {"properties": {"target_id": {"type": "string", "minLength": 1}, "payload": {"required": ["rule", "provenances"]}}}},
+          {"if": {"properties": {"operation": {"enum": ["PROMOTE_PATTERN", "REVISE_PATTERN"]}}}, "then": {"properties": {"target_id": {"type": "string", "minLength": 1}, "payload": {"required": ["rule"]}}}}
+        ]
+      }
+    },
+    "source_hashes": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
+    "policy_version": {"type": "string", "minLength": 1, "maxLength": 80},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "provider_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "source_host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "source_host_family": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "applicability_scope": {"type": "string", "enum": ["universal", "family", "host"]},
+    "applicable_host_ids": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}},
+    "applicable_host_families": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}}
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["source_host_id"]},
+              {"required": ["source_host_family"]},
+              {"required": ["applicability_scope"]},
+              {"required": ["applicable_host_ids"]},
+              {"required": ["applicable_host_families"]}
+            ]
+          }
+        },
+        {
+          "required": ["source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families"],
+          "allOf": [
+            {"if": {"properties": {"applicability_scope": {"const": "universal"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"maxItems": 0}}}},
+            {"if": {"properties": {"applicability_scope": {"const": "family"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"minItems": 1}}}},
+            {"if": {"properties": {"applicability_scope": {"const": "host"}}}, "then": {"properties": {"applicable_host_ids": {"minItems": 1}, "applicable_host_families": {"maxItems": 0}}}}
+          ]
+        }
+      ]
+    }
+  ]
+}

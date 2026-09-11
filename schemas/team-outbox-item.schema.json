@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/team-outbox-item.schema.json",
+  "title": "Portable external intelligence team outbox receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "receipt_id", "status", "store_id_hash", "member_id_hash", "writer_id_hash",
+    "personal_event_hash", "idempotency_key", "spool_ref", "created_at", "attempts",
+    "last_error_code", "delivered_at", "final_event_hash"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "receipt_id": {"type": "string", "pattern": "^teamoutbox_[0-9a-f]{32}$"},
+    "status": {"enum": ["PENDING", "DEFERRED", "DELIVERED", "FAILED"]},
+    "store_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "member_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "writer_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "personal_event_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "spool_ref": {"$ref": "spool-item.schema.json"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "attempts": {"type": "integer", "minimum": 0},
+    "last_error_code": {"type": ["string", "null"]},
+    "delivered_at": {"type": ["string", "null"], "format": "date-time"},
+    "final_event_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

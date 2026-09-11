@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "managed_id": "ei-claude-code-hooks-v1",
+  "hooks": {
+    "SessionStart": [
+      {
+        "id": "ei-claude-code-sessionstart-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Claude Code",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "id": "ei-claude-code-userpromptsubmit-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Claude Code",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "id": "ei-claude-code-stop-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Claude Code",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "id": "ei-claude-code-sessionend-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Claude Code",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ]
+  },
+  "host_instance_ids": ["claude-code"],
+  "canary": {
+    "required_normalized_events": ["session.start", "prompt.before", "turn.stop"],
+    "validity_window_seconds": 604800
+  }
+}

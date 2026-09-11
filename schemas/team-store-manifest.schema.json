@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/team-store-manifest.schema.json",
+  "title": "Portable external intelligence team store manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "store_id", "layout", "event_schema_version", "created_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "portable-external-intelligence-team-store"},
+    "store_id": {"type": "string", "pattern": "^team_[0-9a-f]{16,64}$"},
+    "layout": {"const": "member-writer-events-v1"},
+    "event_schema_version": {"const": 2},
+    "created_at": {"type": "string", "format": "date-time"}
+  }
+}

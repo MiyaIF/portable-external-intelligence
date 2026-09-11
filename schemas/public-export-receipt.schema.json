@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/blob/main/schemas/public-export-receipt.schema.json",
+  "title": "Sanitized public repository export receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_type",
+    "schema_version",
+    "tool_version",
+    "status",
+    "source_commit_sha",
+    "source_tree_id",
+    "source_tree_sha256",
+    "public_root_sha",
+    "public_tree_id",
+    "public_tree_sha256",
+    "selected_paths_sha256",
+    "allowlist_sha256",
+    "publication_policy_sha256",
+    "selected_file_count",
+    "root_commit_count",
+    "author",
+    "validation",
+    "generated_at",
+    "receipt_sha256"
+  ],
+  "properties": {
+    "receipt_type": {"const": "public_export"},
+    "schema_version": {"const": 1},
+    "tool_version": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[0-9]+$"},
+    "status": {"enum": ["exported_unvalidated", "validated"]},
+    "source_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "public_root_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "public_tree_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "public_tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "selected_paths_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "allowlist_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "publication_policy_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "selected_file_count": {"type": "integer", "minimum": 1},
+    "root_commit_count": {"const": 1},
+    "author": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "email"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "email": {"type": "string", "pattern": "^[0-9]+\\+[A-Za-z0-9-]+@users\\.noreply\\.github\\.com$"}
+      }
+    },
+    "validation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "step_digests"],
+      "properties": {
+        "status": {"enum": ["not_run", "passed"]},
+        "step_digests": {
+          "type": "object",
+          "additionalProperties": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        }
+      }
+    },
+    "generated_at": {"type": "string", "format": "date-time"},
+    "receipt_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

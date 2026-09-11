@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "mode": "local_first_subscription_only",
+  "limits": {
+    "per_run": {
+      "input_tokens": 20000,
+      "output_tokens": 4000,
+      "cost": 0
+    },
+    "per_day": {
+      "input_tokens": 100000,
+      "output_tokens": 20000,
+      "cost": 0
+    },
+    "per_candidate": {
+      "input_tokens": 12000,
+      "output_tokens": 3000,
+      "cost": 0
+    }
+  },
+  "retry": {
+    "max_attempts": 4,
+    "backoff_seconds": [300, 900, 3600, 21600]
+  },
+  "deadline": {
+    "max_ms": 120000,
+    "max_response_bytes": 262144
+  },
+  "cloud_api": {
+    "enabled": false,
+    "spend_cap": 0
+  },
+  "subscription": {
+    "on_quota": "DEFERRED_QUOTA"
+  }
+}

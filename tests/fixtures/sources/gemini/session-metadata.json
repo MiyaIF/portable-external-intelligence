@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "host": "gemini-cli",
+  "sessions": [
+    {
+      "session_id": "gemini-session-1",
+      "cwd_fingerprint": "cwd:beta",
+      "observations": [
+        {
+          "id": "gemini-memory-1",
+          "title": "bounded retrieval",
+          "claim": "Retrieve only the context required by the current task.",
+          "domain": "engineering",
+          "benefit": "reduced_search"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 2,
+  "policy_version": "promotion-v1",
+  "candidate": {
+    "independent_provenance_count": 2,
+    "candidate_retention_days": 180
+  },
+  "promotion": {
+    "independent_provenance_count": 2,
+    "distinct_scope_count": 2,
+    "benefit_evidence_count": 1,
+    "max_unresolved_contradictions": 0,
+    "min_rule_chars": 80,
+    "max_rule_chars": 1200,
+    "required_fields": ["precondition", "failure_mode", "applicability"]
+  },
+  "deprecation": {
+    "independent_contradiction_count": 3,
+    "unused_days": 180
+  },
+  "always_on": {
+    "target_chars": 9000,
+    "hard_cap_chars": 12000,
+    "selection": "utility_desc_then_pinned_desc_then_pattern_id_asc"
+  }
+}

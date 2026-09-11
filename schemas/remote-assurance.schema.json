@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/remote-assurance.schema.json",
+  "title": "Machine-local remote assurance receipt",
+  "oneOf": [
+    {"$ref": "#/$defs/versionOne"},
+    {"$ref": "#/$defs/versionTwo"}
+  ],
+  "$defs": {
+    "fingerprint": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "versionOne": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "classification", "remote_fingerprint", "fingerprint_digest", "approved_at"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "classification": {"const": "private_attested"},
+        "remote_fingerprint": {"$ref": "#/$defs/fingerprint"},
+        "fingerprint_digest": {"$ref": "#/$defs/digest"},
+        "approved_at": {"type": "string", "format": "date-time"},
+        "approved_by_hash": {"$ref": "#/$defs/fingerprint"}
+      }
+    },
+    "versionTwo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "classification",
+        "provider",
+        "verification_source",
+        "remote_fingerprint",
+        "fingerprint_digest",
+        "verified_at"
+      ],
+      "properties": {
+        "schema_version": {"const": 2},
+        "classification": {"type": "string", "enum": ["local_path", "private_verified", "private_attested"]},
+        "provider": {"type": "string", "minLength": 1},
+        "verification_source": {"type": "string", "minLength": 1},
+        "remote_fingerprint": {"$ref": "#/$defs/fingerprint"},
+        "fingerprint_digest": {"$ref": "#/$defs/digest"},
+        "verified_at": {"type": "string", "format": "date-time"},
+        "approved_by_hash": {"$ref": "#/$defs/fingerprint"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"classification": {"const": "private_attested"}}, "required": ["classification"]},
+          "then": {"required": ["approved_by_hash"]},
+          "else": {"not": {"required": ["approved_by_hash"]}}
+        }
+      ]
+    }
+  }
+}

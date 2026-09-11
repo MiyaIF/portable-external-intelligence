@@ -1,0 +1,31 @@
+{
+  "schema_version": 2,
+  "canonical_classifications": [
+    "public",
+    "private-reusable",
+    "client-confidential",
+    "machine-local",
+    "secret",
+    "external-reference"
+  ],
+  "sources": {
+    "agent_direct": "private-reusable",
+    "codex_memory": "private-reusable",
+    "rollout_summary": "private-reusable",
+    "native_memory": "private-reusable",
+    "migration": "private-reusable",
+    "manual": "private-reusable",
+    "public": "public",
+    "client_confidential": "client-confidential",
+    "machine_local": "machine-local",
+    "external_article_copy": "external-reference",
+    "external_reference": "external-reference"
+  },
+  "source_families": {
+    "external_article_copy": "external-reference",
+    "browser_state": "machine-local",
+    "raw_transcript": "machine-local",
+    "client_file": "client-confidential",
+    "credential_store": "secret"
+  }
+}

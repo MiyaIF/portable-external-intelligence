@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "license_spdx": "Apache-2.0",
+  "copyright_holder": "Fiso",
+  "public_author": {
+    "name": "MiyaIF",
+    "email": "103426917+MiyaIF@users.noreply.github.com"
+  },
+  "github": {
+    "owner": "MiyaIF",
+    "repository": "portable-external-intelligence",
+    "default_branch": "main"
+  },
+  "security_reporting": {
+    "type": "github_private_vulnerability_reporting",
+    "url": "https://github.com/MiyaIF/portable-external-intelligence/security/advisories/new",
+    "acknowledgement_days": 7,
+    "triage_days": 14
+  },
+  "contribution_policy": {
+    "issues": true,
+    "pull_requests": true,
+    "dco_required": true,
+    "cla_required": false,
+    "response_sla_days": null,
+    "merge_guarantee": false,
+    "bug_bounty": false
+  },
+  "initial_version": "1.0.0"
+}

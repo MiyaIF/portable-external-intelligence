@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Arbitrary sibling membership equality between source host identifiers and applicable host lists is enforced by the authoritative Python validator; this schema intentionally enforces completeness and structural scope/list constraints.",
+  "type": "object",
+  "required": ["pattern_id", "status", "rule", "classification"],
+  "properties": {
+    "pattern_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["candidate", "active", "deprecated", "superseded", "tombstoned"]},
+    "rule": {"type": "string", "minLength": 1, "maxLength": 1200},
+    "classification": {"enum": ["public", "private-reusable", "external-reference"]},
+    "source_host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "source_host_family": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "applicability_scope": {"type": "string", "enum": ["universal", "family", "host"]},
+    "applicable_host_ids": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}},
+    "applicable_host_families": {"type": "array", "maxItems": 16, "uniqueItems": true, "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}}
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["source_host_id"]},
+              {"required": ["source_host_family"]},
+              {"required": ["applicability_scope"]},
+              {"required": ["applicable_host_ids"]},
+              {"required": ["applicable_host_families"]}
+            ]
+          }
+        },
+        {
+          "required": ["source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families"],
+          "allOf": [
+            {"if": {"properties": {"applicability_scope": {"const": "universal"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"maxItems": 0}}}},
+            {"if": {"properties": {"applicability_scope": {"const": "family"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"minItems": 1}}}},
+            {"if": {"properties": {"applicability_scope": {"const": "host"}}}, "then": {"properties": {"applicable_host_ids": {"minItems": 1}, "applicable_host_families": {"maxItems": 0}}}}
+          ]
+        }
+      ]
+    }
+  ],
+  "additionalProperties": true
+}

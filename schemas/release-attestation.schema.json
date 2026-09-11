@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/blob/main/schemas/release-attestation.schema.json",
+  "title": "Post-push public release attestation",
+  "type": "object",
+  "required": ["evidence_type", "subject_commit_sha", "evidence_commit_sha", "manifest_sha256", "public_tree_audit_sha256", "workflow_sha256", "ci_runs", "package_sha256", "sbom_sha256", "publication_policy_sha256", "receipt_index", "attested_at", "attestation_sha256"],
+  "properties": {
+    "evidence_type": {"const": "post_push_public_attestation"},
+    "subject_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "evidence_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "manifest_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "public_tree_audit_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "workflow_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "ci_runs": {"$ref": "release-evidence-index.schema.json#/properties/ci_runs"},
+    "package_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "sbom_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "publication_policy_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "receipt_index": {"$ref": "release-evidence-index.schema.json#/properties/receipt_index"},
+    "attested_at": {"type": "string", "format": "date-time"},
+    "attestation_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

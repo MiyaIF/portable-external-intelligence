@@ -1,0 +1,109 @@
+name: package
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHON_VERSION: ${{ matrix.python-version }}
+      MATRIX_OS: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install hash-locked dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --require-hashes -r requirements-build.lock
+          python -m pip install --require-hashes -r requirements-runtime.lock
+          python -m pip install --require-hashes -r requirements-ci.lock
+          python -m pip install --no-deps -e .
+
+      - name: Verify public workflow security
+        shell: bash
+        run: python -m ei.cli public-release workflows verify --workflow-dir .github/workflows --json
+
+      - name: Verify dependency locks
+        shell: bash
+        run: |
+          python scripts/verify-dependency-lock.py \
+            --pyproject pyproject.toml \
+            --build-lock requirements-build.lock \
+            --runtime-lock requirements-runtime.lock \
+            --ci-lock requirements-ci.lock \
+            --workflow-dir .github/workflows
+
+      - name: Build wheel and source distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist build
+          python -m build --wheel --sdist --no-isolation
+
+      - name: Generate deterministic SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python scripts/generate-sbom.py --root . --output artifacts/dependency-sbom.spdx.json
+
+      - name: Run package acceptance contract
+        shell: bash
+        run: python -m unittest tests.acceptance.test_package_metadata tests.unit.test_dependency_locks
+
+      - name: Certify one clean clone lifecycle
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.13'
+        shell: bash
+        run: python scripts/certify-public-clone.py --source . --output artifacts/public-clone-receipt.json --offline-fixtures
+
+      - name: Upload package evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: package-evidence-${{ matrix.os }}-${{ matrix.python-version }}
+          path: |
+            dist/
+            artifacts/
+          if-no-files-found: error
+          retention-days: 14
+
+  package-status:
+    name: package
+    needs: package
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      REQUIRED_RESULT: ${{ needs.package.result }}
+    steps:
+      - name: Require every package matrix job to succeed
+        shell: bash
+        run: test "$REQUIRED_RESULT" = "success"

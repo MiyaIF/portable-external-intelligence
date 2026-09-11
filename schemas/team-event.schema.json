@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/team-event.schema.json",
+  "title": "Portable external intelligence team event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "event_id", "event_type", "occurred_at", "actor", "machine_id", "payload",
+    "integrity_sha256", "idempotency_key", "provenance", "integrity"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "event_id": {"type": "string", "minLength": 1},
+    "event_type": {"const": "team.knowledge.recorded"},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "actor": {"type": "string", "minLength": 1},
+    "machine_id": {"type": "string", "minLength": 1},
+    "payload": {"$ref": "#/$defs/teamPayload"},
+    "integrity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "provenance": {"type": "array", "items": {"type": "string"}},
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "canonical_payload_hash"],
+      "properties": {
+        "algorithm": {"const": "sha256"},
+        "canonical_payload_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    }
+  },
+  "$defs": {
+    "teamPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "knowledge_scope", "origin_event_hash", "idempotency_key", "title", "claim", "scope",
+        "preconditions", "failure_modes", "benefit", "classification"
+      ],
+      "properties": {
+        "knowledge_scope": {"const": "team"},
+        "origin_event_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "claim": {"type": "string", "minLength": 20, "maxLength": 1200},
+        "scope": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "preconditions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "failure_modes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "benefit": {"type": "string", "minLength": 1},
+        "classification": {"type": "string", "enum": ["public", "private-reusable"]}
+      }
+    }
+  }
+}

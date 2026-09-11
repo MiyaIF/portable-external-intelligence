@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "managed_id": "ei-gemini-cli-hooks-v1",
+  "hooks": {
+    "SessionStart": [
+      {
+        "id": "ei-gemini-cli-sessionstart-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Gemini CLI",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ],
+    "BeforeAgent": [
+      {
+        "id": "ei-gemini-cli-beforeagent-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Gemini CLI",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ],
+    "AfterAgent": [
+      {
+        "id": "ei-gemini-cli-afteragent-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Gemini CLI",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "id": "ei-gemini-cli-sessionend-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Gemini CLI",
+            "command": "{{HOOK_COMMAND}}"
+          }
+        ]
+      }
+    ]
+  },
+  "host_instance_ids": ["gemini-cli"],
+  "canary": {
+    "required_normalized_events": ["session.start", "prompt.before", "turn.stop"],
+    "validity_window_seconds": 604800
+  }
+}

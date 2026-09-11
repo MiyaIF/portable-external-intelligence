@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["event_id", "idempotency_key", "host_id", "host_instance_id", "host_event_name", "normalized_event_name", "session_id_hash", "turn_id_hash", "cwd_hash", "source_hash", "payload_hash", "received_at", "privacy_classification"],
+  "properties": {
+    "event_id": {"type": "string", "pattern": "^evt_[0-9TZ]+_[0-9a-f]{12}$"},
+    "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "host_id": {"type": "string", "minLength": 1},
+    "host_instance_id": {"type": "string", "minLength": 1},
+    "host_event_name": {"type": "string", "minLength": 1},
+    "normalized_event_name": {"type": "string", "minLength": 1},
+    "session_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "turn_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "cwd_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "source_ref": {"type": ["string", "null"]},
+    "source_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "payload_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "received_at": {"type": "string", "format": "date-time"},
+    "privacy_classification": {"type": "string", "minLength": 1},
+    "source_host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "source_host_family": {"type": "string", "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}
+  },
+  "additionalProperties": false
+}

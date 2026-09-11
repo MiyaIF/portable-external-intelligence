@@ -1,0 +1,3 @@
+# Repair workflow
+
+Use the generated Skill launcher from managed global context and append `repair`. Never call `scripts/repair.py` directly or substitute the active project. The launcher invokes the production doctor through the isolated bound Python in strict mode and returns its bounded findings. Repair is doctor-guided: no trust decision, source replacement, projection overwrite, purge, or installed Skill overwrite is automatic. The operator must review the plan and use the explicit installer/rollback command. A missing CLI consent or scheduler is reported as an external wait condition, not repaired by guessing.

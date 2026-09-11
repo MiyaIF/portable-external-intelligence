@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/root-migration-receipt.schema.json",
+  "title": "Root migration receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "status", "plan_hash", "ownership_token_hash", "source_root", "destination_root", "runtime_root", "source_tree_digest", "destination_tree_digest", "copied_files", "created_at"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "status": {"type": "string", "enum": ["complete", "rolled_back"]},
+    "plan_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "ownership_token_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "source_root": {"type": "string", "minLength": 1},
+    "destination_root": {"type": "string", "minLength": 1},
+    "runtime_root": {"type": "string", "minLength": 1},
+    "source_tree_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "destination_tree_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "copied_files": {"type": "integer", "minimum": 0},
+    "created_at": {"type": "string", "minLength": 1},
+    "rolled_back_at": {"type": "string", "minLength": 1}
+  }
+}

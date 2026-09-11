@@ -1,0 +1,63 @@
+name: security
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  security:
+    name: security
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.11"
+
+      - name: Install hash-locked dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-build.lock
+          python -m pip install --require-hashes -r requirements-runtime.lock
+          python -m pip install --require-hashes -r requirements-ci.lock
+          python -m pip install --no-deps -e .
+
+      - name: Verify dependencies and action pins
+        run: python scripts/verify-dependency-lock.py --pyproject pyproject.toml --build-lock requirements-build.lock --runtime-lock requirements-runtime.lock --ci-lock requirements-ci.lock --workflow-dir .github/workflows
+
+      - name: Audit source, secrets, and production boundaries
+        run: |
+          mkdir -p artifacts
+          python scripts/audit-production-source.py --repo . --json > artifacts/source-audit.json
+          python scripts/audit-public-release.py --repo . --policy release/publication-policy.json --working-tree --json > artifacts/public-audit.json
+          # Historical task-baseline.json contains only public Git object/digest
+          # identifiers. Exclude that immutable evidence file so high-entropy
+          # detectors do not classify those identifiers as credentials.
+          detect-secrets scan --force-use-all-plugins --exclude-files '(^|.*[\\/])release[\\/]task-baseline\.json$' > artifacts/secrets-scan.json
+          python -c "import json; value=json.load(open('artifacts/secrets-scan.json', encoding='utf-8')); raise SystemExit(1 if value.get('results') else 0)"
+          pip-audit --disable-pip --requirement requirements-build.lock --require-hashes
+          pip-audit --disable-pip --requirement requirements-runtime.lock --require-hashes
+          pip-audit --disable-pip --requirement requirements-ci.lock --require-hashes
+
+      - name: Upload security evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: security-evidence
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14

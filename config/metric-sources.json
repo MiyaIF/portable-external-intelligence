@@ -1,0 +1,27 @@
+{
+  "schema_version": 2,
+  "metrics": {
+    "repeated_search": {"source": "hook_events", "required_fields": ["session_id_hash", "search_count"]},
+    "rework": {"source": "direct_outcome_events", "required_fields": ["session_id_hash", "rework"]},
+    "failure": {"source": "direct_outcome_events", "required_fields": ["session_id_hash", "failure"]},
+    "uncached_input": {"source": "local_sqlite", "required_fields": ["dedup_key", "input", "cached"]},
+    "cached_input": {"source": "local_sqlite", "required_fields": ["dedup_key", "input", "cached"]},
+    "turns_to_completion": {"source": "hook_events", "required_fields": ["session_id_hash", "turns"]},
+    "incorrect_pattern_application": {"source": "direct_outcome_events", "required_fields": ["session_id_hash", "incorrect_pattern_application"]},
+    "explicit_correction": {"source": "direct_outcome_events", "required_fields": ["session_id_hash", "explicit_correction"]},
+    "privacy_incident": {"source": "privacy_audit", "required_fields": ["session_id_hash", "privacy_incident"]}
+  },
+  "sqlite": {
+    "known_table": "turn_usage",
+    "required_columns": ["id", "input_tokens", "cached_input_tokens", "created_at"],
+    "optional_dedup_columns": ["host_id", "session_id_hash", "turn_id_hash", "source_key", "classification"],
+    "unsupported_status": "SQLITE_SCHEMA_UNSUPPORTED",
+    "read_mode": "read_only"
+  },
+  "article_boundary": {
+    "source_kind": "external_article_copy",
+    "user_total_inclusion": false,
+    "accepted_status": "external_reference_only"
+  },
+  "missing_policy": "remain_missing_never_impute_zero"
+}

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/root-migration-plan.schema.json",
+  "title": "Combined layout root migration plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source_root", "destination_root", "runtime_root", "files", "event_ids", "policy_version", "source_tree_digest", "plan_hash"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "source_root": {"type": "string", "minLength": 1},
+    "destination_root": {"type": "string", "minLength": 1},
+    "runtime_root": {"type": "string", "minLength": 1},
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["relative_path", "sha256", "size", "mode", "category"],
+        "properties": {
+          "relative_path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "size": {"type": "integer", "minimum": 0},
+          "mode": {"type": "integer", "minimum": 0},
+          "category": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "event_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "policy_version": {"type": "string", "minLength": 1},
+    "source_tree_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "plan_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "managed_id": "ei-codex-cli-hooks-v1",
+  "hooks": {
+    "SessionStart": [
+      {
+        "id": "ei-codex-cli-sessionstart-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Codex CLI",
+            "command": "{{HOOK_COMMAND_POSIX}}",
+            "commandWindows": "{{HOOK_COMMAND_WINDOWS}}"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "id": "ei-codex-cli-userpromptsubmit-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Codex CLI",
+            "command": "{{HOOK_COMMAND_POSIX}}",
+            "commandWindows": "{{HOOK_COMMAND_WINDOWS}}"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "id": "ei-codex-cli-stop-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Codex CLI",
+            "command": "{{HOOK_COMMAND_POSIX}}",
+            "commandWindows": "{{HOOK_COMMAND_WINDOWS}}"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "id": "ei-codex-cli-sessionend-v1",
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 3,
+            "statusMessage": "External intelligence: Codex CLI",
+            "command": "{{HOOK_COMMAND_POSIX}}",
+            "commandWindows": "{{HOOK_COMMAND_WINDOWS}}"
+          }
+        ]
+      }
+    ]
+  },
+  "host_instance_ids": [
+    "codex-cli",
+    "codex-app"
+  ],
+  "canary": {
+    "required_normalized_events": ["session.start", "prompt.before", "turn.stop"],
+    "validity_window_seconds": 604800
+  }
+}

@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible problem without sharing private data.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove secrets, credentials, absolute paths, raw prompts/responses, logs, transcripts, SQLite files, and client data before submitting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Give minimal synthetic steps, versions, and CLI adapter. Do not paste private data.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Safe evidence
+      description: Include sanitized error codes or test output only. Use SECURITY.md for vulnerabilities.
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy check
+      options:
+        - label: I removed secrets, credentials, private paths, raw transcripts, and client data.
+          required: true

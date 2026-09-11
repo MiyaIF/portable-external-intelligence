@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "oneOf": [
+    {
+      "title": "event-v1",
+      "type": "object",
+      "required": ["schema_version", "event_id", "event_type", "occurred_at", "actor", "machine_id", "payload", "integrity_sha256"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 1},
+        "event_id": {"type": "string", "minLength": 1},
+        "event_type": {"type": "string", "minLength": 1},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "actor": {"type": "string", "minLength": 1},
+        "machine_id": {"type": "string", "minLength": 1},
+        "payload": {"type": "object"},
+        "integrity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    {
+      "title": "event-v2",
+      "type": "object",
+      "required": ["schema_version", "event_id", "event_type", "occurred_at", "actor", "machine_id", "idempotency_key", "payload", "provenance", "integrity", "integrity_sha256"],
+      "properties": {
+        "schema_version": {"type": "integer", "const": 2},
+        "event_id": {"type": "string", "pattern": "^evt_[0-9TZ]+_[0-9a-f]{12}$"},
+        "event_type": {"type": "string", "minLength": 1},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "actor": {"type": "string", "minLength": 1},
+        "machine_id": {"type": "string", "minLength": 1},
+        "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "payload": {"type": "object"},
+        "provenance": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "integrity": {
+          "type": "object",
+          "required": ["algorithm", "canonical_payload_hash"],
+          "properties": {
+            "algorithm": {"const": "sha256"},
+            "canonical_payload_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+          },
+          "additionalProperties": false
+        },
+        "integrity_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
+  ]
+}

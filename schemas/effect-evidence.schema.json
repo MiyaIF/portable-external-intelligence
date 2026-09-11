@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/schemas/effect-evidence.schema.json",
+  "title": "Release-bound A/B effect evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evidence_type",
+    "experiment_id",
+    "protocol_hash",
+    "subject_commit_sha",
+    "evidence_index_sha256",
+    "primary_metrics",
+    "eligible_units_per_arm",
+    "duration_days",
+    "power",
+    "alpha",
+    "metric_provenance",
+    "missingness",
+    "contamination",
+    "causal_report",
+    "analysis_sha256"
+  ],
+  "properties": {
+    "evidence_type": {"const": "ab_effect"},
+    "experiment_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "protocol_hash": {"$ref": "#/$defs/sha256"},
+    "subject_commit_sha": {"$ref": "#/$defs/commit"},
+    "evidence_index_sha256": {"$ref": "#/$defs/sha256"},
+    "primary_metrics": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1, "maxLength": 160}
+    },
+    "eligible_units_per_arm": {"type": "integer", "minimum": 50},
+    "duration_days": {"type": "integer", "minimum": 14},
+    "power": {"type": "number", "minimum": 0.8, "maximum": 1},
+    "alpha": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.05},
+    "metric_provenance": {"type": "object", "minProperties": 1},
+    "missingness": {"type": "object"},
+    "contamination": {"type": "object"},
+    "causal_report": {"type": "object"},
+    "analysis_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "ci_runs": {},
+  "evidence_commit_sha": null,
+  "evidence_type": "public_release_evidence",
+  "generated_at": "2026-08-28T00:00:00Z",
+  "index_sha256": "sha256:11bbd0df566376274c35b6c51048f6236ef71fa7536b34e4478cdb737b442f23",
+  "package_sha256": null,
+  "public_tree_audit_sha256": null,
+  "publication_policy_sha256": "sha256:fb8426083649a1000ea6a3d3db03b7f99447a1a594b0071bd869b258edcdb326",
+  "receipt_index": [],
+  "sbom_sha256": null,
+  "states": {
+    "effect_validated": "awaiting_sample",
+    "production_enabled": false,
+    "software_complete": false
+  },
+  "status": "awaiting_public_subject",
+  "subject_commit_sha": null,
+  "workflow_sha256": null
+}

@@ -1,0 +1,3 @@
+# Sync workflow
+
+Use the generated Skill launcher from managed global context and append `sync` with only the required bounded options. Never call `scripts/sync.py` directly or substitute the active project. The launcher delegates through the isolated bound Python to the production ei sync CLI. The sync core must keep private-reusable content inside the configured private remote, reject secret or machine-local paths, use a lock, detect unrelated worktree changes, and stop on semantic conflicts. Synchronization is off by default and requires remote assurance plus explicit approval. Offline, quota, or conflict results are reported as deferred/blocked; they are never silently overwritten.

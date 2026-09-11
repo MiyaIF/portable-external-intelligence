@@ -1,0 +1,53 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/schemas/release-receipts.schema.json",
+  "title": "Content-addressed release receipt bundle",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "hosted_ci",
+    "package",
+    "sbom",
+    "secret_scanner",
+    "dependency_scanner",
+    "workflow_security",
+    "security_remediation",
+    "clean_clone"
+  ],
+  "properties": {
+    "hosted_ci": {"$ref": "#/$defs/receipt"},
+    "package": {"$ref": "#/$defs/receipt"},
+    "sbom": {"$ref": "#/$defs/receipt"},
+    "secret_scanner": {"$ref": "#/$defs/receipt"},
+    "dependency_scanner": {"$ref": "#/$defs/receipt"},
+    "workflow_security": {"$ref": "#/$defs/receipt"},
+    "security_remediation": {"$ref": "#/$defs/receipt"},
+    "clean_clone": {"$ref": "#/$defs/receipt"}
+  },
+  "$defs": {
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipt_type",
+        "schema_version",
+        "status",
+        "subject_commit_sha",
+        "producer_workflow",
+        "producer_run_id",
+        "artifact_sha256",
+        "receipt_sha256"
+      ],
+      "properties": {
+        "receipt_type": {"type": "string", "minLength": 1, "maxLength": 80},
+        "schema_version": {"const": 1},
+        "status": {"const": "PASSED"},
+        "subject_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "producer_workflow": {"enum": ["ci", "compatibility", "security", "package"]},
+        "producer_run_id": {"type": "integer", "minimum": 1},
+        "artifact_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "receipt_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

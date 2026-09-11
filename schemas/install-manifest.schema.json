@@ -1,0 +1,243 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/install-manifest.schema.json",
+  "title": "External Intelligence Engine install manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "status", "installed_at", "repo_root", "engine_root", "knowledge_root", "runtime_root",
+    "root_ownership", "supported_hosts", "hosts", "legacy_host_migrations", "managed_marker", "managed_hook_ids",
+    "providers", "organizer", "work_hosts", "privacy_profile", "sync_enabled", "experiment_enabled", "scheduler_requested", "skill_source",
+    "skill_source_hash", "hook_schema_hash", "skip_venv", "venv_created", "python_exe", "transaction_id",
+    "agents_block_version", "config_backup", "hooks_backup", "agents_backup", "agents_original_sha256",
+    "agents_installed_sha256", "knowledge_repository", "knowledge_stores", "reconciliation"
+  ],
+  "properties": {
+    "schema_version": {"const": 8},
+    "status": {"type": "string", "enum": ["INSTALLED", "UNINSTALLED"]},
+    "installed_at": {"type": "string", "format": "date-time"},
+    "uninstalled_at": {"type": "string", "format": "date-time"},
+    "repo_root": {"type": "string", "minLength": 1},
+    "engine_root": {"type": "string", "minLength": 1},
+    "knowledge_root": {"type": "string", "minLength": 1},
+    "runtime_root": {"type": "string", "minLength": 1},
+    "root_ownership": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine_root", "knowledge_root", "runtime_root"],
+      "properties": {
+        "engine_root": {"const": "public-source-read-only"},
+        "knowledge_root": {"const": "private-knowledge-git-or-local"},
+        "runtime_root": {"const": "machine-local-git-forbidden"}
+      }
+    },
+    "supported_hosts": {
+      "type": "array",
+      "items": {"type": "string", "enum": ["codex-cli", "claude-code", "gemini-cli", "qwen-code"]},
+      "uniqueItems": true
+    },
+    "hosts": {
+      "type": "object",
+      "propertyNames": {"pattern": "^(?!codex$|claude$|gemini$|qwen$|codex-app$)(?!\\.|.*[. ]$)(?!con(?:\\..*)?$|prn(?:\\..*)?$|aux(?:\\..*)?$|nul(?:\\..*)?$|com[1-9](?:\\..*)?$|lpt[1-9](?:\\..*)?$)[a-z0-9][a-z0-9._-]{0,159}$"},
+      "additionalProperties": {"$ref": "#/$defs/host"}
+    },
+    "organizer": {"$ref": "#/$defs/organizer"},
+    "work_hosts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"type": "string", "pattern": "^(?!codex$|claude$|gemini$|qwen$|codex-app$)(?!\\.|.*[. ]$)(?!con(?:\\..*)?$|prn(?:\\..*)?$|aux(?:\\..*)?$|nul(?:\\..*)?$|com[1-9](?:\\..*)?$|lpt[1-9](?:\\..*)?$)[a-z0-9][a-z0-9._-]{0,159}$"},
+      "uniqueItems": true
+    },
+    "legacy_host_migrations": {"type": "array", "items": {"$ref": "#/$defs/legacyHostMigration"}},
+    "managed_marker": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["begin", "end", "version"],
+      "properties": {
+        "begin": {"type": "string", "minLength": 1},
+        "end": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "managed_hook_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "providers": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true},
+    "privacy_profile": {"type": "string", "enum": ["public", "private-reusable", "client-confidential", "machine-local"]},
+    "sync_enabled": {"type": "boolean"},
+    "experiment_enabled": {"type": "boolean"},
+    "scheduler_requested": {"type": "boolean"},
+    "skill_source": {"type": "string", "minLength": 1},
+    "skill_source_hash": {"$ref": "#/$defs/nullableDigest"},
+    "hook_schema_hash": {"$ref": "#/$defs/nullableDigest"},
+    "skip_venv": {"type": "boolean"},
+    "venv_created": {"type": "boolean"},
+    "python_exe": {"type": "string", "minLength": 1},
+    "transaction_id": {"type": "string", "minLength": 1},
+    "agents_block_version": {"type": "string", "minLength": 1},
+    "config_backup": {"type": ["string", "null"]},
+    "hooks_backup": {"type": ["string", "null"]},
+    "agents_backup": {"type": ["string", "null"]},
+    "agents_original_sha256": {"$ref": "#/$defs/nullableDigest"},
+    "agents_installed_sha256": {"$ref": "#/$defs/nullableDigest"},
+    "knowledge_repository": {"$ref": "#/$defs/knowledgeRepository"},
+    "knowledge_stores": {"$ref": "#/$defs/knowledgeStores"},
+    "reconciliation": {"$ref": "#/$defs/reconciliation"},
+    "knowledge_retained": {"type": "boolean"}
+  },
+  "$defs": {
+    "organizer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "provider_id", "host_id", "reason_code"],
+      "properties": {
+        "status": {"type": "string", "enum": ["READY", "SELECTION_REQUIRED"]},
+        "provider_id": {"type": ["string", "null"], "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$"},
+        "host_id": {"type": ["string", "null"], "pattern": "^(?!codex$|claude$|gemini$|qwen$|codex-app$)(?!\\.|.*[. ]$)(?!con(?:\\..*)?$|prn(?:\\..*)?$|aux(?:\\..*)?$|nul(?:\\..*)?$|com[1-9](?:\\..*)?$|lpt[1-9](?:\\..*)?$)[a-z0-9][a-z0-9._-]{0,159}$"},
+        "reason_code": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "nullableDigest": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "host_id": {"not": {"enum": ["codex-cli", "claude-code", "gemini-cli", "qwen-code"]}}
+            }
+          },
+          "then": {
+            "required": ["profile_hash", "profile_path"],
+            "properties": {
+              "profile_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+              "profile_path": {"type": "string", "pattern": "^host-profiles/(?!\\.|.*[. ]\\.json$)(?!con(?:\\..*)?\\.json$|prn(?:\\..*)?\\.json$|aux(?:\\..*)?\\.json$|nul(?:\\..*)?\\.json$|com[1-9](?:\\..*)?\\.json$|lpt[1-9](?:\\..*)?\\.json$)[a-z0-9][a-z0-9._-]{0,159}\\.json$"}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "host_id": {"enum": ["codex-cli", "claude-code", "gemini-cli", "qwen-code"]}
+            }
+          },
+          "then": {
+            "not": {"anyOf": [{"required": ["profile_hash"]}, {"required": ["profile_path"]}]}
+          }
+        }
+      ],
+      "required": [
+        "host_id", "home", "hook_config_path", "context_path", "skill_destination", "skill_root", "skill_mode",
+        "source_skill_hash", "installed_skill_hash", "skill_binding_path", "skill_binding_hash", "hook_template_hash", "context_hash", "skill_activation_mode",
+        "capture_primary_path", "managed_hook_ids"
+      ],
+      "properties": {
+        "host_id": {"type": "string", "pattern": "^(?!codex$|claude$|gemini$|qwen$|codex-app$)(?!\\.|.*[. ]$)(?!con(?:\\..*)?$|prn(?:\\..*)?$|aux(?:\\..*)?$|nul(?:\\..*)?$|com[1-9](?:\\..*)?$|lpt[1-9](?:\\..*)?$)[a-z0-9][a-z0-9._-]{0,159}$"},
+        "home": {"type": "string", "minLength": 1},
+        "hook_config_path": {"type": "string", "minLength": 1},
+        "context_path": {"type": "string", "minLength": 1},
+        "skill_destination": {"type": "string", "minLength": 1},
+        "skill_root": {"type": "string", "minLength": 1},
+        "skill_mode": {"type": "string", "enum": ["copy", "link"]},
+        "source_skill_hash": {"$ref": "#/$defs/nullableDigest"},
+        "installed_skill_hash": {"$ref": "#/$defs/nullableDigest"},
+        "skill_binding_path": {"type": "string", "minLength": 1},
+        "skill_binding_hash": {"$ref": "#/$defs/nullableDigest"},
+        "profile_hash": {"$ref": "#/$defs/nullableDigest"},
+        "profile_path": {"type": "string", "pattern": "^host-profiles/(?!\\.|.*[. ]\\.json$)(?!con(?:\\..*)?\\.json$|prn(?:\\..*)?\\.json$|aux(?:\\..*)?\\.json$|nul(?:\\..*)?\\.json$|com[1-9](?:\\..*)?\\.json$|lpt[1-9](?:\\..*)?\\.json$)[a-z0-9][a-z0-9._-]{0,159}\\.json$"},
+        "hook_config_hash": {"$ref": "#/$defs/nullableDigest"},
+        "hook_template_hash": {"$ref": "#/$defs/nullableDigest"},
+        "context_hash": {"$ref": "#/$defs/nullableDigest"},
+        "skill_activation_mode": {"type": "string", "minLength": 1},
+        "capture_primary_path": {"type": "string", "minLength": 1},
+        "managed_hook_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "uniqueItems": true}
+      }
+    },
+    "legacyHostMigration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from_host_id", "to_host_id", "status", "reason_code"],
+      "properties": {
+        "from_host_id": {"type": "string", "minLength": 1},
+        "to_host_id": {"type": ["string", "null"]},
+        "status": {"type": "string", "minLength": 1},
+        "reason_code": {"type": "string", "minLength": 1}
+      }
+    },
+    "knowledgeRepository": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status", "mode", "root", "remote_name", "remote_fingerprint", "remote_classification", "branch",
+        "connected", "initial_push_complete", "sync_enabled"
+      ],
+      "properties": {
+        "status": {"const": "READY"},
+        "mode": {"type": "string", "enum": ["local", "github-new", "github-existing"]},
+        "root": {"type": "string", "minLength": 1},
+        "remote_name": {"type": ["string", "null"], "minLength": 1},
+        "remote_fingerprint": {"$ref": "#/$defs/nullableDigest"},
+        "remote_classification": {"type": ["string", "null"], "enum": [null, "local_path", "private_verified", "private_attested"]},
+        "branch": {"type": ["string", "null"], "minLength": 1},
+        "connected": {"type": "boolean"},
+        "initial_push_complete": {"type": "boolean"},
+        "sync_enabled": {"type": "boolean"}
+      }
+    },
+    "personalKnowledgeStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled", "status", "mode", "root", "remote_name", "remote_fingerprint", "remote_classification", "branch",
+        "connected", "initial_push_complete", "sync_enabled"
+      ],
+      "properties": {
+        "enabled": {"const": true},
+        "status": {"const": "READY"},
+        "mode": {"type": "string", "enum": ["local", "github-new", "github-existing"]},
+        "root": {"type": "string", "minLength": 1},
+        "remote_name": {"type": ["string", "null"], "minLength": 1},
+        "remote_fingerprint": {"$ref": "#/$defs/nullableDigest"},
+        "remote_classification": {"type": ["string", "null"], "enum": [null, "local_path", "private_verified", "private_attested"]},
+        "branch": {"type": ["string", "null"], "minLength": 1},
+        "connected": {"type": "boolean"},
+        "initial_push_complete": {"type": "boolean"},
+        "sync_enabled": {"type": "boolean"}
+      }
+    },
+    "teamKnowledgeStore": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled", "root", "store_id", "layout", "team_member_id", "writer_id", "transport", "transport_managed", "status"
+      ],
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "root": {"type": "string", "minLength": 1},
+        "store_id": {"type": "string", "pattern": "^team_[0-9a-f]{16,64}$"},
+        "layout": {"const": "member-writer-events-v1"},
+        "team_member_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"},
+        "writer_id": {"type": "string", "pattern": "^writer_[0-9a-f]{16,64}$"},
+        "transport": {"const": "external-shared-folder"},
+        "transport_managed": {"const": false},
+        "status": {"type": "string", "enum": ["READY", "DISABLED"]}
+      }
+    },
+    "knowledgeStores": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["personal", "team"],
+      "properties": {
+        "personal": {"$ref": "#/$defs/personalKnowledgeStore"},
+        "team": {"type": ["object", "null"], "oneOf": [{"$ref": "#/$defs/teamKnowledgeStore"}, {"type": "null"}]}
+      }
+    },
+    "reconciliation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["desired_state_digest"],
+      "properties": {
+        "desired_state_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

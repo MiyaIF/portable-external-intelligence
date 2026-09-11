@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "host": "claude-code",
+  "entries": [
+    {
+      "id": "claude-memory-1",
+      "title": "bounded verification",
+      "claim": "Verify the affected range after each write.",
+      "domain": "engineering",
+      "outcome_status": "success",
+      "benefit": "reduced_rework",
+      "cwd_fingerprint": "cwd:alpha"
+    }
+  ]
+}

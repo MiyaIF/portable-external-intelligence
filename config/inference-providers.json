@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "provider_order": [
+    "local-openai-compatible",
+    "ollama",
+    "subscription-cli",
+    "cloud-api"
+  ],
+  "cloud_spend_cap": 0,
+  "providers": {
+    "local-openai-compatible": {
+      "kind": "openai-compatible-http",
+      "enabled": true,
+      "locality": "local",
+      "endpoint": "http://127.0.0.1:8000/v1/chat/completions",
+      "model": "local-model",
+      "timeout_seconds": 30,
+      "max_response_bytes": 262144
+    },
+    "ollama": {
+      "kind": "ollama-subprocess",
+      "enabled": true,
+      "locality": "local",
+      "argv": ["ollama", "run"],
+      "model": "llama3.2",
+      "timeout_seconds": 60,
+      "max_response_bytes": 262144
+    },
+    "subscription-cli": {
+      "kind": "configured-cli",
+      "enabled": false,
+      "auto_from_selected_host": true,
+      "locality": "subscription",
+      "argv": [],
+      "timeout_seconds": 120,
+      "max_response_bytes": 262144
+    },
+    "cloud-api": {
+      "kind": "cloud-api",
+      "enabled": false,
+      "locality": "cloud",
+      "spend_cap": 0
+    }
+  }
+}

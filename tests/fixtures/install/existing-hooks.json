@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "Stop": [
+      {"id": "user-stop", "hooks": []}
+    ]
+  }
+}

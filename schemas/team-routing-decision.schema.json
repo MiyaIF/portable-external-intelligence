@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/team-routing-decision.schema.json",
+  "title": "Portable external intelligence team routing decision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "reason_code", "personal_event_hash", "team_store_id", "normalized_payload"],
+  "properties": {
+    "status": {"enum": ["ELIGIBLE", "NOT_ELIGIBLE", "DEFERRED", "FAILED"]},
+    "reason_code": {"type": "string", "minLength": 1, "maxLength": 96},
+    "personal_event_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "team_store_id": {"type": "string", "pattern": "^team_[0-9a-f]{16,64}$"},
+    "normalized_payload": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["title", "claim", "scope", "preconditions", "failure_modes", "benefit", "classification"],
+      "properties": {
+        "title": {"type": "string", "minLength": 1, "maxLength": 160},
+        "claim": {"type": "string", "minLength": 20, "maxLength": 1200},
+        "scope": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "preconditions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "failure_modes": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "benefit": {"type": "string", "minLength": 1},
+        "classification": {"enum": ["public", "private-reusable"]}
+      }
+    }
+  }
+}

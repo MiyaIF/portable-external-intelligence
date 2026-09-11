@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/blob/main/schemas/release-evidence-index.schema.json",
+  "title": "Public release evidence index",
+  "type": "object",
+  "required": ["evidence_type", "status", "subject_commit_sha", "evidence_commit_sha", "public_tree_audit_sha256", "workflow_sha256", "ci_runs", "package_sha256", "sbom_sha256", "publication_policy_sha256", "receipt_index", "states", "generated_at", "index_sha256"],
+  "properties": {
+    "evidence_type": {"const": "public_release_evidence"},
+    "status": {"type": "string", "enum": ["awaiting_public_subject", "awaiting_post_push_attestation", "verified"]},
+    "subject_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "evidence_commit_sha": {"type": ["string", "null"], "pattern": "^[0-9a-f]{40}$"},
+    "public_tree_audit_sha256": {"anyOf": [{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, {"type": "null"}]},
+    "workflow_sha256": {"anyOf": [{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, {"type": "null"}]},
+    "ci_runs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["run_id", "conclusion", "head_sha"],
+        "properties": {
+          "run_id": {"type": "integer", "minimum": 1},
+          "conclusion": {"type": "string", "enum": ["success", "failure", "cancelled", "skipped", "neutral", "action_required"]},
+          "head_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "package_sha256": {"anyOf": [{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, {"type": "null"}]},
+    "sbom_sha256": {"anyOf": [{"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}, {"type": "null"}]},
+    "publication_policy_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "receipt_index": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["receipt_type", "receipt_sha256"],
+        "properties": {
+          "receipt_type": {"type": "string", "enum": ["fixture", "hosted_contract", "real_host", "activation", "rollback", "ab"]},
+          "receipt_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "states": {
+      "type": "object",
+      "required": ["software_complete", "production_enabled", "effect_validated"],
+      "properties": {
+        "software_complete": {"type": "boolean"},
+        "production_enabled": {"type": "boolean"},
+        "effect_validated": {"const": "awaiting_sample"}
+      },
+      "additionalProperties": false
+    },
+    "generated_at": {"type": "string", "format": "date-time"},
+    "index_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  },
+  "additionalProperties": false
+}

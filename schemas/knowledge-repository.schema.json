@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/schemas/knowledge-repository.schema.json",
+  "title": "Private knowledge repository manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "repository_kind", "sync_enabled", "storage"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "repository_kind": {"type": "string", "const": "private-knowledge"},
+    "sync_enabled": {"type": "boolean", "const": false},
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["events_are_append_only", "projections_are_rebuildable", "deletion_uses_tombstones", "raw_transcripts_forbidden", "credentials_forbidden"],
+      "properties": {
+        "events_are_append_only": {"const": true},
+        "projections_are_rebuildable": {"const": true},
+        "deletion_uses_tombstones": {"const": true},
+        "raw_transcripts_forbidden": {"const": true},
+        "credentials_forbidden": {"const": true}
+      }
+    }
+  }
+}

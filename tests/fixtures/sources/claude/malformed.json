@@ -1,0 +1,5 @@
+{
+  "schema_version": 99,
+  "host": "claude-code",
+  "entries": [{"prompt": "must not be read"}]
+}

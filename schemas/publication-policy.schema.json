@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/portable-external-intelligence/publication-policy.schema.json",
+  "title": "Public repository publication policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "license_spdx",
+    "copyright_holder",
+    "public_author",
+    "github",
+    "security_reporting",
+    "contribution_policy",
+    "initial_version"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "const": 1 },
+    "license_spdx": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9.+-]*( (AND|OR|WITH) [A-Za-z0-9][A-Za-z0-9.+-]*)*$"
+    },
+    "copyright_holder": { "type": "string", "minLength": 1, "maxLength": 200 },
+    "public_author": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "email"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 100 },
+        "email": {
+          "type": "string",
+          "pattern": "^[0-9]+\\+[A-Za-z0-9-]+@users\\.noreply\\.github\\.com$"
+        }
+      }
+    },
+    "github": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "repository", "default_branch"],
+      "properties": {
+        "owner": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$" },
+        "repository": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$" },
+        "default_branch": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$" }
+      }
+    },
+    "security_reporting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "url", "acknowledgement_days", "triage_days"],
+      "properties": {
+        "type": { "const": "github_private_vulnerability_reporting" },
+        "url": { "type": "string", "format": "uri" },
+        "acknowledgement_days": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "triage_days": { "type": "integer", "minimum": 1, "maximum": 30 }
+      }
+    },
+    "contribution_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issues",
+        "pull_requests",
+        "dco_required",
+        "cla_required",
+        "response_sla_days",
+        "merge_guarantee",
+        "bug_bounty"
+      ],
+      "properties": {
+        "issues": { "type": "boolean" },
+        "pull_requests": { "type": "boolean" },
+        "dco_required": { "type": "boolean" },
+        "cla_required": { "type": "boolean" },
+        "response_sla_days": { "type": ["integer", "null"], "minimum": 0, "maximum": 365 },
+        "merge_guarantee": { "type": "boolean" },
+        "bug_bounty": { "type": "boolean" }
+      }
+    },
+    "initial_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    }
+  }
+}

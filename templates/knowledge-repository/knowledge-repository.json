@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "repository_kind": "private-knowledge",
+  "sync_enabled": false,
+  "storage": {
+    "events_are_append_only": true,
+    "projections_are_rebuildable": true,
+    "deletion_uses_tombstones": true,
+    "raw_transcripts_forbidden": true,
+    "credentials_forbidden": true
+  }
+}

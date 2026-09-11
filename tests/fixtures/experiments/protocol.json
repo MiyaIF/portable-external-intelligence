@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "experiment_id": "retrieval-v1",
+  "protocol_hash": "sha256:9bb4cd68f6b512534bdd885be54ac777f233c0380c1a31851b9b711363f4d3b3",
+  "alpha": 0.05,
+  "power_target": 0.8,
+  "minimum_detectable_effect": 0.2,
+  "minimum_sessions_per_variant": 50,
+  "minimum_calendar_days": 14,
+  "eligibility": {
+    "excluded_domains": ["financial-high-stakes", "legal", "medical", "security"],
+    "assignment": "session_id_hash",
+    "unit": "eligible_session_or_task"
+  },
+  "metrics": {
+    "primary": ["repeated_search", "rework", "failure"],
+    "secondary": ["uncached_input", "cached_input", "turns_to_completion"],
+    "guardrails": ["incorrect_pattern_application", "explicit_correction", "privacy_incident"]
+  },
+  "missing_data_policy": "remain_missing_never_impute_zero",
+  "stopping_rule": "do_not_stop_based_on_interim_effect",
+  "capture_and_curation": "both_arms",
+  "control": "shadow_retrieval_without_context",
+  "treatment": "selected_knowledge_context"
+}

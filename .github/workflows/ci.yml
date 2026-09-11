@@ -1,0 +1,95 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  unit-integration:
+    name: unit-integration
+    runs-on: windows-latest
+    timeout-minutes: 35
+    env:
+      PYTHON_VERSION: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Checkout without write credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install hash-locked dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --require-hashes -r requirements-build.lock
+          python -m pip install --require-hashes -r requirements-runtime.lock
+          python -m pip install --require-hashes -r requirements-ci.lock
+          python -m pip install --no-deps -e .
+
+      - name: Run bounded complete unittest suite
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          python scripts/run-release-validation.py --jobs 1 --timeout-seconds 300 --output "artifacts/unittest-$env:PYTHON_VERSION.json" --log-dir "artifacts/test-logs-$env:PYTHON_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify dependency locks and immutable actions
+        shell: pwsh
+        run: |
+          python scripts/verify-dependency-lock.py --pyproject pyproject.toml --build-lock requirements-build.lock --runtime-lock requirements-runtime.lock --ci-lock requirements-ci.lock --workflow-dir .github/workflows
+
+      - name: Verify public workflow security
+        shell: pwsh
+        run: python -m ei.cli public-release workflows verify --workflow-dir .github/workflows --json
+
+      - name: Audit production source
+        shell: pwsh
+        run: |
+          python scripts/audit-production-source.py --repo . --json > "artifacts/source-audit-$env:PYTHON_VERSION.json"
+          if ($LASTEXITCODE -ne 0) { Get-Content "artifacts/source-audit-$env:PYTHON_VERSION.json"; exit $LASTEXITCODE }
+
+      - name: Verify patch whitespace
+        shell: pwsh
+        run: |
+          git diff --check
+
+      - name: Upload test evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: test-evidence-python-${{ matrix.python-version }}
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
+
+  ci-status:
+    name: ci
+    needs: unit-integration
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    env:
+      REQUIRED_RESULT: ${{ needs.unit-integration.result }}
+    steps:
+      - name: Require every CI matrix job to succeed
+        shell: bash
+        run: test "$REQUIRED_RESULT" = "success"

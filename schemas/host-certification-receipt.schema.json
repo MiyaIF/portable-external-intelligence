@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["receipt_id", "mode", "host_id", "host_instance_id", "host_version", "os_family", "os_version", "python_version", "artifact_sha256", "event_sha256", "activation_state", "certified_at"],
+  "properties": {
+    "receipt_id": {"type": "string", "minLength": 1},
+    "mode": {"type": "string", "enum": ["real", "fixture"]},
+    "host_id": {"type": "string", "minLength": 1},
+    "host_instance_id": {"type": "string", "minLength": 1},
+    "host_version": {"type": "string", "minLength": 1},
+    "os_family": {"type": "string", "minLength": 1},
+    "os_version": {"type": "string", "minLength": 1},
+    "python_version": {"type": "string", "minLength": 1},
+    "artifact_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "event_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "activation_state": {"type": "string", "minLength": 1},
+    "certified_at": {"type": "string", "format": "date-time"}
+  },
+  "additionalProperties": false
+}

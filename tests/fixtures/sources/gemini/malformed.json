@@ -1,0 +1,5 @@
+{
+  "schema_version": 1,
+  "host": "gemini-cli",
+  "sessions": {"session_id": "malformed"}
+}

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "ttl_seconds": 604800,
+  "max_items": 10000,
+  "max_bytes": 536870912,
+  "max_payload_bytes": 2097152,
+  "allowed_encrypted_classifications": [
+    "public",
+    "private-reusable",
+    "client-confidential"
+  ],
+  "require_encryption": true,
+  "emergency_spool": {
+    "max_items": 1000,
+    "max_bytes": 67108864,
+    "ttl_seconds": 86400
+  }
+}

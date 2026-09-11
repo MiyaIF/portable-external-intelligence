@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "purpose": "sanitized-complete-legacy-tree",
+  "files": [
+    "MEMORY.md",
+    "external-article.md",
+    "patterns/sample.md",
+    "rollout_summaries/sample.jsonl",
+    "extensions/ad_hoc/notes/correction.md",
+    "skills/sample/SKILL.md",
+    "unsupported/sample.bin"
+  ]
+}

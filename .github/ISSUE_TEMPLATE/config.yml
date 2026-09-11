@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/MiyaIF/portable-external-intelligence/security/advisories/new
+    about: Use Private Vulnerability Reporting; do not publish an unpatched vulnerability.
+  - name: Read support guidance
+    url: https://github.com/MiyaIF/portable-external-intelligence/blob/main/docs/support.md
+    about: Check setup, compatibility, privacy, and recovery guidance first.

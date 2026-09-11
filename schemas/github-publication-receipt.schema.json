@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/blob/main/schemas/github-publication-receipt.schema.json",
+  "title": "Guarded GitHub publication plan or receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_type", "schema_version", "tool_version", "status", "owner",
+    "repository", "repository_url", "default_branch", "source_commit_sha",
+    "source_tree_id", "source_tree_sha256", "root_commit_count",
+    "source_audit_sha256", "plan_sha256", "settings", "settings_sha256",
+    "ruleset", "ruleset_sha256", "feature_states", "target_observation",
+    "ci_run_urls", "post_public_clone", "mutations_performed",
+    "external_mutations", "generated_at", "receipt_sha256"
+  ],
+  "properties": {
+    "receipt_type": {"const": "github_publication"},
+    "schema_version": {"const": 1},
+    "tool_version": {"type": "string", "pattern": "^[A-Za-z0-9_.-]+/[0-9]+$"},
+    "status": {"enum": ["ready_for_confirmation", "blocked", "published", "verified"]},
+    "owner": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,38}$"},
+    "repository": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"},
+    "repository_url": {"type": "string", "format": "uri", "pattern": "^https://github\\.com/[^/]+/[^/]+$"},
+    "default_branch": {"const": "main"},
+    "source_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "root_commit_count": {"const": 1},
+    "source_audit_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "plan_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "settings": {
+      "type": "object",
+      "required": ["visibility", "has_issues", "has_projects", "has_wiki", "has_discussions", "security_and_analysis"],
+      "properties": {
+        "visibility": {"const": "public"},
+        "has_issues": {"type": "boolean"},
+        "has_projects": {"const": false},
+        "has_wiki": {"const": false},
+        "has_discussions": {"const": false},
+        "security_and_analysis": {
+          "type": "object",
+          "additionalProperties": {"const": "enabled"}
+        }
+      },
+      "additionalProperties": false
+    },
+    "settings_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "ruleset": {
+      "type": "object",
+      "required": ["name", "target", "enforcement", "required_status_checks", "required_approving_review_count", "require_code_owner_reviews", "dismiss_stale_reviews", "allow_force_pushes", "allow_deletions", "workflow_security_review_required", "root_privacy_review_required", "signed_tags_required"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "target": {"const": "branch"},
+        "enforcement": {"const": "active"},
+        "required_status_checks": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "required_approving_review_count": {"type": "integer", "minimum": 1},
+        "require_code_owner_reviews": {"const": true},
+        "dismiss_stale_reviews": {"const": true},
+        "allow_force_pushes": {"const": false},
+        "allow_deletions": {"const": false},
+        "workflow_security_review_required": {"const": true},
+        "root_privacy_review_required": {"const": true},
+        "signed_tags_required": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    },
+    "ruleset_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "feature_states": {
+      "type": "object",
+      "required": ["visibility", "issues", "pull_requests", "wiki", "projects", "discussions", "secret_scanning", "secret_scanning_push_protection", "dependabot_alerts", "dependabot_security_updates", "private_vulnerability_reporting", "code_scanning", "actions_hosted_runners_only", "self_hosted_runner_registered"],
+      "properties": {
+        "visibility": {"const": "public"},
+        "issues": {"type": "boolean"},
+        "pull_requests": {"type": "boolean"},
+        "wiki": {"const": false},
+        "projects": {"const": false},
+        "discussions": {"const": false},
+        "secret_scanning": {"const": true},
+        "secret_scanning_push_protection": {"const": true},
+        "dependabot_alerts": {"const": true},
+        "dependabot_security_updates": {"const": true},
+        "private_vulnerability_reporting": {"const": true},
+        "code_scanning": {"const": true},
+        "actions_hosted_runners_only": {"const": true},
+        "self_hosted_runner_registered": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "target_observation": {
+      "type": "object",
+      "required": ["status", "method"],
+      "properties": {
+        "status": {"enum": ["not_found", "exists", "unknown"]},
+        "method": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "ci_run_urls": {"type": "array", "items": {"type": "string", "format": "uri", "pattern": "^https://github\\.com/[^/]+/[^/]+/actions/runs/[0-9]+$"}},
+    "post_public_clone": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["root_commit_sha", "tree_id", "tree_sha256", "root_commit_count", "audit_sha256", "package_sha256", "readme_quick_start"],
+          "properties": {
+            "root_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "tree_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "tree_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "root_commit_count": {"const": 1},
+            "audit_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "package_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+            "readme_quick_start": {"const": true}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "mutations_performed": {"type": "boolean"},
+    "external_mutations": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "receipt_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

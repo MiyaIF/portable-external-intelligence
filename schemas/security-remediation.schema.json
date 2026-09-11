@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/schemas/security-remediation.schema.json",
+  "title": "Release-bound security remediation evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_type",
+    "schema_version",
+    "scan_id",
+    "subject_commit_sha",
+    "status",
+    "scanner_receipt_sha256",
+    "scanner_snapshot_sha256",
+    "reportable_finding_count",
+    "finding_set_sha256",
+    "findings",
+    "report_sha256"
+  ],
+  "properties": {
+    "receipt_type": {"const": "security_remediation"},
+    "schema_version": {"const": 1},
+    "scan_id": {"type": "string", "minLength": 1, "maxLength": 160},
+    "subject_commit_sha": {"$ref": "#/$defs/commit"},
+    "status": {"const": "resolved"},
+    "scanner_receipt_sha256": {"$ref": "#/$defs/sha256"},
+    "scanner_snapshot_sha256": {"$ref": "#/$defs/sha256"},
+    "reportable_finding_count": {"type": "integer", "minimum": 0},
+    "finding_set_sha256": {"$ref": "#/$defs/sha256"},
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "severity", "status", "subject_commit_sha", "regression_evidence_sha256"],
+        "properties": {
+          "finding_id": {"type": "string", "minLength": 1, "maxLength": 160},
+          "severity": {"enum": ["low", "medium", "high", "critical"]},
+          "status": {"const": "fixed"},
+          "subject_commit_sha": {"$ref": "#/$defs/commit"},
+          "regression_evidence_sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "report_sha256": {"$ref": "#/$defs/sha256"}
+  },
+  "$defs": {
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

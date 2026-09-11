@@ -1,0 +1,68 @@
+{
+  "schema_version": 2,
+  "max_inspect_chars": 2000000,
+  "allowed_sync_classifications": [
+    "public",
+    "private-reusable"
+  ],
+  "allow_user_baseline_classifications": [],
+  "reject_path_fragments": [
+    ".env",
+    ".env.",
+    "auth",
+    "auth.json",
+    "authentication",
+    "credentials",
+    "cookies",
+    "browser",
+    "browser-state",
+    "transcript",
+    "raw-transcript",
+    "sqlite",
+    "sqlite3",
+    ".db",
+    "spool",
+    "quarantine",
+    ".ei-local"
+  ],
+  "secret_rules": [
+    "private_key_block",
+    "authorization_header",
+    "cookie_header",
+    "password_assignment",
+    "credential_assignment",
+    "provider_token",
+    "connection_string"
+  ],
+  "redaction": {
+    "algorithm": "deterministic-token-replacement",
+    "post_redaction_rescan": true,
+    "client_confidential_sync_requires": "irreversible_generalization"
+  },
+  "classifications": {
+    "public": {
+      "allow_private_sync": true,
+      "allow_user_baseline": false
+    },
+    "private-reusable": {
+      "allow_private_sync": true,
+      "allow_user_baseline": false
+    },
+    "client-confidential": {
+      "allow_private_sync": false,
+      "allow_user_baseline": false
+    },
+    "machine-local": {
+      "allow_private_sync": false,
+      "allow_user_baseline": false
+    },
+    "secret": {
+      "allow_private_sync": false,
+      "allow_user_baseline": false
+    },
+    "external-reference": {
+      "allow_private_sync": false,
+      "allow_user_baseline": false
+    }
+  }
+}

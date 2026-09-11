@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["schema_version", "user_environment", "external_reference"],
+  "properties": {
+    "schema_version": {"type": "integer"},
+    "user_environment": {"$ref": "#/$defs/totals"},
+    "external_reference": {"$ref": "#/$defs/totals"},
+    "excluded": {"$ref": "#/$defs/totals"},
+    "retrieval": {"$ref": "#/$defs/retrieval"}
+  },
+  "$defs": {
+    "totals": {
+      "type": "object",
+      "required": ["input_tokens", "cached_input_tokens", "uncached_input_tokens", "turns"],
+      "properties": {
+        "input_tokens": {"type": "integer", "minimum": 0},
+        "cached_input_tokens": {"type": "integer", "minimum": 0},
+        "uncached_input_tokens": {"type": "integer", "minimum": 0},
+        "turns": {"type": "integer", "minimum": 0}
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_ids", "selected_ids", "candidate_scopes", "selected_scopes",
+        "injected_chars", "retrieval_latency_ms", "empty_result", "team_unavailable", "scope"
+      ],
+      "properties": {
+        "candidate_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "selected_ids": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        "candidate_scopes": {"type": "array", "items": {"enum": ["personal", "team"]}},
+        "selected_scopes": {"type": "array", "items": {"enum": ["personal", "team"]}},
+        "injected_chars": {"type": "integer", "minimum": 0},
+        "retrieval_latency_ms": {"type": "integer", "minimum": 0},
+        "empty_result": {"type": "boolean"},
+        "team_unavailable": {"type": "boolean"},
+        "scope": {"enum": ["personal", "team", "mixed"]}
+      }
+    }
+  }
+}

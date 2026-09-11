@@ -1,0 +1,11 @@
+# Machine-local and temporary data must never be committed here.
+.ei-runtime/
+runtime/
+cache/
+logs/
+*.sqlite
+*.sqlite3
+*.db
+*.tmp
+*.bak
+__pycache__/

@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/blob/main/schemas/public-clone-receipt.schema.json",
+  "title": "Hosted clean public clone certification receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_type",
+    "schema_version",
+    "status",
+    "source_commit_sha",
+    "clone_commit_sha",
+    "source_tree_id",
+    "clone_tree_id",
+    "os",
+    "python_version",
+    "package_hashes",
+    "runner_inventory_sha256",
+    "workflow_sha256",
+    "dependency_lock_sha256",
+    "source_audit_sha256",
+    "public_audit_sha256",
+    "host_contracts",
+    "test_module_count",
+    "test_count",
+    "test_skipped_count",
+    "duration_seconds",
+    "steps",
+    "offline_fixtures",
+    "isolated_environment",
+    "absolute_path_findings",
+    "generated_at",
+    "receipt_sha256"
+  ],
+  "properties": {
+    "receipt_type": {"const": "public_clone_certification"},
+    "schema_version": {"const": 1},
+    "status": {"enum": ["PASSED", "FAILED", "BLOCKED"]},
+    "source_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "clone_commit_sha": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "source_tree_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "clone_tree_id": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "os": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["system", "release", "image"],
+      "properties": {
+        "system": {"type": "string", "pattern": "^[A-Za-z0-9_.:/-]{1,120}$"},
+        "release": {"type": "string", "pattern": "^[A-Za-z0-9_.:/-]{1,120}$"},
+        "image": {"type": "string", "pattern": "^[A-Za-z0-9_.:/-]{1,120}$"}
+      }
+    },
+    "python_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"},
+    "package_hashes": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+    },
+    "runner_inventory_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "workflow_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "dependency_lock_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "source_audit_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "public_audit_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "host_contracts": {
+      "type": "array",
+      "const": ["codex-cli", "claude-code", "gemini-cli", "qwen-code"]
+    },
+    "test_module_count": {"type": "integer", "minimum": 1},
+    "test_count": {"type": "integer", "minimum": 1},
+    "test_skipped_count": {"type": "integer", "minimum": 0},
+    "duration_seconds": {"type": "number", "minimum": 0},
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "status", "duration_seconds"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "status": {"enum": ["passed", "failed"]},
+          "duration_seconds": {"type": "number", "minimum": 0},
+          "error_code": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,120}$"}
+        }
+      }
+    },
+    "offline_fixtures": {"const": true},
+    "isolated_environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["venv", "developer_home", "credentials", "git_config"],
+      "properties": {
+        "venv": {"const": true},
+        "developer_home": {"const": false},
+        "credentials": {"const": false},
+        "git_config": {"const": false}
+      }
+    },
+    "absolute_path_findings": {"const": 0},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "receipt_sha256": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+  }
+}

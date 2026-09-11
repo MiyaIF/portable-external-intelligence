@@ -1,0 +1,3 @@
+# Maintain workflow
+
+Use the generated Skill launcher from managed global context and append `maintain` with only the required bounded options. Never call `scripts/maintain.py` directly or substitute the active project. The launcher delegates through the isolated bound Python to the production ei maintain CLI with shell execution disabled and a bounded timeout. The CLI performs ingestion, reconciliation, projection, queue/spool health checks, deferred-provider retry, and optional configured synchronization. Do not edit knowledge files from the Skill. Synchronization remains disabled unless the private remote assurance and operator approval are present.

@@ -1,0 +1,7 @@
+model = "existing-model-value"
+
+[features]
+memories = false
+
+[desktop]
+defaultTerminalLocation = "right"

@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "roots": {
+    "engine_role": "public-source-read-only",
+    "knowledge_role": "private-knowledge-git-or-local",
+    "runtime_role": "machine-local-git-forbidden",
+    "require_distinct": true
+  },
+  "retrieval": {
+    "max_chars": 5000,
+    "max_results": 5,
+    "min_score": 0.35
+  },
+  "context": {
+    "prompt_max_chars": 5000,
+    "session_start_max_chars": 2000,
+    "always_on_target_chars": 9000,
+    "always_on_hard_cap_chars": 12000
+  },
+  "hooks": {
+    "session_start_budget_ms": 2000,
+    "prompt_budget_ms": 1000,
+    "stop_budget_ms": 300,
+    "session_end_budget_ms": 3000
+  },
+  "providers": {
+    "order": [
+      "local-openai-compatible",
+      "ollama",
+      "subscription-cli",
+      "cloud-api"
+    ],
+    "cloud_spend_cap": 0
+  },
+  "curation": {
+    "max_attempts": 3,
+    "retry_delay_seconds": 300
+  },
+  "sync": {
+    "enabled": false,
+    "remote": "origin",
+    "branch": "main",
+    "managed_paths": [
+      "events/**",
+      "knowledge/**"
+    ],
+    "remote_race_retries": 2,
+    "retry_seconds": [
+      300,
+      900,
+      3600,
+      21600
+    ],
+    "worktree_name": "sync-worktree"
+  },
+  "capture": {
+    "max_per_session": 3,
+    "max_payload_bytes": 32768
+  },
+  "scheduler": {
+    "task_name": "CodexExternalIntelligenceMaintenance-v1",
+    "interval_minutes": 30,
+    "timeout_seconds": 600,
+    "log_max_bytes": 1048576,
+    "log_retention_files": 5
+  },
+  "experiment": {
+    "enabled": false,
+    "experiment_id": "retrieval-v1"
+  },
+  "dependency_locks": {
+    "ci_tools": {
+      "detect-secrets": "1.5.0",
+      "pip-audit": "2.10.1"
+    }
+  }
+}

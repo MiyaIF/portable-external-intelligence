@@ -1,0 +1,5 @@
+{"type":"session_meta","payload":{"id":"rollout-1"}}
+{"type":"turn_context","cwd":"C:/work/sheet-a","domain":"spreadsheet-operations","outcome_status":"success"}
+{"type":"response_item","kind":"reusable_knowledge","title":"数式確認","claim":"書込後は対象範囲を再読込して数式と値を確認する","benefit":"reduced_rework"}
+{"type":"response_item","kind":"failure","title":"再読込不足","claim":"保存後に再読込しないと古い値を前提に修正して失敗する","benefit":"avoided_failure","outcome_status":"failed"}
+

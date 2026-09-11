@@ -1,0 +1,17 @@
+{
+  "schema_version": 2,
+  "policy_version": "retrieval-v1",
+  "lexical_relevance": 0.35,
+  "scope_match": 0.20,
+  "evidence_strength": 0.15,
+  "freshness": 0.10,
+  "observed_benefit": 0.10,
+  "host_applicability": 0.05,
+  "prior_success": 0.05,
+  "min_score": 0.35,
+  "max_results": 5,
+  "max_chars": 5000,
+  "freshness_half_life_days": 365,
+  "allow_cross_host": false,
+  "include_tombstones": false
+}

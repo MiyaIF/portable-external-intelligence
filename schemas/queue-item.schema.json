@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["queue_id", "event_id", "idempotency_key", "stage", "state", "attempts", "created_at", "source_hash", "host_id", "session_id_hash", "turn_id_hash", "payload_ref", "provider_preference", "privacy_classification"],
+  "properties": {
+    "queue_id": {"type": "string", "minLength": 1},
+    "event_id": {"type": "string", "pattern": "^evt_[0-9TZ]+_[0-9a-f]{12}$"},
+    "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "stage": {"type": "string", "minLength": 1},
+    "state": {"type": "string", "enum": ["READY", "IN_PROGRESS", "DEFERRED", "FAILED_RETRYABLE", "FAILED_NEEDS_ATTENTION", "YES_CURATING", "NO_DISCARDED", "DONE", "QUARANTINED", "DEFERRED_QUOTA", "FAILED"]},
+    "attempts": {"type": "integer", "minimum": 0},
+    "created_at": {"type": "string", "format": "date-time"},
+    "next_eligible_at": {"type": ["string", "null"], "format": "date-time"},
+    "source_ref": {"type": ["string", "null"]},
+    "source_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "host_id": {"type": "string", "minLength": 1},
+    "session_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "turn_id_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "payload_ref": {"anyOf": [{"$ref": "#/$defs/spool_ref"}, {"type": "null"}]},
+    "provider_preference": {"type": "array", "maxItems": 1, "items": {"type": "string", "minLength": 1}},
+    "privacy_classification": {"type": "string", "minLength": 1},
+    "source_host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "source_host_family": {"type": "string", "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "lease_owner": {"type": ["string", "null"]},
+    "lease_expires_at": {"type": ["string", "null"], "format": "date-time"},
+    "last_error_code": {"type": ["string", "null"]}
+  },
+  "not": {"required": ["body"]},
+  "additionalProperties": false,
+  "$defs": {
+    "spool_ref": {
+      "type": "object",
+      "required": ["spool_id", "content_hash", "classification", "created_at", "expires_at", "encrypted"],
+      "properties": {
+        "spool_id": {"type": "string", "minLength": 1},
+        "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "classification": {"type": "string", "minLength": 1},
+        "created_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "key_id": {"type": ["string", "null"]},
+        "encrypted": {"type": "boolean"}
+      },
+      "additionalProperties": false
+    }
+  }
+}
