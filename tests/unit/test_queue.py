@@ -9,10 +9,12 @@ from ei.hooks.registry import normalize_hook_event
 from ei.key_provider import InMemoryKeyProvider
 from ei.queue import (
     QueueError,
+    QueueItem,
     QueueState,
     claim_queue_item,
     enqueue_receipt,
     queue_health,
+    read_queue_item,
     recover_emergency_spool,
     write_emergency_envelope,
     transition_queue_item,
@@ -55,6 +57,43 @@ def make_event(settings, event_name="Stop", turn_id="t1"):
 
 
 class QueueTests(unittest.TestCase):
+    def test_legacy_source_host_omission_is_read_without_rewriting_or_reprocessing(self):
+        for state in ("NO_DISCARDED", "DONE"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                settings = make_isolated_hook_settings(Path(tmp))
+                item = enqueue_receipt(make_event(settings), None, settings, now=NOW)
+                raw = item.to_dict()
+                raw.pop("source_host_id")
+                raw.pop("source_host_family")
+                raw["state"] = state
+                path = settings.paths.queue_dir / f"{item.queue_id}.json"
+                path.write_text(json.dumps(raw), encoding="utf-8")
+                before = path.read_bytes(), path.stat().st_mtime_ns
+                try:
+                    loaded = read_queue_item(item.queue_id, settings)
+                except QueueError as exc:
+                    self.fail(f"valid legacy queue rejected: {exc}")
+                self.assertEqual(loaded.source_host_id, "")
+                self.assertNotIn("source_host_id", loaded.to_dict())
+                self.assertEqual(queue_health(settings).corrupt, 0)
+                self.assertIsNone(claim_queue_item("worker", settings, NOW))
+                self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), before)
+
+    def test_explicit_invalid_source_host_is_not_hidden_as_legacy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            raw = enqueue_receipt(make_event(settings), None, settings, now=NOW).to_dict()
+            for fields in ({"source_host_id": "", "source_host_family": ""},
+                           {"source_host_id": None, "source_host_family": None},
+                           {"source_host_id": "codex-cli"},
+                           {"source_host_family": "codex-cli"}):
+                with self.subTest(fields=fields):
+                    value = {k: v for k, v in raw.items()
+                             if k not in {"source_host_id", "source_host_family"}}
+                    value.update(fields)
+                    with self.assertRaises(QueueError):
+                        QueueItem.from_dict(value)
+
     def test_payload_is_durable_before_queue_receipt(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
