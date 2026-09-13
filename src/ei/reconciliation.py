@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from .cluster import assign_cluster
 from .dedup import content_fingerprint, detect_polarity, normalize_claim
 from .ids import machine_id, stable_hash
 from .journal import append_event
-from .lifecycle import evaluate_lifecycle
+from .lifecycle import evaluate_lifecycle, promotion_eligibility
 from .models import (
     ClusterState,
     Event,
@@ -309,6 +309,41 @@ def _apply_pattern_events(records: dict[str, _ClusterRecord], events: Iterable[E
             count = exposure_counts.get(record.state.pattern_id, 0)
             last_used = max(record.state.last_used_at or "", exposure_times.get(record.state.cluster_id, "")) or None
             record.state = replace(record.state, exposure_count=count, last_used_at=last_used)
+
+
+def candidate_diagnostics(events: Iterable[Event], policy: PromotionPolicy | None = None) -> tuple[dict[str, Any], ...]:
+    """Explain existing candidates using the lifecycle's evidence, without writes."""
+    current = sorted(list(events), key=lambda event: (event.occurred_at, event.event_id))
+    candidates: dict[str, str] = {}
+    for event in current:
+        pattern_id = event.payload.get("pattern_id")
+        if not isinstance(pattern_id, str) or not pattern_id:
+            continue
+        if event.event_type == "pattern.candidate_created":
+            candidates[pattern_id] = str(event.payload.get("cluster_id", ""))
+        elif event.event_type in {"pattern.promoted", "pattern.revised", "pattern.deprecated", "pattern.superseded", "pattern.tombstoned"}:
+            candidates.pop(pattern_id, None)
+    if not candidates:
+        return ()
+    records, _ = _cluster_observations(current)
+    _apply_pattern_events(records, current)
+    selected_policy = policy or PromotionPolicy.defaults()
+    rows: list[dict[str, Any]] = []
+    for pattern_id, cluster_id in sorted(candidates.items()):
+        record = records.get(cluster_id)
+        state = record.state if record is not None else None
+        eligibility = promotion_eligibility(state, selected_policy) if state is not None else None
+        rows.append({
+            "pattern_id": pattern_id,
+            "eligible": eligibility.valid if eligibility else False,
+            "reason_codes": list(eligibility.reason_codes) if eligibility else ["CANDIDATE_EVIDENCE_UNAVAILABLE"],
+            "provenance_count": len(state.provenances) if state else 0,
+            "scope_count": len(state.scopes) if state else 0,
+            "benefit_count": state.benefit_count if state else 0,
+            "contradiction_count": len(state.contradiction_provenances) if state else 0,
+            "policy_version": selected_policy.policy_version,
+        })
+    return tuple(rows)
 
 
 def reconcile_lifecycle(events: Iterable[Event], event_dir, now_utc: datetime | str | None = None, policy: PromotionPolicy | None = None) -> ReconciliationResult:

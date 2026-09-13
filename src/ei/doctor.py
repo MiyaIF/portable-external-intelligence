@@ -16,6 +16,9 @@ from typing import Any, Mapping
 from .canary import read_hook_status, skill_discovery_canary, static_canary
 from .config import Settings, load_settings
 from .index import build_index
+from .journal import iter_events
+from .projection_state import projection_freshness_report
+from .reconciliation import candidate_diagnostics
 from .install_agents import inspect_global_agents, managed_block_sha256, render_managed_context
 from .knowledge_repository import KnowledgeRepositoryError, inspect_knowledge_repository
 from .remote_assurance import RemoteAssuranceError, assure_remote, load_remote_assurance_receipt, remote_fingerprint
@@ -743,13 +746,19 @@ def _projection_check(settings: Settings, strict: bool, event_count: int) -> dic
         )
     try:
         index = build_index(knowledge, index_path)
+        events = list(iter_events(settings.paths.event_dir)) if settings.paths.event_dir.exists() else []
+        freshness = projection_freshness_report(index_path, events)
         return _check(
             "projection",
-            True,
+            not strict or freshness["freshness"] == "CURRENT"
+            or (freshness["freshness"] == "UNKNOWN" and event_count == 0 and index.item_count == 0),
             required=strict,
+            **freshness,
+            candidate_diagnostics=list(candidate_diagnostics(events)),
             index_present=True,
             item_count=index.item_count,
             active_patterns=len(index.active_pattern_ids),
+            candidate_patterns=len(index.candidate_pattern_ids),
             archived_patterns=len(index.archive_pattern_ids),
             observation_count=index.observation_count,
             always_on_chars=index.always_on_chars,
@@ -874,6 +883,7 @@ def _provider_check(settings: Settings, strict: bool, queue_ready: int) -> dict[
             eligible=eligible,
             organizer=organizer,
             organizer_status=organizer.get("status"),
+            cloud_spend_cap=getattr(settings, "cloud_spend_cap", None),
             quota_state="DEFERRED" if queue_ready and eligible == 0 else "AVAILABLE" if eligible else "NOT_REQUIRED",
         )
     except (OSError, TypeError, ValueError, RuntimeError) as exc:
@@ -1005,6 +1015,29 @@ def _recovery_check(settings: Settings, strict: bool) -> dict[str, Any]:
     )
 
 
+def maintenance_status(settings: Settings, manifest: Mapping[str, Any], scheduler: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Keep automatic configuration separate from the last manual/automatic result."""
+    requested = manifest.get("scheduler_requested")
+    health = _read_json(Path(settings.paths.runtime_root) / "health.json")
+    last_status = health.get("status")
+    if last_status not in {"success", "partial", "failed"}:
+        last_status = "unknown"
+    if requested is False:
+        state, reason = "DISABLED", "AUTOMATIC_MAINTENANCE_DISABLED"
+    elif requested is True:
+        try:
+            scheduler = scheduler if scheduler is not None else inspect_registered_task(settings)
+            configured = scheduler.get("registered") is True and scheduler.get("ok") is True
+        except (OSError, ValueError, TypeError, RuntimeError):
+            configured = False
+        state = "CONFIGURED" if configured else "UNVERIFIED"
+        reason = None if configured else "AUTOMATIC_MAINTENANCE_UNVERIFIED"
+    else:
+        state, reason = "UNKNOWN", "AUTOMATIC_MAINTENANCE_UNVERIFIED"
+    return {"status": state, "reason_code": reason, "requested": requested if type(requested) is bool else None,
+            "last_recorded_status": last_status, "continuous_execution_verified": False}
+
+
 def run_doctor(
     settings: Settings,
     strict: bool = False,
@@ -1058,6 +1091,9 @@ def run_doctor(
             required=strict,
             reason_code=_reason(str(exc), "SCHEDULER_STATE_INVALID"),
         ))
+    scheduler_check = next((item for item in checks if item.get("name") == "scheduler"), {})
+    checks.append(_check("maintenance", True, required=False,
+                         **maintenance_status(settings, manifest, scheduler_check)))
     repairs = _repair_items(checks)
     if repair_plan is not None and str(repair_plan) != "-":
         target = Path(repair_plan).expanduser().resolve()

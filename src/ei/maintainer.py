@@ -1212,6 +1212,23 @@ def run_maintenance(
         team_services=team_services,
     )
     personal_summary = _knowledge_summary(projection)
+    from .reconciliation import candidate_diagnostics
+
+    try:
+        personal_summary["candidate_diagnostics"] = list(candidate_diagnostics(events))
+    except (ValueError, TypeError, RuntimeError) as exc:
+        errors.append({"stage": "candidate_diagnostics", "error_code": _safe_code(str(exc), "CANDIDATE_DIAGNOSTICS_UNAVAILABLE")})
+    if projection is not None:
+        from .projection_state import projection_freshness_report
+
+        try:
+            freshness = projection_freshness_report(projection.index_path, _events(settings))
+            personal_summary.update(freshness)
+            if freshness["freshness"] != "CURRENT":
+                errors.append({"stage": "projection", "error_code": freshness["reason_code"]})
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            personal_summary["freshness"] = "UNKNOWN"
+            errors.append({"stage": "projection", "error_code": _safe_code(str(exc), "PROJECTION_CHECK_FAILED")})
 
     sync_result: Mapping[str, Any] = {
         "requested": sync_policy == "auto", "policy": sync_policy, "status": "not_requested",
