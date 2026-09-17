@@ -4839,7 +4839,8 @@ def _guided_interactive_selection(args: argparse.Namespace) -> SetupSelection:
         sync_selection = getattr(args, "sync", None)
         sync = bool(sync_selection) if sync_selection is not None else prompt_bool("Git同期を有効にしますか", knowledge_mode in {"github-new", "github-existing"})
         experiment = bool(getattr(args, "experiment", False)) or prompt_bool("A/B測定を有効にしますか", False)
-        scheduler = bool(getattr(args, "scheduler", False)) or prompt_bool("任意の保守schedulerを有効にしますか", False)
+        scheduler_arg = getattr(args, "scheduler", None)
+        scheduler = bool(scheduler_arg) if scheduler_arg is not None else prompt_bool("任意の保守schedulerを有効にしますか", False)
         skill_mode = getattr(args, "skill_mode", "copy")
         if skill_mode == "copy":
             skill_mode = prompt_text("Skillの導入方法（copy/link）", skill_mode)
@@ -4848,9 +4849,18 @@ def _guided_interactive_selection(args: argparse.Namespace) -> SetupSelection:
         providers = _parse_values(getattr(args, "providers", ()), deduplicate=False)
         privacy_profile = getattr(args, "privacy_profile", "private-reusable")
         sync_arg = getattr(args, "sync", None)
-        sync = bool(sync_arg) if sync_arg is not None else (previous_knowledge_record.get("sync_enabled") is True if previous else knowledge_mode in {"github-new", "github-existing"})
+        sync = bool(sync_arg) if sync_arg is not None else prompt_bool(
+            "個人ナレッジをGitリモートにも同期しますか（ローカルの自動蓄積とは別）",
+            previous_knowledge_record.get("sync_enabled") is True if previous else False,
+        )
         experiment = bool(getattr(args, "experiment", False)) or (previous.get("experiment_enabled") is True if previous else False)
-        scheduler = bool(getattr(args, "scheduler", False)) or (previous.get("scheduler_requested") is True if previous else False)
+        write_utf8("定期処理は記憶の候補を整理・再試行します。整理AIの利用枠を消費する場合があります。")
+        write_utf8("実行間隔は既定で30分です。再実行では既存の間隔と有効・無効の選択を引き継ぎます。")
+        scheduler_arg = getattr(args, "scheduler", None)
+        scheduler = bool(scheduler_arg) if scheduler_arg is not None else prompt_bool(
+            "記憶の整理を定期的に実行しますか（自動蓄積には有効化を推奨）",
+            previous.get("scheduler_requested") is True if previous else False,
+        )
         if previous and privacy_profile == "private-reusable" and isinstance(previous.get("privacy_profile"), str):
             privacy_profile = str(previous["privacy_profile"])
         skill_mode = getattr(args, "skill_mode", "copy")
@@ -5151,7 +5161,10 @@ def _main() -> int:
     sync_group.add_argument("--no-sync", dest="sync", action="store_false")
     parser.set_defaults(sync=None)
     parser.add_argument("--experiment", action="store_true")
-    parser.add_argument("--scheduler", action="store_true")
+    scheduler_group = parser.add_mutually_exclusive_group()
+    scheduler_group.add_argument("--scheduler", dest="scheduler", action="store_true")
+    scheduler_group.add_argument("--no-scheduler", dest="scheduler", action="store_false")
+    parser.set_defaults(scheduler=None)
     parser.add_argument("--skill-mode", choices=("copy", "link"), default="copy")
     parser.add_argument("--skip-venv", action="store_true")
     parser.add_argument("--check-only", action="store_true")
@@ -5220,8 +5233,11 @@ def _main() -> int:
             _print(result.to_dict(), args.json_mode)
             return 0 if result.ok else 1
         if args.setup or (not args.repo and not args.codex_home):
-            result = setup(_interactive_selection(args), args.check_only)
-            _print(result.to_dict(), args.json_mode)
+            from .setup_activation import setup_result_with_guidance
+            selection = _interactive_selection(args)
+            result = setup(selection, args.check_only)
+            value = setup_result_with_guidance(selection, result, interactive=not args.json_mode and not args.non_interactive and sys.stdin.isatty(), check_only=args.check_only)
+            _print(value, args.json_mode)
             return 0 if result.ok else 1
         if not args.repo or not args.codex_home:
             raise ValueError("INSTALL_PATHS_REQUIRED")

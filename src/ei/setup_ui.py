@@ -370,6 +370,8 @@ def render_setup_summary(
     )
     lines.append("外部知能: 1つ（既存ナレッジを共用）")
     lines.append(f"記憶の整理AI: {_organizer_text(effective_provider, effective_host, custom_labels)}")
+    lines.append("定期的な記憶整理: " + ("有効（整理AIの利用枠を消費する場合があります）" if getattr(selection, "scheduler", False) else "無効"))
+    lines.append("Gitリモート同期: " + ("有効" if getattr(selection, "sync", False) else "無効（ローカル保存のみ）"))
     display_hosts = current_hosts | previous_hosts
     host_labels = [_host_label(item, custom_labels) for item in sorted(display_hosts)]
     lines.append("作業・記憶取得CLI: " + (", ".join(host_labels) if host_labels else "未選択"))

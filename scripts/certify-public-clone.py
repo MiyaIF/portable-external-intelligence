@@ -399,13 +399,51 @@ def _built_wheel(directory: Path) -> Path:
 def _package_install_arguments(python_executable: Path, wheel: Path) -> list[str | Path]:
     return [
         python_executable,
+        "-I",
+        "-B",
+        "-X",
+        "utf8",
         "-m",
         "pip",
+        "--isolated",
         "install",
         "--disable-pip-version-check",
+        "--no-index",
         "--no-deps",
+        "--force-reinstall",
         wheel,
     ]
+
+
+def _verify_installed_package(
+    python_executable: Path,
+    wheel: Path,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+) -> None:
+    # A source egg-info directory can make pip return success without installing
+    # anything. Check the real venv distribution and entry point with no source
+    # directory or caller Python overrides on the import path.
+    probe = (
+        "import importlib.metadata as metadata, pathlib, sys, ei; "
+        "root = pathlib.Path(sys.prefix).resolve(); "
+        "module = pathlib.Path(ei.__file__).resolve(); "
+        "distribution = metadata.distribution('portable-external-intelligence'); "
+        "valid = sys.prefix != sys.base_prefix and module.is_relative_to(root) "
+        "and pathlib.Path(distribution.locate_file('')).resolve().is_relative_to(root) "
+        "and distribution.version == sys.argv[1]; "
+        "sys.exit(0 if valid else 1)"
+    )
+    _run(
+        [python_executable, "-I", "-B", "-X", "utf8", "-c", probe, wheel.name.split("-")[1]],
+        cwd=cwd, env=env, timeout=timeout, code="PACKAGE_IMPORT_FAILED",
+    )
+    _run(
+        [python_executable, "-I", "-B", "-X", "utf8", "-m", "ei.cli", "--help"],
+        cwd=cwd, env=env, timeout=timeout, code="PACKAGE_ENTRYPOINT_FAILED",
+    )
 
 
 def _audit_json(
@@ -760,6 +798,7 @@ def certify(source_value: Path | str, *, offline_fixtures: bool, timeout_seconds
             packages = _package_hashes(package_dir)
             wheel = _built_wheel(package_dir)
             _step(steps, "install_package", lambda: _run(_package_install_arguments(python_executable, wheel), cwd=clone, env=environment, timeout=timeout_seconds, code="PACKAGE_INSTALL_FAILED"))
+            _step(steps, "verify_installed_package", lambda: _verify_installed_package(python_executable, wheel, cwd=workspace, env=environment, timeout=timeout_seconds))
             dependency_output = _step(steps, "dependency_lock_audit", lambda: _run([python_executable, "scripts/verify-dependency-lock.py", "--pyproject", "pyproject.toml", "--build-lock", "requirements-build.lock", "--runtime-lock", "requirements-runtime.lock", "--ci-lock", "requirements-ci.lock", "--workflow-dir", ".github/workflows"], cwd=clone, env=environment, timeout=timeout_seconds, code="DEPENDENCY_AUDIT_FAILED"))
             workflow_output = _step(steps, "workflow_security_audit", lambda: _json_command(python_executable, clone, environment, ["public-release", "workflows", "verify", "--workflow-dir", ".github/workflows", "--json"], timeout=timeout_seconds, code="WORKFLOW_AUDIT_FAILED"))
             source_output = _step(steps, "production_source_audit", lambda: _audit_json(python_executable, clone, environment, "scripts/audit-production-source.py", ["--repo", ".", "--json"], timeout=timeout_seconds, code="SOURCE_AUDIT_FAILED"))

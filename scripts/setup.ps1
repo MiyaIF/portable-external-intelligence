@@ -26,6 +26,8 @@ param(
   [switch]$NoSync,
   [switch]$Experiment,
   [switch]$Scheduler,
+  [switch]$NoScheduler,
+  [switch]$InstallPrerequisites,
   [switch]$CheckOnly,
   [switch]$NonInteractive,
   [switch]$AcceptPlan,
@@ -34,36 +36,21 @@ param(
 )
 $ErrorActionPreference = "Stop"
 if ($Sync -and $NoSync) { throw "SYNC_SELECTION_CONFLICT" }
+if ($Scheduler -and $NoScheduler) { throw "SCHEDULER_SELECTION_CONFLICT" }
 if ($TeamKnowledgeRoot -and $NoTeamKnowledge) { throw "TEAM_SELECTION_CONFLICT" }
-
-function Resolve-PythonExecutable {
-  param([string]$Requested)
-  if ($Requested) {
-    $resolved = (Resolve-Path -LiteralPath $Requested -ErrorAction Stop).Path
-    & $resolved -c "import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)"
-    if ($LASTEXITCODE -ne 0) { throw "PYTHON_VERSION_UNSUPPORTED" }
-    return $resolved
-  }
-  foreach ($candidate in @("py.exe", "python.exe", "python3")) {
-    try {
-      if ($candidate -eq "py.exe") {
-        & $candidate -3 -c "import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return ((& $candidate -3 -c "import sys; print(sys.executable)").Trim()) }
-      } else {
-        & $candidate -c "import sys; raise SystemExit(0 if sys.version_info >= (3,11) else 1)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return ((& $candidate -c "import sys; print(sys.executable)").Trim()) }
-      }
-    } catch {}
-  }
-  throw "PYTHON_NOT_FOUND"
-}
 
 $repoPath = (Resolve-Path -LiteralPath $Repo -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath (Join-Path $repoPath "src") -PathType Container)) { throw "REPO_ROOT_INVALID" }
-$python = Resolve-PythonExecutable $PythonExe
-$oldPythonPath = $env:PYTHONPATH
-$env:PYTHONPATH = (Join-Path $repoPath "src") + $(if ($oldPythonPath) { ";" + $oldPythonPath } else { "" })
-$cli = @("-B", "-m", "ei.installer", "--setup", "--python-exe", $python, "--privacy-profile", $PrivacyProfile, "--skill-mode", $SkillMode)
+. (Join-Path $PSScriptRoot 'prerequisites.ps1')
+try {
+  $python = Resolve-EiPrerequisites -PythonExe $PythonExe -NonInteractive:$NonInteractive -CheckOnly:$CheckOnly -InstallPrerequisites:$InstallPrerequisites
+} catch {
+  if ($Json) { @{ok=$false; error_code=$_.Exception.Message; stage='prerequisites'} | ConvertTo-Json -Compress }
+  else { [Console]::Error.WriteLine($_.Exception.Message) }
+  exit 2
+}
+$bootstrap = 'import runpy,sys;source=sys.argv.pop(1);sys.path.insert(0,source);runpy.run_module(''ei.installer'',run_name=''__main__'')'
+$cli = @("-I", "-B", "-X", "utf8", "-c", $bootstrap, (Join-Path $repoPath 'src'), "--setup", "--python-exe", $python, "--privacy-profile", $PrivacyProfile, "--skill-mode", $SkillMode)
 if ($EngineRoot) { $cli += @("--engine-root", $EngineRoot) } else { $cli += @("--repo", $repoPath) }
 if ($KnowledgeMode) { $cli += @("--knowledge-mode", $KnowledgeMode) }
 if ($KnowledgeRoot) { $cli += @("--knowledge-root", $KnowledgeRoot) }
@@ -86,6 +73,7 @@ if ($Sync) { $cli += "--sync" }
 if ($NoSync) { $cli += "--no-sync" }
 if ($Experiment) { $cli += "--experiment" }
 if ($Scheduler) { $cli += "--scheduler" }
+if ($NoScheduler) { $cli += "--no-scheduler" }
 if ($CheckOnly) { $cli += "--check-only" }
 if ($NonInteractive) { $cli += "--non-interactive" }
 if ($AcceptPlan) { $cli += "--accept-plan" }

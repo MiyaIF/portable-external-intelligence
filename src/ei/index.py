@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from .models import KnowledgeIndex, host_applicability_fields
+from .projection_state import validate_source_state
 
 
 _ALLOWED_CLASSES = {"public", "private-reusable"}
@@ -36,6 +37,8 @@ def _load_index_document(index_path: Path) -> tuple[dict[str, Any], bytes]:
         raise ValueError("INDEX_JSON_INVALID") from exc
     if not isinstance(document, dict) or document.get("schema_version") != 2:
         raise ValueError("INDEX_SCHEMA_UNSUPPORTED")
+    if "source_state" in document:
+        validate_source_state(document["source_state"])
     for key in ("active_pattern_ids", "candidate_pattern_ids", "archive_pattern_ids", "observation_ids"):
         if not isinstance(document.get(key), list) or not all(isinstance(item, str) and item for item in document[key]):
             raise ValueError(f"INDEX_{key.upper()}_INVALID")
@@ -90,6 +93,16 @@ def build_index(knowledge_dir: Path, index_path: Path) -> KnowledgeIndex:
         raise ValueError("INDEX_PATH_OUTSIDE_KNOWLEDGE_DIR")
     document, raw = _load_index_document(source)
     _validate_projection_files(source.parent, document)
+    if "source_state" in document:
+        # The manifest is published last. An interrupted generation must not
+        # reuse its predecessor's generation hash with a newly written index.
+        try:
+            manifest_document = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("PROJECTION_MANIFEST_MISMATCH") from exc
+        manifest_files = manifest_document.get("files") if isinstance(manifest_document, Mapping) else None
+        if not isinstance(manifest_files, Mapping) or manifest_files.get("index.json") != _sha256(raw):
+            raise ValueError("PROJECTION_MANIFEST_MISMATCH")
     if source != requested:
         requested.parent.mkdir(parents=True, exist_ok=True)
         temporary = requested.with_name(requested.name + f".{os.getpid()}.tmp")

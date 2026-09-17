@@ -27,6 +27,8 @@ sync_enabled=0
 sync_disabled=0
 experiment=0
 scheduler=0
+no_scheduler=0
+install_prerequisites=0
 check_only=0
 non_interactive=0
 accept_plan=0
@@ -61,6 +63,8 @@ while [ "$#" -gt 0 ]; do
     --no-sync) sync_disabled=1; shift ;;
     --experiment) experiment=1; shift ;;
     --scheduler) scheduler=1; shift ;;
+    --no-scheduler) no_scheduler=1; shift ;;
+    --install-prerequisites) install_prerequisites=1; shift ;;
     --check-only) check_only=1; shift ;;
     --non-interactive) non_interactive=1; shift ;;
     --accept-plan) accept_plan=1; shift ;;
@@ -79,19 +83,19 @@ if [ -n "$team_knowledge_root" ] && [ "$no_team_knowledge" -eq 1 ]; then
   exit 2
 fi
 
-if [ -z "$python_exe" ]; then
-  python_exe="$(command -v python3 || command -v python || true)"
-fi
-if [ -z "$python_exe" ]; then
-  echo "PYTHON_NOT_FOUND" >&2
+if [ "$scheduler" -eq 1 ] && [ "$no_scheduler" -eq 1 ]; then
+  echo "SCHEDULER_SELECTION_CONFLICT" >&2
   exit 2
 fi
-case "$python_exe" in
-  */*) ;;
-  *) python_exe="$(command -v "$python_exe")" ;;
-esac
+bootstrap_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+. "$bootstrap_dir/prerequisites.sh"
+if ! python_exe=$(ei_ensure_prerequisites "$python_exe" "$non_interactive" "$check_only" "$install_prerequisites"); then
+  [ "$json_mode" -eq 0 ] || printf '%s\n' '{"ok":false,"error_code":"PREREQUISITE_SETUP_BLOCKED","stage":"prerequisites"}'
+  exit 2
+fi
 
-set -- -B -m ei.installer --setup --python-exe "$python_exe" --privacy-profile "$privacy_profile" --skill-mode "$skill_mode"
+bootstrap='import runpy,sys;source=sys.argv.pop(1);sys.path.insert(0,source);runpy.run_module("ei.installer",run_name="__main__")'
+set -- -I -B -X utf8 -c "$bootstrap" "$repo/src" --setup --python-exe "$python_exe" --privacy-profile "$privacy_profile" --skill-mode "$skill_mode"
 if [ -n "$engine_root" ]; then
   set -- "$@" --engine-root "$engine_root"
 else
@@ -118,10 +122,11 @@ fi
 [ "$sync_disabled" -eq 1 ] && set -- "$@" --no-sync
 [ "$experiment" -eq 1 ] && set -- "$@" --experiment
 [ "$scheduler" -eq 1 ] && set -- "$@" --scheduler
+[ "$no_scheduler" -eq 1 ] && set -- "$@" --no-scheduler
 [ "$check_only" -eq 1 ] && set -- "$@" --check-only
 [ "$non_interactive" -eq 1 ] && set -- "$@" --non-interactive
 [ "$accept_plan" -eq 1 ] && set -- "$@" --accept-plan
 [ "$skip_venv" -eq 1 ] && set -- "$@" --skip-venv
 [ "$json_mode" -eq 1 ] && set -- "$@" --json
 
-PYTHONPATH="$repo/src${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 "$python_exe" "$@"
+"$python_exe" "$@"

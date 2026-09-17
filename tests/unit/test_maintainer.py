@@ -13,6 +13,7 @@ from ei.journal import append_event, iter_events
 from ei.key_provider import InMemoryKeyProvider
 from ei.maintainer import drain_queue, process_failure, run_maintenance
 from ei.models import Event
+from ei.project import project_events
 from ei.queue import QueueState, enqueue_receipt, queue_health, read_queue_item
 from ei.spool import write_spool
 from ei.setup_contract import OrganizerSelection
@@ -90,6 +91,37 @@ def source_hash(label):
 
 
 class MaintainerTests(unittest.TestCase):
+    def test_projection_still_updates_when_queue_processing_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            event = Event.create("observation.recorded", "2026-01-01T00:00:00+00:00", "test", "test",
+                                 {"observation_id": "obs_saved", "claim": "確認する", "classification": "private-reusable"},
+                                 event_id="evt_saved")
+            source = append_event(event, settings.paths.event_dir)
+            before = source.read_bytes()
+            with patch("ei.maintainer.drain_queue", side_effect=RuntimeError("QUEUE_DRAIN_FAILED")):
+                result = run_maintenance(settings, sync_policy="disabled")
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(result.projection.get("freshness"), "CURRENT")
+            self.assertEqual(source.read_bytes(), before)
+            self.assertTrue((settings.paths.knowledge_dir / "observations/obs_saved.md").is_file())
+
+    def test_concurrent_event_is_reported_as_pending_not_current(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            def append_after_projection(events, root):
+                index = project_events(events, root)
+                append_event(Event.create("observation.recorded", "2026-01-01T00:00:00+00:00",
+                    "test", "test", {"observation_id": "obs_late", "claim": "遅延した記録",
+                    "classification": "private-reusable"}, event_id="evt_late"), settings.paths.event_dir)
+                return index
+            with patch("ei.maintainer.project_events", side_effect=append_after_projection):
+                result = run_maintenance(settings, sync_policy="disabled")
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(result.projection.get("freshness"), "STALE")
+            self.assertIn("PROJECTION_STALE", [row["error_code"] for row in result.errors])
+            self.assertEqual(run_maintenance(settings, sync_policy="disabled").projection["freshness"], "CURRENT")
+
     def _enqueue_candidate(self, settings, *, payload_ref=None):
         source = source_hash("candidate")
         event = Event.create_v2(

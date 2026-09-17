@@ -6,9 +6,53 @@ from pathlib import Path
 
 from ei.models import Event
 from ei.project import project_events
+from ei.index import read_index_items
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_index_links_to_readable_details_and_keeps_legacy_mirrors(self):
+        event = Event.create("observation.recorded", "2026-01-01T00:00:00+00:00", "test", "test",
+                             {"observation_id": "obs_guide", "title": "確認の順序",
+                              "claim": "変更後に保存結果を確認する", "classification": "private-reusable"},
+                             event_id="evt_guide")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_events([event], root)
+            text = (root / "index.md").read_text(encoding="utf-8")
+            self.assertIn("[確認の順序](observations/obs_guide.md)", text)
+            self.assertIn("有効化済み: 0", text)
+            self.assertIn("生成時点", text)
+            detail = (root / "observations/obs_guide.md").read_text(encoding="utf-8")
+            self.assertIn("2026-01-01T00:00:00+00:00", detail)
+            self.assertEqual((root / "memories/obs_guide.md").read_bytes(),
+                             (root / "observations/obs_guide.md").read_bytes())
+
+    def test_candidate_explanation_does_not_become_retrieved_rule(self):
+        rule = "実際の適用根拠を確認する"
+        event = Event.create("pattern.candidate_created", "2026-01-01T00:00:00+00:00", "test", "test",
+                             {"pattern_id": "pat_guide", "cluster_id": "cluster_guide", "rule": rule,
+                              "classification": "private-reusable"}, event_id="evt_guide")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            index = project_events([event], root)
+            detail = (root / "candidates/pat_guide.md").read_text(encoding="utf-8")
+            self.assertIn("CANDIDATE_EVIDENCE_UNAVAILABLE", detail)
+            self.assertIn("根拠を復元できない", detail)
+            items = list(read_index_items(index, ["pat_guide"]))
+            self.assertEqual(items[0]["rule"], rule)
+
+    def test_markdown_title_cannot_inject_an_image_or_extra_list_entry(self):
+        event = Event.create("observation.recorded", "2026-01-01T00:00:00+00:00", "test", "test",
+                             {"observation_id": "obs_label", "title": "![image](https://example.invalid)\n- extra",
+                              "claim": "確認", "classification": "private-reusable"}, event_id="evt_label")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_events([event], root)
+            text = (root / "index.md").read_text(encoding="utf-8")
+            self.assertNotIn("![image]", text)
+            self.assertNotIn("\n- extra", text)
+            self.assertIn("(observations/obs_label.md)", text)
+
     def test_semantically_identical_crlf_projection_is_not_rewritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "knowledge"
