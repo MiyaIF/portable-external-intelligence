@@ -52,6 +52,7 @@ exit $LASTEXITCODE
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ei.installer", result.stdout)
 
+    @unittest.skipUnless(sys.platform == "win32", "setup.ps1 discovers native Windows dependencies")
     def test_setup_wrapper_check_only_accepts_bootstrap_and_scheduler_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

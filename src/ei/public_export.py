@@ -498,9 +498,10 @@ def _copy_selected_files(
 def _git_configure(destination: Path, author: Mapping[str, str]) -> None:
     _run(["git", "-C", destination, "init", "--quiet"], cwd=destination, code="PUBLIC_EXPORT_GIT_INIT_FAILED")
     _run(["git", "-C", destination, "branch", "-M", "main"], cwd=destination, code="PUBLIC_EXPORT_GIT_INIT_FAILED")
+    # Keep git init's filesystem probe for core.filemode. Forcing it on makes
+    # Windows report policy-selected executables as modified (or reset them).
     for key, value in (
         ("core.autocrlf", "false"),
-        ("core.filemode", "true"),
         ("commit.gpgSign", "false"),
         ("user.name", str(author["name"])),
         ("user.email", str(author["email"])),
@@ -535,7 +536,7 @@ def _commit_root(destination: Path, *, author: Mapping[str, str], source_date: s
             "GIT_COMMITTER_DATE": source_date,
         }
     )
-    _run(["git", "-C", destination, "add", "--all", "--", "."], cwd=destination, env=env, code="PUBLIC_EXPORT_GIT_ADD_FAILED")
+    # _set_index_modes already staged the exact files and executable modes.
     _run(
         ["git", "-C", destination, "commit", "--quiet", "--no-gpg-sign", "-m", "chore: create sanitized public root"],
         cwd=destination,
