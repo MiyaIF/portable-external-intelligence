@@ -85,12 +85,14 @@ class PublicWorkflowAcceptanceTests(unittest.TestCase):
         source = (ROOT / "scripts" / "prerequisites.sh").read_text(encoding="utf-8").rstrip()
         marker = hashlib.sha256(b"unreviewed synthetic scanner regression value").hexdigest()
         with tempfile.TemporaryDirectory() as tmp:
-            sample = Path(tmp) / "prerequisites.sh"
+            # Windows runners may expose TEMP through an 8.3 path alias.
+            root = Path(tmp).resolve(strict=True)
+            sample = root / "prerequisites.sh"
             sample.write_text(source + "\nunreviewed_value='" + marker + "'\n", encoding="utf-8")
             completed = subprocess.run(
                 [sys.executable, "-B", "-X", "utf8", "-m", "detect_secrets", "scan", "--all-files", "--no-verify",
                  "--force-use-all-plugins", str(sample)],
-                cwd=tmp, capture_output=True, text=True, encoding="utf-8", check=False, timeout=60,
+                cwd=root, capture_output=True, text=True, encoding="utf-8", check=False, timeout=60,
             )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         findings = [item for items in json.loads(completed.stdout)["results"].values() for item in items]
