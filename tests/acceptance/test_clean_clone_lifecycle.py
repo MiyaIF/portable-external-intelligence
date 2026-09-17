@@ -4,9 +4,12 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+import venv
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +32,52 @@ def _load_certifier():
 
 
 class CleanCloneLifecycleTests(unittest.TestCase):
+    def test_wheel_install_is_not_skipped_due_to_source_egg_info(self) -> None:
+        module = _load_certifier()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            source = workspace / "source with spaces 日本語"
+            source.mkdir()
+            package = source / "ei"
+            package.mkdir()
+            (package / "__init__.py").write_text("raise RuntimeError('SOURCE_MUST_NOT_LOAD')\n", encoding="utf-8")
+            info = source / "portable_external_intelligence.egg-info"
+            info.mkdir()
+            metadata = "Metadata-Version: 2.1\nName: portable-external-intelligence\nVersion: 1.0.0\n"
+            (info / "PKG-INFO").write_text(metadata, encoding="utf-8")
+            wheel = workspace / "portable_external_intelligence-1.0.0-py3-none-any.whl"
+            dist_info = "portable_external_intelligence-1.0.0.dist-info/"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("ei/__init__.py", "INSTALLED_FIXTURE = True\n")
+                archive.writestr("ei/cli.py", "import argparse\nargparse.ArgumentParser().parse_args()\n")
+                archive.writestr(dist_info + "METADATA", metadata)
+                archive.writestr(dist_info + "WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+                archive.writestr(dist_info + "RECORD", "")
+            venv_root = workspace / "venv"
+            venv.EnvBuilder(with_pip=True).create(venv_root)
+            python = venv_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            environment = {**os.environ, "PYTHONPATH": str(source), "PIP_NO_INDEX": "1", "PIP_CONFIG_FILE": os.devnull}
+            installed = subprocess.run(
+                [str(item) for item in module._package_install_arguments(python, wheel)],
+                cwd=source, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=60,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            imported = subprocess.run(
+                [str(python), "-I", "-B", "-c", "import ei; assert ei.INSTALLED_FIXTURE"],
+                cwd=source, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            self.assertEqual(imported.returncode, 0, "Wheel was not actually installed: " + imported.stderr)
+            module._verify_installed_package(python, wheel, cwd=source, env=environment, timeout=30)
+            with self.assertRaisesRegex(module.CertificationError, "PACKAGE_IMPORT_FAILED"):
+                module._verify_installed_package(
+                    python, workspace / "portable_external_intelligence-9.9.9-py3-none-any.whl",
+                    cwd=source, env=environment, timeout=30,
+                )
+            site_packages = venv_root / ("Lib/site-packages" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+            (site_packages / "ei" / "__init__.py").unlink()
+            with self.assertRaisesRegex(module.CertificationError, "PACKAGE_IMPORT_FAILED"):
+                module._verify_installed_package(python, wheel, cwd=source, env=environment, timeout=30)
+
     def test_failure_output_exposes_only_bounded_path_free_suite_diagnostics(self) -> None:
         module = _load_certifier()
         with tempfile.TemporaryDirectory() as tmp:
@@ -77,7 +126,8 @@ class CleanCloneLifecycleTests(unittest.TestCase):
         self.assertEqual(selected, wheel)
         self.assertEqual(
             module._package_install_arguments(Path("python"), selected),
-            [Path("python"), "-m", "pip", "install", "--disable-pip-version-check", "--no-deps", selected],
+            [Path("python"), "-I", "-B", "-X", "utf8", "-m", "pip", "--isolated", "install",
+             "--disable-pip-version-check", "--no-index", "--no-deps", "--force-reinstall", selected],
         )
 
     def test_certifier_rejects_missing_or_ambiguous_built_wheels(self) -> None:

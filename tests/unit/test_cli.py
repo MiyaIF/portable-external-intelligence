@@ -479,6 +479,8 @@ class CliTests(unittest.TestCase):
                 str(knowledge),
                 str(runtime),
                 "no",      # optional team knowledge
+                "no",      # remote sync is separate
+                "no",      # periodic maintenance consent
                 "yes",     # apply the final summary
             ]
             output = io.StringIO()
@@ -574,7 +576,7 @@ class CliTests(unittest.TestCase):
                 "1", "1", "1", "yes", "1", "1", "Test Compatible CLI",
                 "test-compatible", str(root / "custom-home"),
                 ".config/test/settings.json", ".config/test/context.md", ".config/test/skills",
-                "local", str(root / "knowledge"), str(root / "runtime"), "no", "yes",
+                "local", str(root / "knowledge"), str(root / "runtime"), "no", "no", "no", "yes",
             ]
             output = io.StringIO()
             old_stdin = sys.stdin
@@ -613,9 +615,9 @@ class CliTests(unittest.TestCase):
                 "1", "1", "1", "yes", "new", "1", "Test Compatible CLI",
                 "test-compatible", str(custom_home), ".config/test/settings.json",
                 ".config/test/context.md", ".config/test/skills", "1", str(personal),
-                "", "yes", str(team), "member-a", "yes",
+                "", "yes", str(team), "member-a", "no", "no", "yes", "",
             ]
-            second_answers = ["", "", "", "no", "", "", "yes"]
+            second_answers = ["", "", "", "no", "", "", "", "", "yes", ""]
             args = [
                 "setup", "--repo", str(Path.cwd()), "--host-home", f"codex-cli={codex_home}",
                 "--python-exe", sys.executable, "--skip-venv",

@@ -18,7 +18,7 @@ from .certification import certify_host, write_certification_artifact
 from .release import ReleaseManifest, build_release_manifest, verify_release_attestation
 from .config import load_settings
 from .context import build_context
-from .doctor import run_doctor
+from .doctor import maintenance_status, run_doctor
 from .experiment import ExperimentConfig, render_experiment_report, summarize_experiment
 from .ids import fingerprint, machine_id, stable_hash
 from .index import build_index
@@ -52,7 +52,7 @@ from .models import CaptureContext, Event, ObservationInput, validate_host_appli
 from .privacy import inspect_observation
 from .project import project_events
 from .publication_policy import PublicationPolicyError, verify_publication_policy
-from .reconciliation import reconcile_lifecycle
+from .reconciliation import candidate_diagnostics, reconcile_lifecycle
 from .recovery import inspect_root_migration_recovery, recover_root_migration_staging
 from .retrieve import (
     ExposureRecord,
@@ -583,9 +583,10 @@ def _read_records(path: Path) -> list[Mapping[str, Any]]:
 
 
 def _setup(args: argparse.Namespace) -> int:
+    from .setup_activation import setup_result_with_guidance
     selection = _interactive_selection(args)
     result = installer_setup(selection, check_only=bool(args.check_only or args.dry_run))
-    value = result.to_dict()
+    value = setup_result_with_guidance(selection, result, interactive=not args.json_mode and not args.non_interactive and sys.stdin.isatty(), check_only=bool(args.check_only or args.dry_run))
     _emit(value, True)
     if result.ok:
         return EXIT_OK
@@ -765,6 +766,7 @@ def _provider_status(settings: Any) -> dict[str, Any]:
 
 
 def _projection_status(settings: Any) -> dict[str, Any]:
+    from .projection_state import projection_freshness_report
     index = _index(settings)
     if index is None:
         return {
@@ -780,8 +782,11 @@ def _projection_status(settings: Any) -> dict[str, Any]:
             candidate_count = len(document.get("candidate_pattern_ids", ()))
     except (OSError, UnicodeError, json.JSONDecodeError):
         candidate_count = 0
+    events = _events(settings)
     return {
         "status": "ready",
+        **projection_freshness_report(Path(index.index_path), events),
+        "candidate_diagnostics": list(candidate_diagnostics(events)),
         "active_patterns": len(index.active_pattern_ids),
         "candidate_patterns": candidate_count,
         "archived_patterns": len(index.archive_pattern_ids),
@@ -854,6 +859,7 @@ def _status(args: argparse.Namespace) -> int:
         "status": "ok",
         "organizer": organizer,
         "work_hosts": work_hosts,
+        "maintenance": maintenance_status(settings, manifest),
         "Hook": {"hosts": hook_summary},
         "Skill": {"hosts": skill_summary},
         "capture_primary": capture,
@@ -1905,7 +1911,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_group.add_argument("--no-sync", dest="sync", action="store_false")
     setup.set_defaults(sync=None)
     setup.add_argument("--experiment", action="store_true")
-    setup.add_argument("--scheduler", action="store_true")
+    scheduler_group = setup.add_mutually_exclusive_group()
+    scheduler_group.add_argument("--scheduler", dest="scheduler", action="store_true")
+    scheduler_group.add_argument("--no-scheduler", dest="scheduler", action="store_false")
+    setup.set_defaults(scheduler=None)
     setup.add_argument("--skill-mode", choices=("copy", "link"), default="copy")
     setup.add_argument("--skip-venv", action="store_true")
     setup.add_argument("--non-interactive", action="store_true")

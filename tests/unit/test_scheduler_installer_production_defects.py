@@ -221,6 +221,7 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
                 "LastRunTime": None,
                 "NextRunTime": "2030-01-01T00:00:00+00:00",
                 "State": "Ready",
+                "Enabled": True,
             }
             with patch(
                 "ei.task_scheduler.subprocess.run",

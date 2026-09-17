@@ -6,12 +6,40 @@
 
 ## 前提
 
-- GitとPython 3.11以降。
+- GitとPython 3.11以降（venv/ensurepipを含む）。OS別のsetupが確認し、不足時は承認を得て導入します。
 - 実機の確認をするCLIは、あらかじめインストール済みであること。
 - `local` 以外では、対象の非公開保存先を操作できる認証済みクライアント。
 - 公開エンジン、個人ナレッジ、機械ローカルruntimeの3つが重ならないこと。チームを使う場合は共有保存先も別にします。
 
 セットアップで使う各保存先は、正規化後も互いに重なりません。`--skip-venv` は、管理済みのPython環境で `ei` がすでに読み込める場合だけ使います。
+
+## Git・PythonがないPCから始める
+
+Gitがない場合はGitHubの **Code → Download ZIP** で公開エンジンを取得し、展開したフォルダでsetupを実行してください。Pythonを使わないPowerShell／シェルの前処理が、依存ソフトの有無と実行可否を確認します。
+
+| OS | 使用する導入方法 | 対象 |
+|---|---|---|
+| Windows | 既存のWinGet。利用できない場合は公式インストーラーを案内 | `Git.Git`、`Python.Python.3.13` の不足分 |
+| macOS | AppleのCommand Line ToolsとPython公式インストーラー | Git、Pythonの不足分。Homebrewは使用・追加導入しない |
+| Linux | apt-get または dnf | `git`、`python3`、apt-getでは `python3-venv` の不足分 |
+
+導入前にパッケージ名と導入方法を表示し、`y` または `yes` と答えた場合だけ実行します。初期値は「導入しない」です。インストーラーの利用規約や管理者確認は省略せず、setupが代理承認することもありません。HomebrewやWinGet自体を追加導入したり、社内PCの制限を回避したりはしません。利用可能な導入手段がない場合は公式の手動導入先を案内して停止します。
+
+macOSのGit不足時は、承認後に `xcode-select --install` でAppleの導入画面を開きます。Command Line ToolsにはGit以外のコンパイラやSDKも含まれるため、承認前に説明します。Xcode本体は要求しません。導入完了後にsetupへ戻りEnterを押すと、実際にGitが使えることを確認します。画面を中断した場合やまだ導入中の場合は、Pythonの追加導入やエンジンの構築に進みません。
+
+macOSのPython不足時は、`python.org` の公式Python 3.13.15パッケージを一時フォルダへ取得します。公式リリースに掲載されたSHA-256との一致、パッケージ署名、macOSのインストール審査を確認してから、標準インストーラーを開きます。バージョンとハッシュはsetupのソースに固定し、ダウンロード時に「最新版」へ勝手に切り替えません。更新時は公式リリースを再確認して両方を更新します。利用者が導入内容・利用規約・管理者確認に対応し、公式手順の `Install Certificates.command` も実行してください。インストーラーを終了するとsetupに戻ります。Enterを押しただけでは成功にせず、Python・venv・ensurepipの実行可否を再確認します。一時パッケージはインストーラーの終了後に削除します。起動・待機が中断されて終了を確認できない場合は保持し、場所を表示します。Installerを終了した後で手動削除できます。
+
+導入済みで利用可能なGit・Pythonは再インストールしません。対応していないPythonを削除することもありません。導入失敗・拒否・導入後の再確認失敗では、エンジンの構築に進みません。途中まで導入できたソフトは保持し、原因を解消してsetupを再実行すると再検出します。新しいターミナルが必要な場合も、その旨を案内します。OS標準リポジトリでPython 3.11以降を提供していない環境は手動導入が必要です。
+
+既にHomebrew等で導入したGit・Pythonも、実行可能ならそのまま利用します。導入元を理由に置き換えたり、既存の管理ソフトを削除したりしません。Linuxの自動導入は既存のapt-get・dnfに対応し、それ以外の環境では標準の導入手順を案内します。追加のパッケージ管理ソフトや外部リポジトリは登録しません。
+
+確認だけの `-CheckOnly` / `--check-only` は、導入承認フラグがあってもインストールしません。非対話は既定で自動導入を禁止します。自動化で明示的に許可する場合だけ `-InstallPrerequisites`（PowerShell）／`--install-prerequisites`（sh）を指定してください。`-AcceptPlan` / `--accept-plan` はエンジン設定への同意であり、Git・Python導入への同意には流用しません。非対話で管理者確認や規約確認が必要になった場合は停止するため、対話実行または管理者による事前導入が必要です。
+
+macOSの新規導入にはGUIの操作が必要なため、`--install-prerequisites` を指定しても非対話ではインストーラーを起動しません。対話端末で実行するか、Git・Pythonを事前導入してください。既に必要なソフトが使える場合は非対話setupを続行できます。`--check-only` ではAppleのGit・Pythonの案内用コマンドから導入画面が開かないように確認します。
+
+これらの導入フラグはOS別setupラッパー専用です。Pythonで動く `ei setup` 自体にPythonを導入させるものではありません。Windowsでスクリプト実行が組織のポリシーにより禁止されている場合は管理者に確認してください。setupは実行ポリシーを変更しません。
+
+参照: [WinGet公式の導入コマンド](https://learn.microsoft.com/en-us/windows/package-manager/winget/install)、[Git公式のmacOS導入方法](https://git-scm.com/install/mac)、[Apple公式のCommand Line Tools説明](https://developer.apple.com/library/archive/technotes/tn2339/_index.html)、[Python公式のmacOS導入手順](https://docs.python.org/3/using/mac.html)、[Python 3.13.15の配布元・SHA-256](https://www.python.org/downloads/release/python-31315/)。
 
 ## ラッパーと確認
 
@@ -19,10 +47,10 @@
 
 ```text
 scripts/setup.ps1
-scripts/setup.sh
+sh scripts/setup.sh
 ```
 
-対話画面では、作業CLI、Host home、知識モード、個人ナレッジ、整理AI、整理用Host、任意のチーム保存先、同期、scheduler、Skill配置を選びます。画面の計画を確認してから適用します。画面を閉じたり入力を拒否した場合、保存先は変更しません。
+通常の対話画面では、整理AI、整理用Host、作業CLI、個人ナレッジ、任意のチーム保存先、Git同期、定期整理を選びます。Host homeやSkill配置の変更は対応する引数でも指定できます。画面の計画を確認してから適用します。エンジン設定の適用を拒否した場合、ナレッジ保存先は変更しません。前段で別途承認して導入したGit・Pythonは残ります。
 
 非対話では、各選択を引数で明示し、`--non-interactive --accept-plan` を指定します。適用前は `--check-only` を使います。`--json` は状態とreason codeを機械可読にします。
 
@@ -36,6 +64,8 @@ scripts/setup.sh
 - チーム保存先: `--team-knowledge-root` と `--team-member-id`、または `--no-team-knowledge`。
 - モード: `--knowledge-mode local|github-new|github-existing`。
 - 計画: `--check-only`、`--accept-plan`、`--json`、`--non-interactive`。
+- 定期整理: `--scheduler` / `--no-scheduler`（PowerShellでは `-Scheduler` / `-NoScheduler`）。通常対話で省略した場合は有効・無効を質問し、再実行では以前の選択を初期値にします。
+- Git同期: `--sync` / `--no-sync`。ローカルでの蓄積・整理とは独立した選択です。
 
 `--providers` は旧設定の読み取り互換です。新規設定では整理AIを明示します。複数providerを先頭から自動選択することはありません。選択が不足すると `SELECTION_REQUIRED` になり、新規整理は `DEFERRED` として候補を保持します。
 
@@ -94,6 +124,14 @@ profileはruntimeへ正規化コピーされ、元profileの場所や実行時�
 `SETUP_COMPLETE` はソフトウェア設定の完了だけを示します。`HOST_ACTIVATION_VERIFIED`、`PRODUCTION_COMPLETE`、`EFFECT_VALIDATED` はそれぞれ別の実機・運用・効果証拠が必要です。証拠がない状態は `UNVERIFIED` として残します。
 
 ## 確認後の操作
+
+設定を適用すると、各作業CLIのHook承認手順と定期処理の状態を表示します。Hookは任意コマンドを実行する機能なので、利用者が内容を確認してCLI側で承認してください。setupは信頼設定を変更したり、承認を迂回したりしません。Codex CLIの場合は `/hooks`、Claude Codeの場合は `/hooks`、Gemini CLIの場合は `/hooks list` が確認の入口です。互換CLIはそのCLI自身の手順に従います。Codex App自体は対応対象に含めません。
+
+承認後、対象CLIで新しいセッションを開き、機密情報を含まない短い依頼を1回送り、応答後に終了してください。setupの確認画面で `r` を入力すると、実際のHook受信記録とOS側の定期処理の状態を再取得します。「承認した」と入力しただけでは確認済みにしません。Enterで後回しにでき、同一設定の再実行時も状態を取り直します。
+
+JSON出力の `activation.hooks` は `VERIFIED` / `UNVERIFIED`、`activation.maintenance.status` は `ENABLED` / `DISABLED` / `UNVERIFIED` です。`ENABLED` はOSの登録・有効状態の確認であり、長時間の稼働実績ではありません。Windowsで手動停止されたタスクは正常扱いしません。同じ設定のsetupを繰り返しても、手動停止した同一定義のタスクを自動再開するものではありません。OSのタスク管理画面で停止理由・実行結果を確認してください。
+
+`activation.automatic_operation=UNVERIFIED` は、setupが「作業→蓄積→整理→次回取得」までの実運用テストを代行していないことを示します。既存の `SETUP_COMPLETE` とは区別します。定期処理の登録だけ失敗した場合も、保持されたインストールについてHook案内と個別状態を表示し、エラーは成功に書き換えません。
 
 `doctor --strict` でmanifest、profile、Skill binding、root分離を確認します。`status` で作業CLIごとのHook/Skill状態を確認し、`recall` は整理AIなしで既存patternを取得できます。初回の実機確認では、対象CLIのHook同意とSkill検出を行い、receiptを保存します。
 

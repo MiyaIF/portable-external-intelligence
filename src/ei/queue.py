@@ -85,7 +85,7 @@ class QueueItem:
     source_host_family: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        serialized = {
             "queue_id": self.queue_id,
             "event_id": self.event_id,
             "idempotency_key": self.idempotency_key,
@@ -108,12 +108,22 @@ class QueueItem:
             "source_host_id": self.source_host_id,
             "source_host_family": self.source_host_family,
         }
+        # Pre-host-scope queues have no trusted source pair. Preserve absence
+        # instead of manufacturing an invalid empty label or a current host.
+        if self.source_host_id == "" and self.source_host_family == "":
+            serialized.pop("source_host_id")
+            serialized.pop("source_host_family")
+        return serialized
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "QueueItem":
         if not isinstance(value, Mapping):
             raise QueueError("QUEUE_ITEM_INVALID")
         try:
+            validate_schema("queue-item", value)
+            if "source_host_id" in value or "source_host_family" in value:
+                if not value.get("source_host_id") or not value.get("source_host_family"):
+                    raise QueueError("QUEUE_ITEM_INVALID")
             result = cls(
                 queue_id=str(value["queue_id"]),
                 event_id=str(value["event_id"]),

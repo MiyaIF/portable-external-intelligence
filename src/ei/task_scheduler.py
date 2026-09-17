@@ -547,7 +547,7 @@ def inspect_registered_task(
         "Arguments=$action.Arguments;WorkingDirectory=$action.WorkingDirectory;"
         "UserId=[string]$task.Principal.UserId;RunLevel=[string]$task.Principal.RunLevel;"
         "LastTaskResult=$info.LastTaskResult;LastRunTime=$lastRun;NextRunTime=$nextRun;"
-        "State=[string]$task.State} | ConvertTo-Json -Compress"
+        "State=[string]$task.State;Enabled=$task.Settings.Enabled} | ConvertTo-Json -Compress"
     )
     environment = os.environ.copy()
     environment["EI_TASK_NAME"] = str(expected.get("task_name", TASK_NAME))
@@ -576,6 +576,7 @@ def inspect_registered_task(
     stale = bool(last_run and (datetime.now(timezone.utc) - last_run.astimezone(timezone.utc)).total_seconds() > settings.scheduler_interval_minutes * 60 * 2 and task_state != "running")
     checks = {
         "task_name": str(live.get("TaskName", "")) == TASK_NAME,
+        "manager_enabled": live.get("Enabled") is True and task_state in {"ready", "running", "queued"},
         "executable": executable == expected_executable and executable.is_file(),
         "executable_hash": executable.is_file() and _sha256_file(executable) == str(expected.get("executable_sha256", "")),
         "executable_content_identity": executable.is_file() and _sha256_file(executable) == _recorded_hash(expected.get("executable_sha256")),
