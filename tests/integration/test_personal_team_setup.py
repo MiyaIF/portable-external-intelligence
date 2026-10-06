@@ -9,7 +9,10 @@ from pathlib import Path
 from ei.installer import SetupSelection, setup
 
 
-class PersonalTeamSetupTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class PersonalTeamSetupTests(NotificationIsolationMixin, unittest.TestCase):
     def _selection(self, root: Path, *, team: bool | None = None, team_root: Path | None = None, member: str | None = None) -> SetupSelection:
         home = root / "codex-home"
         home.mkdir(parents=True, exist_ok=True)
@@ -33,6 +36,7 @@ class PersonalTeamSetupTests(unittest.TestCase):
     def test_fresh_personal_only_setup_writes_schema_v8_and_empty_stores(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             result = setup(self._selection(root))
             self.assertTrue(result.ok, result.to_dict())
             self.assertEqual(result.status, "SETUP_COMPLETE")

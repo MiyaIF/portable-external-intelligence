@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Mapping, Sequence
 
+from .capture_contract import CaptureIdentity
 from .ids import canonical_json, new_event_id, stable_hash
 
 
@@ -423,6 +424,7 @@ class CaptureContext:
     capture_index: int
     source_host_id: str = ""
     source_host_family: str = ""
+    capture_identity: CaptureIdentity | None = None
 
 
 @dataclass(frozen=True)

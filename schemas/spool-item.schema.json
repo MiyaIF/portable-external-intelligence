@@ -3,6 +3,7 @@
   "type": "object",
   "required": ["spool_id", "content_hash", "classification", "created_at", "expires_at", "encrypted"],
   "properties": {
+    "purpose": {"enum": ["legacy", "pending", "validated-result"]},
     "spool_id": {"type": "string", "minLength": 1},
     "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
     "classification": {"type": "string", "minLength": 1},

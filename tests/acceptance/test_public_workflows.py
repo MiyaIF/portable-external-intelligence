@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -51,9 +53,9 @@ class PublicWorkflowAcceptanceTests(unittest.TestCase):
         self.assertIn("scripts/setup.ps1", documents)
         self.assertIn("scripts/setup.sh", documents)
 
-    def test_tracked_tree_has_no_unreviewed_secret_scanner_findings(self) -> None:
+    def test_public_worktree_has_no_unreviewed_secret_scanner_findings(self) -> None:
         tracked_result = subprocess.run(
-            ["git", "ls-files", "-z"],
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
             cwd=ROOT,
             capture_output=True,
             check=False,
@@ -66,7 +68,7 @@ class PublicWorkflowAcceptanceTests(unittest.TestCase):
         )
         selected = select_public_paths(tracked, allowlist)
         completed = subprocess.run(
-            [sys.executable, "-B", "-m", "detect_secrets", "scan", "--force-use-all-plugins", *selected],
+            [sys.executable, "-B", "-X", "utf8", "-m", "detect_secrets", "scan", "--all-files", "--no-verify", "--force-use-all-plugins", *selected],
             cwd=ROOT,
             capture_output=True,
             text=True,
@@ -78,6 +80,24 @@ class PublicWorkflowAcceptanceTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
         self.assertEqual(payload.get("results"), {})
+
+    def test_reviewed_digest_does_not_hide_an_unreviewed_value_on_another_line(self) -> None:
+        source = (ROOT / "scripts" / "prerequisites.sh").read_text(encoding="utf-8").rstrip()
+        marker = hashlib.sha256(b"unreviewed synthetic scanner regression value").hexdigest()
+        with tempfile.TemporaryDirectory() as tmp:
+            # Windows runners may expose TEMP through an 8.3 path alias.
+            root = Path(tmp).resolve(strict=True)
+            sample = root / "prerequisites.sh"
+            sample.write_text(source + "\nunreviewed_value='" + marker + "'\n", encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", "-m", "detect_secrets", "scan", "--all-files", "--no-verify",
+                 "--force-use-all-plugins", str(sample)],
+                cwd=root, capture_output=True, text=True, encoding="utf-8", check=False, timeout=60,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        findings = [item for items in json.loads(completed.stdout)["results"].values() for item in items]
+        self.assertTrue(findings, "Unreviewed credential-like values must still be detected")
+        self.assertEqual({item["line_number"] for item in findings}, {len(source.splitlines()) + 1})
 
     def test_only_hosted_public_workflows_are_active(self) -> None:
         names = sorted(path.name for path in WORKFLOW_ROOT.glob("*.y*ml"))

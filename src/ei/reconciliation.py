@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from .cluster import assign_cluster
 from .dedup import content_fingerprint, detect_polarity, normalize_claim
 from .ids import machine_id, stable_hash
 from .journal import append_event
-from .lifecycle import evaluate_lifecycle
+from .lifecycle import evaluate_lifecycle, promotion_eligibility
 from .models import (
     ClusterState,
     Event,
@@ -18,6 +18,24 @@ from .models import (
     host_applicability_fields,
     validate_host_applicability_mapping,
 )
+
+
+def _checked(values, budget):
+    if budget is not None:
+        budget.check()
+    for value in values:
+        if budget is not None:
+            budget.check()
+        yield value
+
+
+def _ordered_events(events, budget):
+    values = []
+    for event in _checked(events, budget):
+        values.append(event)
+        if budget is not None and len(values) > 50000:
+            raise ValueError("JOURNAL_BOUNDED_LIMIT")
+    return sorted(values, key=lambda event: (event.occurred_at, event.event_id))
 
 
 @dataclass(frozen=True)
@@ -131,8 +149,8 @@ def _cluster_id(observation: ObservationState) -> str:
     return base + "_" + stable_hash(_host_applicability_key(observation))[:12]
 
 
-def _canonical_rule(observations: Iterable[ObservationState]) -> str:
-    choices = sorted((observation.claim for observation in observations if observation.claim), key=lambda value: (-len(normalize_claim(value)), normalize_claim(value)))
+def _canonical_rule(observations: Iterable[ObservationState], budget=None) -> str:
+    choices = sorted((observation.claim for observation in _checked(observations, budget) if observation.claim), key=lambda value: (-len(normalize_claim(value)), normalize_claim(value)))
     return choices[0] if choices else ""
 
 
@@ -169,13 +187,13 @@ def _event_for_pattern(
         {"event_type": event_type, "cluster_id": record.state.cluster_id, "payload": complete}
     )[:28]
     return Event.create(event_type, occurred_at, "reconcile", machine_id(), complete, event_id=event_id)
-def _new_record(cluster_id: str, observations: list[ObservationState], last_used_at: str | None) -> _ClusterRecord:
+def _new_record(cluster_id: str, observations: list[ObservationState], last_used_at: str | None, budget=None) -> _ClusterRecord:
     first = observations[0]
     state = ClusterState(
         cluster_id=cluster_id,
         pattern_id=None,
         status="raw",
-        rule=_canonical_rule(observations),
+        rule=_canonical_rule(observations, budget),
         provenances=frozenset(observation.provenance_key for observation in observations),
         scopes=frozenset(_scope(observation) for observation in observations),
         benefit_count=sum(1 for observation in observations if observation.benefit),
@@ -195,19 +213,19 @@ def _new_record(cluster_id: str, observations: list[ObservationState], last_used
     return _ClusterRecord(state, observations, state.rule, 0)
 
 
-def _cluster_observations(events: list[Event]) -> tuple[dict[str, _ClusterRecord], int]:
+def _cluster_observations(events: list[Event], budget=None) -> tuple[dict[str, _ClusterRecord], int]:
     observations: list[ObservationState] = []
     observation_clusters: dict[str, str] = {}
     records: dict[str, _ClusterRecord] = {}
     duplicate_count = 0
     observation_times: dict[str, str] = {}
-    for event in events:
+    for event in _checked(events, budget):
         if event.event_type != "observation.recorded" or not event.payload.get("claim"):
             continue
         observation = _observation_state(event)
         decision = assign_cluster(
             observation,
-            [candidate for candidate in observations if _host_applicability_key(candidate) == _host_applicability_key(observation)],
+            (candidate for candidate in _checked(observations, budget) if _host_applicability_key(candidate) == _host_applicability_key(observation)),
         )
         if decision.kind == "new" or decision.target_observation_id is None:
             cluster_id = _cluster_id(observation)
@@ -219,13 +237,13 @@ def _cluster_observations(events: list[Event]) -> tuple[dict[str, _ClusterRecord
         observations.append(observation)
         observation_times[cluster_id] = max(observation_times.get(cluster_id, ""), event.occurred_at)
         if cluster_id not in records:
-            records[cluster_id] = _new_record(cluster_id, [observation], event.occurred_at)
+            records[cluster_id] = _new_record(cluster_id, [observation], event.occurred_at, budget)
         else:
             record = records[cluster_id]
             record.observations.append(observation)
             record.state = replace(
                 record.state,
-                rule=_canonical_rule(record.observations),
+                rule=_canonical_rule(record.observations, budget),
                 provenances=frozenset(item.provenance_key for item in record.observations),
                 scopes=frozenset(_scope(item) for item in record.observations),
                 benefit_count=sum(1 for item in record.observations if item.benefit),
@@ -246,7 +264,7 @@ def _cluster_observations(events: list[Event]) -> tuple[dict[str, _ClusterRecord
                 )
             record.canonical_rule = record.state.rule
         contradictory = set(records[cluster_id].state.contradiction_provenances)
-        for prior in observations[:-1]:
+        for prior in _checked(observations[:-1], budget):
             if observation_clusters.get(prior.observation_id) != cluster_id:
                 continue
             if prior.provenance_key != observation.provenance_key and detect_polarity(prior.claim) != detect_polarity(observation.claim):
@@ -257,10 +275,10 @@ def _cluster_observations(events: list[Event]) -> tuple[dict[str, _ClusterRecord
     return records, duplicate_count
 
 
-def _apply_pattern_events(records: dict[str, _ClusterRecord], events: Iterable[Event]) -> None:
+def _apply_pattern_events(records: dict[str, _ClusterRecord], events: Iterable[Event], budget=None) -> None:
     exposure_counts: dict[str, int] = {}
     exposure_times: dict[str, str] = {}
-    for event in events:
+    for event in _checked(events, budget):
         payload = event.payload
         cluster_id = str(payload.get("cluster_id", ""))
         record = records.get(cluster_id)
@@ -303,21 +321,56 @@ def _apply_pattern_events(records: dict[str, _ClusterRecord], events: Iterable[E
             record.state = replace(record.state, status="superseded", superseded_by=str(payload.get("replacement_pattern_id", payload.get("superseded_by", ""))), replacement_active=bool(payload.get("replacement_active", False)))
         elif event_type == "pattern.tombstoned":
             record.state = replace(record.state, status="tombstoned")
-        record.canonical_rule = _canonical_rule(record.observations)
-    for record in records.values():
+        record.canonical_rule = _canonical_rule(record.observations, budget)
+    for record in _checked(records.values(), budget):
         if record.state.pattern_id:
             count = exposure_counts.get(record.state.pattern_id, 0)
             last_used = max(record.state.last_used_at or "", exposure_times.get(record.state.cluster_id, "")) or None
             record.state = replace(record.state, exposure_count=count, last_used_at=last_used)
 
 
-def reconcile_lifecycle(events: Iterable[Event], event_dir, now_utc: datetime | str | None = None, policy: PromotionPolicy | None = None) -> ReconciliationResult:
-    current_events = sorted(list(events), key=lambda event: (event.occurred_at, event.event_id))
+def candidate_diagnostics(events: Iterable[Event], policy: PromotionPolicy | None = None, *, budget=None) -> tuple[dict[str, Any], ...]:
+    """Explain existing candidates using the lifecycle's evidence, without writes."""
+    current = _ordered_events(events, budget)
+    candidates: dict[str, str] = {}
+    for event in _checked(current, budget):
+        pattern_id = event.payload.get("pattern_id")
+        if not isinstance(pattern_id, str) or not pattern_id:
+            continue
+        if event.event_type == "pattern.candidate_created":
+            candidates[pattern_id] = str(event.payload.get("cluster_id", ""))
+        elif event.event_type in {"pattern.promoted", "pattern.revised", "pattern.deprecated", "pattern.superseded", "pattern.tombstoned"}:
+            candidates.pop(pattern_id, None)
+    if not candidates:
+        return ()
+    records, _ = _cluster_observations(current, budget)
+    _apply_pattern_events(records, current, budget)
+    selected_policy = policy or PromotionPolicy.defaults()
+    rows: list[dict[str, Any]] = []
+    for pattern_id, cluster_id in _checked(sorted(candidates.items()), budget):
+        record = records.get(cluster_id)
+        state = record.state if record is not None else None
+        eligibility = promotion_eligibility(state, selected_policy) if state is not None else None
+        rows.append({
+            "pattern_id": pattern_id,
+            "eligible": eligibility.valid if eligibility else False,
+            "reason_codes": list(eligibility.reason_codes) if eligibility else ["CANDIDATE_EVIDENCE_UNAVAILABLE"],
+            "provenance_count": len(state.provenances) if state else 0,
+            "scope_count": len(state.scopes) if state else 0,
+            "benefit_count": state.benefit_count if state else 0,
+            "contradiction_count": len(state.contradiction_provenances) if state else 0,
+            "policy_version": selected_policy.policy_version,
+        })
+    return tuple(rows)
+
+
+def reconcile_lifecycle(events: Iterable[Event], event_dir, now_utc: datetime | str | None = None, policy: PromotionPolicy | None = None, *, budget=None) -> ReconciliationResult:
+    current_events = _ordered_events(events, budget)
     original_event_ids = set(_event_map(current_events))
     event_ids = set(original_event_ids)
-    records, duplicate_count = _cluster_observations(current_events)
+    records, duplicate_count = _cluster_observations(current_events, budget)
     selected_policy = policy or PromotionPolicy.defaults()
-    _apply_pattern_events(records, current_events)
+    _apply_pattern_events(records, current_events, budget)
     now = now_utc or datetime.now(timezone.utc)
     now_text = now.isoformat() if isinstance(now, datetime) else str(now)
     if current_events:
@@ -331,33 +384,36 @@ def reconcile_lifecycle(events: Iterable[Event], event_dir, now_utc: datetime | 
     generated: list[Event] = []
     candidate_events = 0
     revision_events = 0
-    for record in records.values():
+    for record in _checked(records.values(), budget):
         state = record.state
         if state.status in {"raw", "candidate"} and len(state.provenances) >= selected_policy.independent_provenance_count and not state.pattern_id:
             pattern_id = "pat_" + stable_hash(state.cluster_id)[:20]
-            observed_at = max((event.occurred_at for event in current_events if event.event_type == "observation.recorded" and str(event.payload.get("observation_id", "")) in {item.observation_id for item in record.observations}), default=now_text)
+            observation_ids = {item.observation_id for item in _checked(record.observations, budget)}
+            observed_at = max((event.occurred_at for event in _checked(current_events, budget) if event.event_type == "observation.recorded" and str(event.payload.get("observation_id", "")) in observation_ids), default=now_text)
             generated.append(_event_for_pattern("pattern.candidate_created", record, observed_at, {"pattern_id": pattern_id, "rule": record.canonical_rule, "provenances": sorted(state.provenances), "scopes": sorted(state.scopes), "applicability": list(state.applicability), "benefit_count": state.benefit_count, "classification": state.classification}, selected_policy, "REPEATED_OBSERVATION", new_version=0))
             candidate_events += 1
         elif state.status == "active" and record.canonical_rule and record.canonical_rule != state.rule:
             revision = record.revision + 1
             generated.append(_event_for_pattern("pattern.revised", record, now_text, {"pattern_id": state.pattern_id, "revision": revision, "rule": record.canonical_rule, "provenances": sorted(state.provenances), "scopes": sorted(state.scopes), "applicability": list(state.applicability), "benefit_count": state.benefit_count, "classification": state.classification}, selected_policy, "NEW_REUSABLE_EVIDENCE", new_version=revision))
             revision_events += 1
-    for event in generated:
+    for event in _checked(generated, budget):
         if event.event_id not in event_ids:
-            append_event(event, event_dir)
+            append_event(event, event_dir, **({"budget": budget} if budget is not None else {}))
             event_ids.add(event.event_id)
     updated_events = current_events + [event for event in generated if event.event_id not in original_event_ids]
-    updated_records, _ = _cluster_observations(sorted(updated_events, key=lambda event: (event.occurred_at, event.event_id)))
-    _apply_pattern_events(updated_records, sorted(updated_events, key=lambda event: (event.occurred_at, event.event_id)))
+    updated_records, _ = _cluster_observations(_ordered_events(updated_events, budget), budget)
+    _apply_pattern_events(updated_records, _ordered_events(updated_events, budget), budget)
     lifecycle_events: list[Event] = []
-    for record in updated_records.values():
+    for record in _checked(updated_records.values(), budget):
         lifecycle_events.extend(evaluate_lifecycle(record.state, selected_policy, now_utc=now_text))
     promotion_events = sum(1 for event in lifecycle_events if event.event_type == "pattern.promoted")
     deprecation_events = sum(1 for event in lifecycle_events if event.event_type == "pattern.deprecated")
     tombstone_events = sum(1 for event in lifecycle_events if event.event_type == "pattern.tombstoned")
-    for event in lifecycle_events:
+    for event in _checked(lifecycle_events, budget):
         if event.event_id not in event_ids:
-            append_event(event, event_dir)
+            append_event(event, event_dir, **({"budget": budget} if budget is not None else {}))
             event_ids.add(event.event_id)
     unique_created = len(event_ids.difference(original_event_ids))
+    if budget is not None:
+        budget.check()
     return ReconciliationResult(unique_created, candidate_events, promotion_events, revision_events, deprecation_events, tombstone_events, duplicate_count, len(updated_records))

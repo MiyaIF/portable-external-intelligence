@@ -160,6 +160,30 @@ class PublicExportTests(unittest.TestCase):
             self.assertEqual(first.receipt["public_tree_sha256"], second.receipt["public_tree_sha256"])
             self.assertEqual(first.receipt["public_root_sha"], second.receipt["public_root_sha"])
 
+    def test_export_preserves_executable_modes_and_remains_clean_for_resume(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ei-public-export-modes-") as tmp:
+            root = Path(tmp)
+            source, policy, allowlist = self._source(root)
+            destination = root / "public"
+            result = create_public_export(
+                source, destination, policy_path=policy, allowlist_path=allowlist, validate=False,
+            )
+            listing = subprocess.run(
+                ["git", "-C", str(destination), "ls-tree", "-r", "HEAD"],
+                check=True, capture_output=True, text=True,
+            ).stdout
+            modes = {line.split("\t", 1)[1]: line.split(" ", 1)[0] for line in listing.splitlines()}
+            self.assertEqual(modes, {
+                "LICENSE": "100644", "README.md": "100644",
+                "scripts/check.sh": "100755", "src/rule.py": "100644",
+            })
+            _verify_resumable_export(destination, result.receipt)
+
+            # A later staging pass must not replace policy-selected modes with
+            # the filesystem's non-executable default on Windows.
+            subprocess.run(["git", "-C", str(destination), "add", "--all"], check=True, capture_output=True)
+            _verify_resumable_export(destination, result.receipt)
+
     def test_export_reads_committed_blobs_when_worktree_changes_after_preflight(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ei-public-export-race-") as tmp:
             root = Path(tmp)

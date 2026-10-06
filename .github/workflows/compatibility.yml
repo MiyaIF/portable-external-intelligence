@@ -17,7 +17,7 @@ jobs:
   compatibility:
     name: compatibility-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    timeout-minutes: 35
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +47,9 @@ jobs:
 
       - name: Run host contract assertions
         run: python -m unittest tests.compatibility.test_all_host_contracts tests.certification.test_receipt_contract tests.certification.test_missing_host_blocks_completion
+
+      - name: Run unattended and package acceptance contracts
+        run: python -m unittest tests.acceptance.test_reliable_automatic_accumulation tests.acceptance.test_package_metadata -v
 
       - name: Verify dependency and source contracts
         run: |

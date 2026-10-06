@@ -130,7 +130,12 @@ class ReleaseContractTests(unittest.TestCase):
 
     def test_valid_attestation_separates_software_production_and_effect(self) -> None:
         manifest = build_release_manifest("a" * 40, self._artifacts(), {})
-        status = verify_release_attestation(manifest, self._attestation(manifest), "b" * 40)
+        status = verify_release_attestation(
+            manifest,
+            self._attestation(manifest),
+            "b" * 40,
+            now=datetime(2026, 8, 27, tzinfo=timezone.utc),
+        )
         self.assertTrue(status.software_complete)
         self.assertFalse(status.production_enabled)
         self.assertEqual(status.effect_validated, "awaiting_sample")

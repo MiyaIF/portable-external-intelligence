@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MiyaIF/portable-external-intelligence/schemas/operation-incident.schema.json",
+  "title": "Sanitized durable operation incident",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "incident_id",
+    "reason_family",
+    "reason_code",
+    "component_id",
+    "severity",
+    "pending_count",
+    "detected_at",
+    "last_observed_at",
+    "status",
+    "resolved_at",
+    "notification_generation",
+    "delivery"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "incident_id": {"type": "string", "pattern": "^inc_[0-9a-f]{32}$"},
+    "reason_family": {"$ref": "#/$defs/reasonCode"},
+    "reason_code": {"$ref": "#/$defs/reasonCode"},
+    "component_id": {"$ref": "#/$defs/safeId"},
+    "severity": {"enum": ["info", "warning", "error", "critical"]},
+    "pending_count": {"type": ["integer", "null"], "minimum": 0},
+    "pending_count_status": {"enum": ["COMPLETE", "PARTIAL", "UNKNOWN"]},
+    "detected_at": {"type": "string", "format": "date-time"},
+    "last_observed_at": {"type": "string", "format": "date-time"},
+    "status": {"enum": ["OPEN", "RESOLVED", "HISTORICAL"]},
+    "resolved_at": {
+      "oneOf": [
+        {"type": "string", "format": "date-time"},
+        {"type": "null"}
+      ]
+    },
+    "notification_generation": {"type": "integer", "minimum": 1},
+    "occurrence_generation": {"type": "integer", "minimum": 1},
+    "delivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["os", "cli"],
+      "properties": {
+        "os": {"$ref": "#/$defs/deliveryState"},
+        "cli": {"$ref": "#/$defs/deliveryState"}
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["pending_count_status"], "properties": {"pending_count_status": {"const": "UNKNOWN"}}},
+      "then": {"properties": {"pending_count": {"type": "null"}}},
+      "else": {"properties": {"pending_count": {"type": "integer", "minimum": 0}}}
+    }
+  ],
+  "$defs": {
+    "reasonCode": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+    "safeId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,199}$"},
+    "optionalTimestamp": {
+      "oneOf": [
+        {"type": "string", "format": "date-time"},
+        {"type": "null"}
+      ]
+    },
+    "deliveryState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "last_attempt_at",
+        "last_success_at",
+        "last_result",
+        "success_generation",
+        "successful_sessions"
+      ],
+      "properties": {
+        "last_attempt_at": {"$ref": "#/$defs/optionalTimestamp"},
+        "last_success_at": {"$ref": "#/$defs/optionalTimestamp"},
+        "last_result": {"enum": [null, "SUCCESS", "FAILED", "UNKNOWN"]},
+        "last_status": {"enum": [null, "SENT", "UNAVAILABLE", "DENIED", "FAILED"]},
+        "last_reason_code": {"enum": [null, "OS_ACCEPTED", "OS_UNAVAILABLE", "OS_DENIED", "OS_FAILED", "OS_TIMEOUT", "OS_RESPONSE_INVALID", "CLI_UNVERIFIED", "BUDGET_EXHAUSTED"]},
+        "delivery_id": {"oneOf": [{"$ref": "#/$defs/safeId"}, {"type": "null"}]},
+        "display_status": {"enum": [null, "UNVERIFIED"]},
+        "lease": {
+          "oneOf": [
+            {"type": "null"},
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["token", "notification_generation", "occurrence_generation", "session_hash"],
+              "properties": {
+                "previous_delivery": {
+                  "allOf": [
+                    {"$ref": "#/$defs/deliveryState"},
+                    {"not": {"required": ["lease"]}}
+                  ]
+                },
+                "token": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+                "notification_generation": {"type": "integer", "minimum": 1},
+                "occurrence_generation": {"type": "integer", "minimum": 1},
+                "session_hash": {"oneOf": [{"$ref": "#/$defs/safeId"}, {"type": "null"}]}
+              }
+            }
+          ]
+        },
+        "success_generation": {"type": "integer", "minimum": 0},
+        "successful_sessions": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/safeId"}
+        }
+      }
+    }
+  }
+}

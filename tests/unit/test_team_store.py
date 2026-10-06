@@ -11,6 +11,7 @@ from dataclasses import replace
 
 from ei.journal import event_integrity
 from ei.models import Event
+from ei.operation_runtime import OperationBudget
 from ei.team_store import (
     append_team_event,
     initialize_team_store,
@@ -52,6 +53,24 @@ def initialized_team_root(root: Path):
 
 
 class TeamStoreTests(unittest.TestCase):
+    def test_zero_budget_neither_scans_nor_appends(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = initialized_team_root(Path(raw) / "shared")
+            with patch("ei.team_store.inspect_team_store", side_effect=AssertionError("no inspection")):
+                with self.assertRaises(TimeoutError):
+                    scan_team_events(root.root, budget=OperationBudget(0))
+                with self.assertRaises(TimeoutError):
+                    append_team_event(root.root, "member-a", "writer_aaaaaaaaaaaaaaaa", team_event("evt_a"), budget=OperationBudget(0))
+
+    def test_interrupted_event_read_is_not_returned_as_partial_scan(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = initialized_team_root(Path(raw) / "shared").root
+            append_team_event(root, "member-a", "writer_aaaaaaaaaaaaaaaa", team_event("evt_a"))
+            with patch("ei.team_store._existing_event", side_effect=TimeoutError("OPERATION_BUDGET_EXHAUSTED")):
+                with self.assertRaises(TimeoutError):
+                    scan_team_events(root, budget=OperationBudget(5000))
+            self.assertEqual(len(scan_team_events(root, budget=OperationBudget(5000)).events), 1)
+
     def test_team_event_rejects_personal_path_before_append(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = initialized_team_root(Path(raw) / "shared team").root

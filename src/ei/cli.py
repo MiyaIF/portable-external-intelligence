@@ -16,9 +16,16 @@ from .adapters.rollout_summary import RolloutSummaryAdapter
 from .capture import reconcile_fallback, record_agent_observation
 from .certification import certify_host, write_certification_artifact
 from .release import ReleaseManifest, build_release_manifest, verify_release_attestation
+from .closeout_service import (
+    InputError,
+    PrivacyRejected,
+    _closeout_source_pair,
+    _event_audit,
+    process_closeout,
+)
 from .config import load_settings
 from .context import build_context
-from .doctor import run_doctor
+from .doctor import maintenance_status, run_doctor
 from .experiment import ExperimentConfig, render_experiment_report, summarize_experiment
 from .ids import fingerprint, machine_id, stable_hash
 from .index import build_index
@@ -52,7 +59,7 @@ from .models import CaptureContext, Event, ObservationInput, validate_host_appli
 from .privacy import inspect_observation
 from .project import project_events
 from .publication_policy import PublicationPolicyError, verify_publication_policy
-from .reconciliation import reconcile_lifecycle
+from .reconciliation import candidate_diagnostics, reconcile_lifecycle
 from .recovery import inspect_root_migration_recovery, recover_root_migration_staging
 from .retrieve import (
     ExposureRecord,
@@ -80,14 +87,6 @@ EXIT_PRIVACY = 3
 EXIT_GIT = 4
 EXIT_DEPENDENCY = 5
 EXIT_INTERNAL = 6
-
-
-class InputError(ValueError):
-    """Raised for invalid CLI input or schema."""
-
-
-class PrivacyRejected(ValueError):
-    """Raised when CLI input cannot cross the privacy boundary."""
 
 
 def _emit(value: Any, json_mode: bool = False) -> None:
@@ -354,13 +353,12 @@ def _capture_health(settings: Any, events: Sequence[Event]) -> dict[str, Any]:
         if event.event_type == "observation.recorded"
         and event.payload.get("capture_path") != "agent_direct"
     ]
-    result = reconcile_fallback(settings, direct_events, native_events)
     return {
-        "direct_count": result.direct_count,
-        "native_count": result.native_count,
-        "fallback_recovered": result.recovered,
-        "capture_coverage": result.coverage_rate,
-        "capture_coverage_unknown": result.coverage_unknown,
+        "direct_count": len(direct_events),
+        "native_count": len(native_events),
+        "fallback_recovered": None,
+        "capture_coverage": None,
+        "capture_coverage_unknown": True,
     }
 
 
@@ -388,23 +386,35 @@ def _write_json(path: Path, value: Mapping[str, Any]) -> None:
             temporary.unlink()
 
 
-def _rotate_and_write_log(path: Path, value: Mapping[str, Any], max_bytes: int, retention_files: int) -> None:
+def _rotate_and_write_log(path: Path, value: Mapping[str, Any], max_bytes: int, retention_files: int, *, budget=None) -> None:
+    def check():
+        if budget is not None:
+            budget.check()
+    check()
     if type(max_bytes) is not int or max_bytes < 1024:
         raise ValueError("SCHEDULED_LOG_LIMIT_INVALID")
     if type(retention_files) is not int or retention_files < 1:
         raise ValueError("SCHEDULED_LOG_RETENTION_INVALID")
     encoded = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str) + "\n").encode("utf-8")
-    target = Path(path).expanduser().resolve()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    target = Path(path).expanduser().absolute()
+    safe_ensure_directory(target.parent)
+    assert_safe_target(target.parent, target, allow_missing=True, expected_type="file")
     if target.exists() and target.stat().st_size + len(encoded) > max_bytes:
         for index in range(retention_files - 1, 0, -1):
+            check()
             source = target.with_name(f"{target.stem}.{index}{target.suffix}")
             destination = target.with_name(f"{target.stem}.{index + 1}{target.suffix}")
             if source.exists():
+                assert_safe_target(target.parent, source, allow_missing=False, expected_type="file")
+                assert_safe_target(target.parent, destination, allow_missing=True, expected_type="file")
+                check()
                 os.replace(source, destination)
+        check()
+        assert_safe_target(target.parent, target.with_name(f"{target.stem}.1{target.suffix}"), allow_missing=True, expected_type="file")
         os.replace(target, target.with_name(f"{target.stem}.1{target.suffix}"))
-    with target.open("ab") as stream:
-        stream.write(encoded)
+    check()
+    from .measurement_events import _append_log_line
+    _append_log_line(target, encoded.decode("utf-8"), budget=budget)
 
 
 def _parse_datetime(value: str | None) -> datetime | None:
@@ -494,58 +504,10 @@ def _team_projection_for_recall(settings: Any) -> tuple[Any | None, dict[str, An
     return result.index, summary
 
 
-def _event_audit(settings: Any, decision: Any, candidate: Mapping[str, Any]) -> None:
-    payload = {
-        "decision": decision.decision,
-        "reason_code": decision.reason_code,
-        "provider_id": decision.provider_id or "unknown",
-        "classification": decision.classification,
-        "evidence_count": len(decision.evidence_refs),
-        "candidate_id_hash": fingerprint(
-            str(candidate.get("candidate_id", candidate.get("title", "candidate")))
-        ),
-    }
-    if decision.source_host_id and decision.source_host_family:
-        payload.update(
-            {
-                "source_host_id": decision.source_host_id,
-                "source_host_family": decision.source_host_family,
-                "applicability_scope": decision.applicability_scope,
-                "applicable_host_ids": list(decision.applicable_host_ids),
-                "applicable_host_families": list(decision.applicable_host_families),
-            }
-        )
-    event_id = "evt_gate_" + stable_hash(payload)[:32]
-    event = Event.create(
-        "gate.decision",
-        datetime.now(timezone.utc).isoformat(),
-        "external-intelligence",
-        machine_id(),
-        payload,
-        event_id=event_id,
-    )
-    append_event(event, settings.paths.event_dir)
 
-
-def _closeout_source_pair(candidate: Mapping[str, Any], *, required: bool) -> tuple[str, str]:
-    source_host_id = candidate.get("source_host_id", "")
-    source_host_family = candidate.get("source_host_family", "")
-    if not isinstance(source_host_id, str) or not isinstance(source_host_family, str):
-        raise InputError("CLOSEOUT_SOURCE_HOST_PAIR_INVALID")
-    if bool(source_host_id) != bool(source_host_family):
-        raise InputError("CLOSEOUT_SOURCE_HOST_PAIR_INVALID")
-    if not source_host_id and not source_host_family:
-        if required:
-            raise InputError("CLOSEOUT_SOURCE_HOST_PAIR_REQUIRED")
-        return "", ""
-    try:
-        validate_host_label(source_host_id, field="source_host_id")
-        validate_host_label(source_host_family, field="source_host_family")
-    except ValueError as exc:
-        raise InputError("CLOSEOUT_SOURCE_HOST_PAIR_INVALID") from exc
-    return source_host_id, source_host_family
 from .canary import read_hook_status, skill_discovery_canary
 from .inference.router import ProviderRouter, ProviderSelectionError
+from .organizer_recovery import OrganizerRecovery
 from .spool import gc_expired_spool
 from .experiment import assign_arm
 from .models import PromotionPolicy
@@ -583,9 +545,18 @@ def _read_records(path: Path) -> list[Mapping[str, Any]]:
 
 
 def _setup(args: argparse.Namespace) -> int:
+    from .setup_activation import setup_result_with_guidance
     selection = _interactive_selection(args)
     result = installer_setup(selection, check_only=bool(args.check_only or args.dry_run))
-    value = result.to_dict()
+    value = setup_result_with_guidance(
+        selection,
+        result,
+        interactive=not args.json_mode and not args.non_interactive and sys.stdin.isatty(),
+        check_only=bool(args.check_only or args.dry_run),
+        verify_operation_requested=args.verify_operation,
+        allow_model_test=args.allow_model_test,
+        allow_notification_test=args.allow_notification_test,
+    )
     _emit(value, True)
     if result.ok:
         return EXIT_OK
@@ -690,7 +661,7 @@ def _status_host(settings: Any, manifest: Mapping[str, Any], host_id: str) -> di
         record = {}
     instance_id = str(record.get("host_instance_id", host_id))
     try:
-        status = read_hook_status(host_id, instance_id, settings)
+        status = read_hook_status(host_id, instance_id, settings, persist=False)
         raw = status.to_dict()
         allowed = (
             "host_id", "host_instance_id", "hook_status", "skill_discovery_status",
@@ -731,40 +702,16 @@ def _status_host(settings: Any, manifest: Mapping[str, Any], host_id: str) -> di
 
 
 def _provider_status(settings: Any) -> dict[str, Any]:
-    try:
-        router = ProviderRouter(settings=settings)
-        providers: list[dict[str, Any]] = []
-        for provider in router.providers:
-            try:
-                available = bool(provider.available())
-            except (OSError, RuntimeError, ValueError):
-                available = False
-            providers.append({
-                "provider_id": str(getattr(provider, "provider_id", "")),
-                "locality": str(getattr(provider, "locality", "unknown")),
-                "available": available,
-            })
-        try:
-            eligible = [str(item.provider_id) for item in router.eligible_providers()]
-        except (OSError, RuntimeError, ValueError):
-            eligible = []
-        return {
-            "status": "ready" if eligible else "deferred",
-            "order": [str(item.get("provider_id", "")) for item in providers],
-            "providers": providers,
-            "eligible": eligible,
-            "quota": "available" if eligible else "unverified_or_exhausted",
-        }
-    except (OSError, RuntimeError, ValueError) as exc:
-        return {
-            "status": "unavailable",
-            "providers": [],
-            "eligible": [],
-            "reason_code": _error_code(exc, "PROVIDER_STATUS_UNAVAILABLE"),
-        }
+    # Availability probes may start provider processes or touch authentication
+    # state. A read-only status reports selection, not an unperformed test.
+    order = list(getattr(settings, "provider_order", ()))
+    return {"status": "unverified", "order": order,
+        "providers": [{"provider_id": item, "available": None} for item in order],
+        "eligible": None, "quota": "unverified", "reason_code": "PROVIDER_STATUS_NOT_PROBED"}
 
 
 def _projection_status(settings: Any) -> dict[str, Any]:
+    from .projection_state import projection_freshness_report
     index = _index(settings)
     if index is None:
         return {
@@ -780,8 +727,11 @@ def _projection_status(settings: Any) -> dict[str, Any]:
             candidate_count = len(document.get("candidate_pattern_ids", ()))
     except (OSError, UnicodeError, json.JSONDecodeError):
         candidate_count = 0
+    events = _events(settings)
     return {
         "status": "ready",
+        **projection_freshness_report(Path(index.index_path), events),
+        "candidate_diagnostics": list(candidate_diagnostics(events)),
         "active_patterns": len(index.active_pattern_ids),
         "candidate_patterns": candidate_count,
         "archived_patterns": len(index.archive_pattern_ids),
@@ -791,6 +741,8 @@ def _projection_status(settings: Any) -> dict[str, Any]:
     }
 def _status(args: argparse.Namespace) -> int:
     settings = args.settings
+    from .operation_runtime import operation_status
+    automatic = operation_status(settings, now=datetime.now(timezone.utc))
     events = _events(settings)
     manifest = _read_local_json(Path(settings.paths.install_manifest_path)) or {}
     records = manifest.get("hosts", {}) if isinstance(manifest.get("hosts"), Mapping) else {}
@@ -801,14 +753,9 @@ def _status(args: argparse.Namespace) -> int:
     hook_summary = {row["host_id"]: row["hook"] for row in host_rows}
     skill_summary = {row["host_id"]: row["skill"] for row in host_rows}
     capture = _capture_health(settings, events)
-    try:
-        queue = queue_health(settings).to_dict()
-    except (OSError, RuntimeError, ValueError) as exc:
-        queue = {"status": "unavailable", "reason_code": _error_code(exc, "QUEUE_HEALTH_UNAVAILABLE")}
-    try:
-        spool = spool_health(settings).to_dict()
-    except (OSError, RuntimeError, ValueError) as exc:
-        spool = {"status": "unavailable", "reason_code": _error_code(exc, "SPOOL_HEALTH_UNAVAILABLE")}
+    custody = automatic["snapshot"]
+    queue = {"status": custody["pending_count_status"], "pending_count": custody["pending_count"], "source": "bounded_custody_cache"}
+    spool = {**queue, "pending_bytes": custody["pending_bytes"], "reserved_count": custody["reserved_count"], "reserved_bytes": custody["reserved_bytes"]}
     sync_state = _read_local_json(Path(settings.paths.local_state_dir) / "sync-state.json") or {}
     sync = {
         "enabled": bool(getattr(settings, "sync_enabled", False)),
@@ -854,6 +801,9 @@ def _status(args: argparse.Namespace) -> int:
         "status": "ok",
         "organizer": organizer,
         "work_hosts": work_hosts,
+        "maintenance": maintenance_status(settings, manifest, scheduler={
+            "registered": automatic["scheduler"]["native"].get("registered"),
+            "ok": automatic["scheduler"]["native"].get("identity_verified") is True}),
         "Hook": {"hosts": hook_summary},
         "Skill": {"hosts": skill_summary},
         "capture_primary": capture,
@@ -867,6 +817,7 @@ def _status(args: argparse.Namespace) -> int:
         },
         "sync": sync,
         "experiment": experiment,
+        "automatic_operation": automatic,
     }, True)
     return EXIT_OK
 
@@ -1056,178 +1007,9 @@ def _closeout(args: argparse.Namespace) -> int:
         payload = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise InputError("CLOSEOUT_JSON_INVALID") from exc
-    if not isinstance(payload, Mapping):
-        raise InputError("CLOSEOUT_OBJECT_REQUIRED")
-    nested_candidate = payload.get("candidate")
-    if nested_candidate is not None and not isinstance(nested_candidate, Mapping):
-        raise InputError("CLOSEOUT_CANDIDATE_OBJECT_REQUIRED")
-    candidate = {
-        str(key): value
-        for key, value in (nested_candidate if isinstance(nested_candidate, Mapping) else payload).items()
-        if isinstance(key, str)
-    }
-    gate_input = payload.get("gate_decision") if isinstance(payload.get("gate_decision"), Mapping) else candidate
-    try:
-        if isinstance(gate_input, Mapping) and isinstance(payload.get("gate_decision"), Mapping):
-            from .gate import GateDecision
-            source_host_id, source_host_family = _closeout_source_pair(
-                candidate,
-                required=gate_input.get("decision") == "YES",
-            )
-            decision = GateDecision.from_mapping(
-                gate_input,
-                source_host_id=source_host_id,
-                source_host_family=source_host_family,
-            )
-        elif candidate.get("decision") in {"YES", "NO"}:
-            from .gate import GateDecision
-            source_host_id, source_host_family = _closeout_source_pair(candidate, required=candidate.get("decision") == "YES")
-            decision = GateDecision.from_mapping(
-                candidate,
-                source_host_id=source_host_id,
-                source_host_family=source_host_family,
-            )
-        else:
-            budget = InferenceBudget(
-                candidate_id=str(candidate.get("candidate_id", "closeout")),
-                purpose="inheritance-gate",
-                deadline_ms=int(getattr(args.settings, "prompt_budget_ms", 1000)),
-            )
-            decision = decide_inheritance(
-                candidate,
-                _RouterAdapter(ProviderRouter(settings=args.settings)),
-                budget,
-            )
-    except ProviderSelectionError:
-        raise
-    except (ValueError, TypeError) as exc:
-        raise InputError(_error_code(exc, "GATE_INPUT_INVALID")) from exc
-
-    if decision.decision in {"YES", "NO"}:
-        privacy = inspect_observation(ObservationInput(
-            decision.candidate_title,
-            decision.candidate_claim,
-            "agent_direct",
-            str(candidate.get("source_ref", "closeout")),
-            "",
-            str(candidate.get("domain", "general")),
-            "observed",
-            decision.benefit,
-            decision.classification,
-        ))
-        if privacy.reason_code not in {"CLASSIFIED", "GENERALIZATION_VERIFIED"}:
-            if decision.decision == "YES":
-                raise PrivacyRejected(privacy.reason_code)
-            from .gate import GateDecision
-            decision = GateDecision(
-                "NO",
-                "secret_or_confidential",
-                "",
-                "",
-                (),
-                "",
-                "private-reusable",
-                1.0,
-                decision.provider_id,
-                source_host_id=decision.source_host_id,
-                source_host_family=decision.source_host_family,
-                applicability_scope=decision.applicability_scope,
-                applicable_host_ids=decision.applicable_host_ids,
-                applicable_host_families=decision.applicable_host_families,
-            )
-        _event_audit(args.settings, decision, candidate)
-    if decision.decision == "NO":
-        team_result = {"status": "DISABLED", "reason_code": "TEAM_DISABLED"} if getattr(getattr(args.settings, "knowledge_stores", None), "team", None) is None else {"status": "SKIPPED", "reason_code": "PERSONAL_APPLY_NOT_SUCCESS"}
-        _emit({
-            "status": "discarded",
-            "gate": decision.to_dict(),
-            "curation": {"status": "not_run"},
-            "personal": {"status": "DISCARDED"},
-            "team": team_result,
-            "knowledge_stores": {"personal": {"status": "DISCARDED"}, "team": team_result},
-        }, True)
-        return EXIT_OK
-    if decision.decision == "DEFERRED":
-        team_result = {"status": "DISABLED", "reason_code": "TEAM_DISABLED"} if getattr(getattr(args.settings, "knowledge_stores", None), "team", None) is None else {"status": "DEFERRED", "reason_code": "DEFERRED_TEAM_STORE"}
-        _emit({"status": "deferred", "gate": decision.to_dict(), "personal": {"status": "DEFERRED"}, "team": team_result, "knowledge_stores": {"personal": {"status": "DEFERRED"}, "team": team_result}}, True)
-        return EXIT_DEPENDENCY
-    if decision.decision == "FAILED":
-        team_result = {"status": "DISABLED", "reason_code": "TEAM_DISABLED"} if getattr(getattr(args.settings, "knowledge_stores", None), "team", None) is None else {"status": "SKIPPED", "reason_code": "PERSONAL_APPLY_NOT_SUCCESS"}
-        _emit({"status": "failed", "gate": decision.to_dict(), "personal": {"status": "FAILED"}, "team": team_result, "knowledge_stores": {"personal": {"status": "FAILED"}, "team": team_result}}, True)
-        retryable = {"NO_PROVIDER_AVAILABLE", "PROVIDER_UNAVAILABLE", "QUOTA_EXHAUSTED"}
-        return EXIT_DEPENDENCY if decision.reason_code in retryable else EXIT_INTERNAL
-
-    index = _index(args.settings)
-    curator_input = {
-        **candidate,
-        "decision": "YES",
-        "title": decision.candidate_title,
-        "claim": decision.candidate_claim,
-        "candidate_title": decision.candidate_title,
-        "candidate_claim": decision.candidate_claim,
-        "benefit": decision.benefit,
-        "classification": decision.classification,
-        "evidence_refs": list(decision.evidence_refs),
-        "source_host_id": decision.source_host_id,
-        "source_host_family": decision.source_host_family,
-        "applicability_scope": decision.applicability_scope,
-        "applicable_host_ids": list(decision.applicable_host_ids),
-        "applicable_host_families": list(decision.applicable_host_families),
-    }
-    changeset = curate_candidate(
-        curator_input,
-        index,
-        {"provider_id": decision.provider_id or "manual-structured"},
-        None,
-    )
-    validation = validate_changeset(changeset, args.settings)
-    if not validation.valid:
-        code = validation.reason_codes[0] if validation.reason_codes else "CHANGESET_INVALID"
-        if code in {"RAW_CONTENT_FORBIDDEN", "PRIVACY_REJECTED"}:
-            raise PrivacyRejected(code)
-        raise InputError(code)
-    applied = apply_changeset(changeset, args.settings)
-    team_result: dict[str, Any]
-    team_store = getattr(getattr(args.settings, "knowledge_stores", None), "team", None)
-    if team_store is None:
-        team_result = {"status": "DISABLED", "reason_code": "TEAM_DISABLED"}
-    elif applied.applied:
-        from .team_routing import route_applied_personal_knowledge
-        team_decision = route_applied_personal_knowledge(
-            {
-                "applied": applied.applied,
-                "changeset_hash": changeset.fingerprint,
-                "event_ids": list(applied.event_ids),
-                "candidate": curator_input,
-                "changeset": changeset.to_dict(),
-            },
-            args.settings,
-        )
-        team_result = team_decision.to_dict()
-    else:
-        team_result = {"status": "SKIPPED", "reason_code": "PERSONAL_APPLY_NOT_SUCCESS"}
-    value = {
-        "status": "applied" if applied.applied else "failed",
-        "gate": decision.to_dict(),
-        "curation": {
-            "changeset": changeset.to_dict(),
-            "applied": applied.applied,
-            "reason_code": applied.reason_code,
-            "event_ids": list(applied.event_ids),
-            "already_applied": applied.already_applied,
-        },
-        "personal": {
-            "status": "READY" if applied.applied else "FAILED",
-            "reason_code": applied.reason_code,
-        },
-        "team": team_result,
-        "knowledge_stores": {
-            "personal": {"status": "READY" if applied.applied else "FAILED"},
-            "team": team_result,
-        },
-    }
-    _emit(value, True)
-    return EXIT_OK if applied.applied else EXIT_INTERNAL
+    result = process_closeout(payload, args.settings)
+    _emit(result.payload, True)
+    return result.exit_code
 def _drain(args: argparse.Namespace) -> int:
     result = drain_queue(
         args.settings,
@@ -1256,18 +1038,21 @@ def _maintain(args: argparse.Namespace) -> int:
             "mutations": False,
         }, True)
         return EXIT_OK
+    from .operation_runtime import OperationBudget
+    budget = OperationBudget(args.time_budget_ms)
+    budget.check()
     policy = getattr(args, "sync_policy", None)
     if not policy:
         policy = "auto" if bool(args.sync or getattr(args.settings, "sync_enabled", False)) else "disabled"
     source_values = getattr(args, "source", ()) or ()
-    source_paths = tuple(_source_paths(args.settings, source_values)) if source_values else ()
+    source_paths = tuple(Path(value).expanduser().absolute() for value in source_values) if source_values else None
     log_path = (
-        Path(args.log_file).expanduser().resolve()
+        Path(args.log_file).expanduser().absolute()
         if args.log_file
         else Path(args.settings.paths.log_dir) / "maintenance.jsonl"
     )
     try:
-        with FileLock(Path(args.settings.paths.locks_dir) / "maintenance.lock"):
+        with FileLock(Path(args.settings.paths.locks_dir) / "maintenance.lock", budget=budget):
             result = run_maintenance(
                 args.settings,
                 source_paths=source_paths,
@@ -1275,19 +1060,24 @@ def _maintain(args: argparse.Namespace) -> int:
                 time_budget_ms=args.time_budget_ms,
                 sync_policy=policy,
                 now=_parse_datetime(args.now),
+                budget=budget,
             )
     except RuntimeError as exc:
         if str(exc) == "SYNC_LOCK_BUSY":
             raise
         raise InputError(_error_code(exc, "MAINTENANCE_LOCK_FAILED")) from exc
-    _rotate_and_write_log(
-        log_path,
-        result.to_dict(),
-        int(args.settings.scheduler_log_max_bytes),
-        int(args.settings.scheduler_log_retention_files),
-    )
+    result_document = result.to_dict()
+    result_document["log_status"] = "UNKNOWN"
+    if budget.remaining_ms() > 0:
+        try:
+            _rotate_and_write_log(log_path, result_document, int(args.settings.scheduler_log_max_bytes),
+                int(args.settings.scheduler_log_retention_files), budget=budget)
+            result_document["log_status"] = "WRITTEN"
+        except TimeoutError:
+            # A write may already have reached disk; never assert it did not.
+            result_document["log_status"] = "UNKNOWN"
     if not args.quiet:
-        _emit(result.to_dict(), True)
+        _emit(result_document, True)
     if result.status == "success":
         return EXIT_OK
     codes = {str(item.get("error_code", "")) for item in result.errors}
@@ -1882,6 +1672,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     setup = common("setup")
     setup.add_argument("--check-only", action="store_true")
+    setup.add_argument("--verify-operation", action="store_true")
+    setup.add_argument("--allow-model-test", action="store_true")
+    setup.add_argument("--allow-notification-test", action="store_true")
     setup.add_argument("--work-host", dest="work_hosts", action="append", default=[])
     setup.add_argument("--hosts", action="append", default=[], help="deprecated alias of --work-host")
     setup.add_argument("--host", dest="hosts", action="append", help="deprecated alias of --work-host")
@@ -1892,6 +1685,7 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--providers", action="append", default=[])
     setup.add_argument("--organizer-provider")
     setup.add_argument("--organizer-host")
+    common("resume-organizer")
     setup.add_argument("--privacy-profile", default="private-reusable")
     setup.add_argument("--knowledge-mode", choices=("local", "github-new", "github-existing"))
     setup.add_argument("--github-repository")
@@ -1905,7 +1699,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sync_group.add_argument("--no-sync", dest="sync", action="store_false")
     setup.set_defaults(sync=None)
     setup.add_argument("--experiment", action="store_true")
-    setup.add_argument("--scheduler", action="store_true")
+    scheduler_group = setup.add_mutually_exclusive_group()
+    scheduler_group.add_argument("--scheduler", dest="scheduler", action="store_true")
+    scheduler_group.add_argument("--no-scheduler", dest="scheduler", action="store_false")
+    setup.set_defaults(scheduler=None)
     setup.add_argument("--skill-mode", choices=("copy", "link"), default="copy")
     setup.add_argument("--skip-venv", action="store_true")
     setup.add_argument("--non-interactive", action="store_true")
@@ -2147,6 +1944,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "migration":
             return _migration(args)
         args.settings = _settings(args)
+        if args.command == "resume-organizer":
+            try:
+                router = ProviderRouter(settings=args.settings)
+                provider = router.selected()
+            except ProviderSelectionError as exc:
+                _emit({"status": "UNAVAILABLE", "reason_code": exc.reason_code,
+                    "provider_id": None, "next_eligible_at": None}, args.json_mode)
+                return EXIT_DEPENDENCY
+            fingerprint_value = "sha256:" + stable_hash({
+                "organizer": router.organizer.to_dict(), "config": router.config,
+            })
+            recovery = OrganizerRecovery(
+                Path(args.settings.paths.runtime_dir) / ("organizer-" + stable_hash(provider.provider_id) + ".json"),
+                provider.provider_id,
+                config_fingerprint=fingerprint_value,
+            )
+            result = (recovery.preview_auth_retry if args.dry_run else recovery.request_auth_retry)(
+                provider, now=datetime.now(timezone.utc), config_fingerprint=fingerprint_value,
+            )
+            _emit(result, args.json_mode)
+            return EXIT_OK if result["status"] in {"RETRY_REQUESTED", "ALREADY_REQUESTED", "NO_ACTION"} else EXIT_DEPENDENCY
         if args.command == "update":
             return _update(args)
         if args.command == "uninstall":
@@ -2171,6 +1989,12 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_OK if report.ok or args.repair_plan is not None else EXIT_DEPENDENCY
         if args.command == "status":
             return _status(args)
+        if args.command in {"recall", "closeout", "observe", "query", "ingest", "reconcile", "project"} and not getattr(args, "dry_run", False) and os.environ.get("EI_INTERNAL") != "1":
+            # Fail-open health/scheduler work is separate from user output;
+            # no unverified host notice channel or model prompt is used.
+            from .operation_runtime import service_cli_start
+            session = getattr(args, "session_id", None)
+            service_cli_start(args.settings, now=datetime.now(timezone.utc), session_hash=fingerprint(session) if session else None)
         if args.command == "queue":
             if args.queue_command != "drain":
                 raise InputError("QUEUE_COMMAND_INVALID")

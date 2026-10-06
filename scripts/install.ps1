@@ -38,5 +38,5 @@ if ($SkipVenv) { $setupArgs += "-SkipVenv" }
 if ($CheckOnly) { $setupArgs += "-CheckOnly" }
 if ($Json) { $setupArgs += "-Json" }
 if (-not $NoScheduledTask -and -not $CheckOnly) { $setupArgs += "-Scheduler" }
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $setup @setupArgs
+& powershell.exe -NoProfile -File $setup @setupArgs
 exit $LASTEXITCODE

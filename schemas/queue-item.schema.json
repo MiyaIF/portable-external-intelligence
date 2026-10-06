@@ -3,6 +3,8 @@
   "type": "object",
   "required": ["queue_id", "event_id", "idempotency_key", "stage", "state", "attempts", "created_at", "source_hash", "host_id", "session_id_hash", "turn_id_hash", "payload_ref", "provider_preference", "privacy_classification"],
   "properties": {
+    "capture_id": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+    "validated_result_ref": {"anyOf": [{"allOf": [{"$ref": "#/$defs/spool_ref"}, {"required": ["purpose"], "properties": {"purpose": {"const": "validated-result"}}}]}, {"type": "null"}]},
     "queue_id": {"type": "string", "minLength": 1},
     "event_id": {"type": "string", "pattern": "^evt_[0-9TZ]+_[0-9a-f]{12}$"},
     "idempotency_key": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
@@ -32,6 +34,7 @@
       "type": "object",
       "required": ["spool_id", "content_hash", "classification", "created_at", "expires_at", "encrypted"],
       "properties": {
+        "purpose": {"enum": ["legacy", "pending", "validated-result"]},
         "spool_id": {"type": "string", "minLength": 1},
         "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "classification": {"type": "string", "minLength": 1},

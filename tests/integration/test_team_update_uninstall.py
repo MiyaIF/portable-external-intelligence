@@ -24,7 +24,10 @@ def _tree_hash(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-class TeamLifecycleRetentionTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class TeamLifecycleRetentionTests(NotificationIsolationMixin, unittest.TestCase):
     def _selection(self, root: Path, team_root: Path) -> SetupSelection:
         home = root / "codex-home"
         home.mkdir(parents=True, exist_ok=True)
@@ -48,6 +51,7 @@ class TeamLifecycleRetentionTests(unittest.TestCase):
     def _install(self, root: Path) -> tuple[SetupSelection, Path, Path, Path, Path]:
         team_root = root / "shared-team"
         selection = self._selection(root, team_root)
+        self.notification_isolation.allow_notification_helper()
         result = setup(selection)
         self.assertTrue(result.ok, result.to_dict())
         self.assertEqual(result.status, "SETUP_COMPLETE")

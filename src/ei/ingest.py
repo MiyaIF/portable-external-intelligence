@@ -4,15 +4,22 @@ import hashlib
 import json
 import os
 import re
+import time
 import unicodedata
-from dataclasses import dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from .adapters.base import SourceAdapter, SourceRecord, SourceCursor, scan_read_only
 from .config import Settings
 from .ids import fingerprint, machine_id, stable_hash
-from .journal import append_event
+from .journal import append_event, read_event
+from .capture_contract import CaptureIdentity, CaptureReceipt, capture_key
+from .capture_ledger import record_receipt
+from .pending_capture import accept_candidate
+from .safe_fs import assert_safe_target, safe_atomic_write, safe_ensure_directory
 from .models import Event, ObservationInput, validate_host_label
 from .privacy import inspect_observation
 
@@ -57,9 +64,13 @@ def _cursor_path(settings: Settings) -> Path:
     return settings.paths.local_state_dir / "ingest-cursor.json"
 
 
-def _load_cursor(path: Path) -> dict[str, Any]:
+def _load_cursor(path: Path, *, max_bytes: int | None = None) -> dict[str, Any]:
     if not path.exists():
         return {"version": CURSOR_VERSION, "sources": {}}
+    if max_bytes is not None:
+        assert_safe_target(path.parent, path, allow_missing=False, expected_type="file")
+        if path.stat().st_size > max_bytes:
+            raise ValueError("SOURCE_LEGACY_CURSOR_LIMIT")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -235,7 +246,211 @@ def _adapter_health(adapter: SourceAdapter) -> Mapping[str, int]:
     return {key: int(value[key]) for key in value if isinstance(key, str) and type(value[key]) is int and value[key] >= 0}
 
 
+@contextmanager
+def source_coordination(settings: Settings, *, wait: bool = True, budget=None):
+    """Lock order: source coordination, then pending/receipt capture lock."""
+    if budget is not None:
+        budget.check()
+    root = safe_ensure_directory(settings.paths.local_state_dir / "source-coordination")
+    path = assert_safe_target(root, root / ".source.lock", allow_missing=True, expected_type="file")
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    locked = False
+    try:
+        assert_safe_target(root, path, allow_missing=False, expected_type="file")
+        opened, current = os.fstat(descriptor), path.stat(follow_symlinks=False)
+        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError("SOURCE_LOCK_CHANGED")
+        started = time.monotonic()
+        while not locked:
+            if budget is not None:
+                budget.check()
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                if not wait or time.monotonic() - started >= 5:
+                    raise
+                time.sleep(min(0.01, budget.remaining_ms() / 1000) if budget is not None else 0.01)
+        yield root
+    finally:
+        try:
+            if locked:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def _record_index(settings, record, parser_version):
+    root = safe_ensure_directory(settings.paths.local_state_dir / "source-records")
+    key = stable_hash(json.dumps([record.source_ref, record.source_host_id, record.source_host_family,
+        parser_version, _record_fingerprint(record)], ensure_ascii=False))
+    return root, assert_safe_target(root, root / (key + ".json"), allow_missing=True), key
+
+
+def _read_record_plan(root, path, observation, budget=None):
+    if budget is not None:
+        budget.check()
+    if not path.exists():
+        return None
+    assert_safe_target(root, path, allow_missing=False, expected_type="file")
+    if path.stat().st_size > 16384:
+        raise ValueError("SOURCE_INDEX_INVALID")
+    value = json.loads(path.read_bytes())
+    digest = stable_hash(json.dumps(asdict(observation), sort_keys=True, ensure_ascii=False))
+    if not isinstance(value, dict) or value.get("observation_hash") != digest or value.get("route") not in {"event", "capture"}:
+        raise ValueError("SOURCE_INDEX_INVALID")
+    fields = {"observation_hash", "route", "occurred_at"} | ({"identity"} if value["route"] == "capture" else set())
+    if set(value) != fields or not isinstance(value["occurred_at"], str):
+        raise ValueError("SOURCE_INDEX_INVALID")
+    try:
+        moment = datetime.fromisoformat(value["occurred_at"].replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            raise ValueError("SOURCE_INDEX_INVALID")
+        if value["route"] == "capture" and capture_key(CaptureIdentity(**value["identity"])) is None:
+            raise ValueError("SOURCE_INDEX_INVALID")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("SOURCE_INDEX_INVALID") from exc
+    return value
+
+
+def _write_record_plan(root, path, value, budget=None):
+    if budget is not None:
+        budget.check()
+    safe_atomic_write(root, path, json.dumps(value, sort_keys=True).encode("utf-8"), mode=0o600)
+
+
+def _bound_identity(settings, record, parser_version, key, *, identity=None, binding_root=None, limit=2_097_152, require_existing=False, budget=None):
+    if budget is not None:
+        budget.check()
+    root = safe_ensure_directory(settings.paths.local_state_dir / "source-bindings")
+    scope = [record.source_ref, record.source_host_id, record.source_host_family, parser_version]
+    path = assert_safe_target(root, root / (stable_hash(json.dumps(scope)) + ".json"), allow_missing=True)
+    value = None
+    if path.exists():
+        if path.stat().st_size > limit:
+            raise ValueError("SOURCE_BINDING_LIMIT")
+        value = json.loads(path.read_bytes())
+        if (not isinstance(value, dict) or set(value) != {"scope", "root", "host_id", "instance_hash", "store_id", "records"}
+                or value["scope"] != fingerprint(scope) or value["host_id"] != record.source_host_id
+                or not isinstance(value["records"], dict)):
+            raise ValueError("SOURCE_BINDING_INVALID")
+        assert_safe_target(Path(value["root"]), Path(record.source_ref), allow_missing=False, expected_type="file")
+        capture_key(CaptureIdentity(value["host_id"], value["instance_hash"], value["store_id"], None, None, None))
+        if identity is not None and (value["root"] != str(binding_root) or value["instance_hash"] != identity.instance_hash or value["store_id"] != identity.store_id):
+            raise ValueError("SOURCE_BINDING_CONFLICT")
+    elif require_existing:
+        raise ValueError("SOURCE_BINDING_MISSING")
+    elif identity is not None:
+        value = dict(scope=fingerprint(scope), root=str(binding_root), host_id=identity.host_id,
+            instance_hash=identity.instance_hash, store_id=identity.store_id, records={})
+    if value is None:
+        return None
+    if key in value["records"]:
+        saved = value["records"][key]
+        if not isinstance(saved, list) or len(saved) != 3:
+            raise ValueError("SOURCE_BINDING_INVALID")
+        selected = CaptureIdentity(value["host_id"], value["instance_hash"], value["store_id"], saved[0], saved[1], saved[2])
+    else:
+        if not record.stable_record_id:
+            raise ValueError("SOURCE_RECORD_ID_UNKNOWN")
+        relative = Path(record.source_ref).relative_to(Path(value["root"])).as_posix()
+        selected = identity or CaptureIdentity(value["host_id"], value["instance_hash"], value["store_id"],
+            fingerprint(record.session_id) if record.session_id else None,
+            fingerprint(record.turn_id) if record.turn_id else None,
+            fingerprint(json.dumps([relative, parser_version, record.source_hash, record.stable_record_id])))
+        value["records"][key] = [selected.session_hash, selected.turn_hash, selected.record_hash]
+        encoded = json.dumps(value, sort_keys=True).encode("utf-8")
+        if len(encoded) > limit:
+            raise ValueError("SOURCE_BINDING_LIMIT")
+        _write_record_plan(root, path, value, budget=budget)
+    if capture_key(selected) is None:
+        raise ValueError("SOURCE_BINDING_INVALID")
+    return selected
+
+
+def _planned_event(settings, record, parser_version, capture_path, key, plan=None, budget=None):
+    if budget is not None:
+        budget.check()
+    event = _event_for_record(record, _record_fingerprint(record), settings, capture_path,
+        source_host_id=record.source_host_id, source_host_family=record.source_host_family)
+    stamp = datetime.fromisoformat((plan or {}).get("occurred_at", event.occurred_at).replace("Z", "+00:00"))
+    event = replace(event, event_id="evt_" + stamp.strftime("%Y%m%dT%H%M%S%fZ") + "_" + key[:12], occurred_at=stamp.isoformat())
+    path = settings.paths.event_dir / stamp.strftime("%Y") / stamp.strftime("%m") / (event.event_id + ".json")
+    if path.exists():
+        assert_safe_target(settings.paths.event_dir, path, allow_missing=False, expected_type="file")
+        if path.stat().st_size > 2_097_152:
+            raise ValueError("SOURCE_EVENT_LIMIT")
+        stored = read_event(path, budget=budget)
+        # Unchanged normalized content can outlive a different whole-file version.
+        fields = set(event.payload) - {"source_hash", "provenance_key"}
+        if stored.event_id != event.event_id or stored.event_type != event.event_type or any(stored.payload.get(k) != event.payload[k] for k in fields):
+            raise ValueError("SOURCE_EVENT_MISMATCH")
+        return stored, path
+    return event, None
+
+
+def coordinate_record(settings, record, parser_version, capture_path, observation, *, identity=None, binding_root=None, now=None, metadata_limit=2_097_152, budget=None):
+    """The caller holds source_coordination. Route ownership precedes payload writes."""
+    now = now or datetime.now(timezone.utc)
+    if budget is not None:
+        budget.check()
+    root, path, key = _record_index(settings, record, parser_version)
+    plan = _read_record_plan(root, path, observation, budget=budget)
+    bound = _bound_identity(settings, record, parser_version, key, identity=identity, binding_root=binding_root,
+        limit=metadata_limit, require_existing=plan is not None and plan["route"] == "capture", budget=budget)
+    if plan is None:
+        _, existing = _planned_event(settings, record, parser_version, capture_path, key, budget=budget)
+        # A legacy cursor fingerprint alone cannot establish durable success.
+        # Unverifiable historical records defer rather than creating a second copy.
+        if budget is not None:
+            budget.check()
+        cursor = _load_cursor(_cursor_path(settings), max_bytes=metadata_limit)
+        previous = cursor["sources"].get(_source_key(record.source_ref, record.source_host_id, record.source_host_family), {})
+        if existing is None and previous.get("parser_version") == parser_version and _record_fingerprint(record) in previous.get("record_fingerprints", []):
+            raise ValueError("SOURCE_LEGACY_EVIDENCE_UNKNOWN")
+        plan = {"observation_hash": stable_hash(json.dumps(asdict(observation), sort_keys=True, ensure_ascii=False)),
+                "route": "capture" if bound is not None and existing is None else "event", "occurred_at": record.observed_at}
+        if plan["route"] == "capture":
+            plan["identity"] = asdict(bound)
+        _write_record_plan(root, path, plan, budget=budget)
+    if plan["route"] == "capture":
+        trusted = CaptureIdentity(**plan["identity"])
+        if trusted.host_id != record.source_host_id or capture_key(trusted) is None or bound != trusted:
+            raise ValueError("SOURCE_INDEX_IDENTITY_INVALID")
+        result = accept_candidate(settings, trusted, observation, now=now, budget=budget, origin="NATIVE_SOURCE")
+        if identity is not None and result.state == "SECURED" and capture_key(identity) != result.capture_id:
+            result = record_receipt(settings, replace(result, capture_id=capture_key(identity), covered_target_ids=()), budget=budget)
+        return result, None, False
+    event, existing = _planned_event(settings, record, parser_version, capture_path, key, plan, budget=budget)
+    if existing is None:
+        if budget is not None:
+            budget.check()
+        append_event(event, settings.paths.event_dir, budget=budget)
+    if identity is not None:
+        receipt = record_receipt(settings, CaptureReceipt(capture_key(identity), "SECURED", (event.event_id,), (),
+            "SOURCE_EVENT_SECURED", now, ((event.event_id, fingerprint(json.dumps(event.payload, sort_keys=True))),)), budget=budget)
+        return receipt, event, existing is None
+    return None, event, existing is None
+
+
 def ingest_sources(settings: Settings, adapters: Iterable[SourceAdapter]) -> IngestResult:
+    with source_coordination(settings):
+        return _ingest_sources(settings, adapters)
+
+
+def _ingest_sources(settings: Settings, adapters: Iterable[SourceAdapter]) -> IngestResult:
     """Ingest normalized records idempotently while preserving source immutability."""
     cursor_path = _cursor_path(settings)
     cursor = _load_cursor(cursor_path)
@@ -377,6 +592,7 @@ def ingest_sources(settings: Settings, adapters: Iterable[SourceAdapter]) -> Ing
             )
             current_fingerprints: list[str] = []
             last_event_id = ""
+            deferred = False
             for record, pair in zip(source_records, record_pairs, strict=True):
                 if pair is None:
                     continue
@@ -409,19 +625,22 @@ def ingest_sources(settings: Settings, adapters: Iterable[SourceAdapter]) -> Ing
                     rejected += 1
                     health["rejected"] += 1
                     continue
-                event = _event_for_record(
-                    record,
-                    record_fp,
-                    settings,
-                    _capture_path(record, adapter),
-                    source_host_id=source_host_id,
-                    source_host_family=source_host_family,
-                )
-                append_event(event, settings.paths.event_dir)
-                created += 1
+                scoped_record = replace(record, source_host_id=source_host_id, source_host_family=source_host_family)
+                receipt, event, was_created = coordinate_record(settings, scoped_record, parser_version, _capture_path(record, adapter), observation)
+                if receipt is not None and receipt.state != "SECURED":
+                    deferred = True
+                    current_fingerprints.remove(record_fp)
+                    health["unknown"] += 1
+                    continue
+                if event is None:
+                    skipped += 1
+                    continue
+                created += int(was_created)
                 health["parsed"] += 1
                 event_ids.append(event.event_id)
                 last_event_id = event.event_id
+            if deferred:
+                continue
             sources[key] = {
                 **dict(metadata),
                 "source_ref_hash": fingerprint(source_ref),

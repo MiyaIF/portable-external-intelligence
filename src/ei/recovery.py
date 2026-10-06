@@ -260,16 +260,35 @@ def _hash(value: str) -> str:
     return "sha256:" + hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()
 
 
-def _read_jsonl(path: Path) -> tuple[list[Mapping[str, Any]], int]:
+def _orphan_check(budget):
+    if budget is not None:
+        budget.check()
+
+
+def _read_jsonl(path: Path, *, budget=None) -> tuple[list[Mapping[str, Any]], int]:
+    _orphan_check(budget)
     if not path.exists():
         return [], 0
     rows: list[Mapping[str, Any]] = []
     invalid = 0
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        assert_safe_target(path.parent, path, allow_missing=False, expected_type="file")
+        lines = []
+        with path.open("r", encoding="utf-8") as stream:
+            while True:
+                _orphan_check(budget)
+                line = stream.readline(1048577 if budget is not None else -1)
+                if not line:
+                    break
+                if budget is not None and len(line) > 1048576:
+                    raise ValueError("RECOVERY_SOURCE_LINE_LIMIT")
+                lines.append(line)
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError):
         return [], 1
     for line in lines:
+        _orphan_check(budget)
         if not line.strip():
             continue
         try:
@@ -284,12 +303,14 @@ def _read_jsonl(path: Path) -> tuple[list[Mapping[str, Any]], int]:
     return rows, invalid
 
 
-def _known_recovery_fingerprints(settings: Any) -> set[str]:
+def _known_recovery_fingerprints(settings: Any, *, budget=None) -> set[str]:
+    _orphan_check(budget)
     root = Path(settings.paths.event_dir)
     if not root.exists():
         return set()
     known: set[str] = set()
-    for event in iter_events(root):
+    for event in iter_events(root, **({"budget": budget} if budget is not None else {})):
+        _orphan_check(budget)
         if event.event_type != "capture.fallback_recovered":
             continue
         value = event.payload.get("observation_fingerprint") or event.payload.get("source_hash")
@@ -298,30 +319,34 @@ def _known_recovery_fingerprints(settings: Any) -> set[str]:
     return known
 
 
-def _write_result(settings: Any, result: RecoveryResult) -> None:
+def _write_result(settings: Any, result: RecoveryResult, *, budget=None) -> None:
+    _orphan_check(budget)
     path = Path(settings.paths.runtime_dir) / "recovery-health.json"
     try:
         safe_ensure_directory(path.parent)
+        _orphan_check(budget)
         safe_atomic_write(path.parent, path, (json.dumps(result.to_dict(), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8"))
     except SafeFilesystemError as exc:
         raise ValueError(exc.code) from exc
 
 
-def reconcile_orphans(host_id: str, cursor: SourceCursor | Mapping[str, Any] | None, settings: Any) -> RecoveryResult:
+def reconcile_orphans(host_id: str, cursor: SourceCursor | Mapping[str, Any] | None, settings: Any, *, budget=None) -> RecoveryResult:
+    _orphan_check(budget)
     if not isinstance(host_id, str) or not host_id:
         result = RecoveryResult(0, 1, 0, True, reason_codes=("HOST_ID_INVALID",))
-        _write_result(settings, result)
+        _write_result(settings, result, budget=budget)
         return result
     source_cursor = _cursor_value(cursor)
-    rows, invalid = _read_jsonl(Path(settings.paths.local_state_dir) / "orphan-sources.jsonl")
-    receipts, receipt_invalid = _read_jsonl(Path(settings.paths.runtime_dir) / "hook-receipts.jsonl")
-    known = _known_recovery_fingerprints(settings)
+    rows, invalid = _read_jsonl(Path(settings.paths.local_state_dir) / "orphan-sources.jsonl", budget=budget)
+    receipts, receipt_invalid = _read_jsonl(Path(settings.paths.runtime_dir) / "hook-receipts.jsonl", budget=budget)
+    known = _known_recovery_fingerprints(settings, budget=budget)
     recovered = 0
     parse_deferred = invalid + receipt_invalid
     policy_excluded = 0
     duplicate = 0
     reasons: set[str] = set()
     for row in rows:
+        _orphan_check(budget)
         row_host = row.get("host_id")
         if row_host not in {None, host_id}:
             continue
@@ -379,7 +404,9 @@ def reconcile_orphans(host_id: str, cursor: SourceCursor | Mapping[str, Any] | N
             occurred_at=parsed_occurred_at,
         )
         try:
-            append_event(event, settings.paths.event_dir)
+            append_event(event, settings.paths.event_dir, **({"budget": budget} if budget is not None else {}))
+        except TimeoutError:
+            raise
         except (OSError, ValueError, RuntimeError):
             parse_deferred += 1
             reasons.add("append_deferred")
@@ -389,6 +416,7 @@ def reconcile_orphans(host_id: str, cursor: SourceCursor | Mapping[str, Any] | N
     unclosed_sessions: set[str] = set()
     closed_sessions: set[str] = set()
     for receipt in receipts:
+        _orphan_check(budget)
         if receipt.get("host_id") != host_id:
             continue
         session = receipt.get("session_id_hash")
@@ -407,7 +435,7 @@ def reconcile_orphans(host_id: str, cursor: SourceCursor | Mapping[str, Any] | N
     if policy_excluded:
         reasons.add("policy_excluded")
     result = RecoveryResult(recovered, parse_deferred, policy_excluded, coverage_unknown, duplicate, tuple(sorted(reasons)))
-    _write_result(settings, result)
+    _write_result(settings, result, budget=budget)
     return result
 
 

@@ -15,8 +15,10 @@ from typing import Any, Mapping
 from unittest.mock import patch
 
 from ei.capture import record_agent_observation
+from ei.capture_ledger import read_receipt
 from ei.cli import _recall
 from ei.inference.base import ProviderResult
+from ei.inference.budget import BudgetLedger
 from ei.inference.router import ProviderRouter
 from ei.installer import (
     SetupSelection,
@@ -27,11 +29,14 @@ from ei.installer import (
     update,
 )
 from ei.journal import iter_events
+from ei.key_provider import InMemoryKeyProvider
 from ei.maintainer import _RouterAdapter, drain_queue
 from ei.models import CaptureContext, ObservationInput
 from ei.project import project_events
-from ei.queue import QueueState, enqueue_receipt, list_queue_items, read_queue_item
+from ei.queue import QueueState, list_queue_items, read_queue_item
 from ei.reconciliation import reconcile_lifecycle
+from ei.runtime_catalog import lookup as runtime_lookup
+from ei.spool import read_spool
 
 
 CUSTOM_PROFILE: dict[str, object] = {
@@ -83,10 +88,18 @@ class RecordingOrganizer:
                 "applicable_host_families": list(input_json.get("applicable_host_families", ())),
             },
             schema_name=schema_name,
+            # This deterministic fixture models measured usage. These fixed
+            # values are synthetic, not estimates or real provider telemetry.
+            input_tokens=100,
+            output_tokens=100,
+            metadata={"usage_known": True, "cost_known": True},
         )
 
 
-class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class SingleIntelligenceMultiCliAcceptanceTests(NotificationIsolationMixin, unittest.TestCase):
     def _selection(self, root: Path) -> SetupSelection:
         homes = {
             "codex-cli": root / "homes" / "codex-cli",
@@ -159,11 +172,26 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             source_host_id=host_id,
             source_host_family=family,
         )
+        prior_events = self._journal_digest(settings)
         captured = record_agent_observation(observation, context, settings)
         self.assertTrue(captured.created, captured)
-        events = list(iter_events(settings.paths.event_dir))
-        event = next(item for item in events if item.event_id == captured.event_id)
-        queued = enqueue_receipt(event, None, settings)
+        queued = read_queue_item(captured.event_id or "", settings)
+        self.assertEqual(queued.state, QueueState.READY)
+        self.assertIsNotNone(queued.capture_id)
+        self.assertIsNotNone(queued.payload_ref)
+        self.assertEqual(queued.payload_ref.purpose, "pending")
+        receipt = read_receipt(settings, queued.capture_id)
+        self.assertEqual(receipt.state, "SECURED")
+        self.assertEqual(receipt.candidate_ids, (queued.queue_id,))
+        body = json.loads(read_spool(queued.payload_ref, settings, expected_capture_id=queued.capture_id))
+        self.assertEqual(body["claim"], phrase)
+        self.assertEqual((body["source_host_id"], body["source_host_family"]), (host_id, family))
+        self.assertEqual(body["applicability_scope"], scope)
+        self.assertEqual(body["applicable_host_ids"], list(applicable_ids))
+        self.assertEqual(body["applicable_host_families"], list(applicable_families))
+        encrypted = runtime_lookup(settings.paths.spool_dir, queued.payload_ref.spool_id).read_bytes()
+        self.assertNotIn(phrase.encode("utf-8"), encrypted)
+        self.assertEqual(self._journal_digest(settings), prior_events)
         return captured.event_id or "", queued
 
     def _recall(self, settings: Any, query: str, host_id: str, *, domain: str = "") -> dict[str, Any]:
@@ -203,9 +231,10 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
         )
 
     def test_two_work_hosts_share_one_intelligence_and_one_organizer(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("multi-cli-test", b"m" * 32)):
             root = Path(temporary)
             selection = self._selection(root)
+            self.notification_isolation.allow_notification_helper()
             installed = setup(selection)
             self.assertTrue(installed.ok, installed.to_dict())
             manifest_path = root / "runtime" / "install-manifest.json"
@@ -281,7 +310,7 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             )
             self.assertFalse(replay.created)
             self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY")
-            self.assertEqual(len(list(iter_events(settings.paths.event_dir))), 6)
+            self.assertEqual(list(iter_events(settings.paths.event_dir)), [])
             self.assertEqual(len(list_queue_items(settings)), 6)
 
             organizer = RecordingOrganizer()
@@ -289,6 +318,7 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             router = ProviderRouter(
                 [organizer, alternative],
                 organizer=settings.organizer,
+                budget_ledger=BudgetLedger(settings),
             )
             drained = drain_queue(
                 settings,
@@ -301,12 +331,26 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             self.assertGreater(organizer.calls, 0)
             self.assertEqual(alternative.calls, 0)
             self.assertTrue(all(item.state == QueueState.DONE for item in list_queue_items(settings)))
+            committed = [event for event in iter_events(settings.paths.event_dir) if event.event_type == "curation.changeset.applied"]
+            self.assertEqual(len(committed), 6)
+            self.assertEqual(
+                {source for event in committed for source in event.payload["source_hashes"]},
+                {item.source_hash for item in list_queue_items(settings)},
+            )
 
-            reconcile_lifecycle(
+            observations = [event for event in iter_events(settings.paths.event_dir) if event.event_type == "observation.recorded"]
+            self.assertEqual(len(observations), 6)
+            for scope in ("universal", "family", "host"):
+                self.assertEqual(
+                    {event.payload["cwd_fingerprint"] for event in observations if event.payload["applicability_scope"] == scope},
+                    {"sha256:" + hashlib.sha256(f"project-{scope}-{number}".encode("utf-8")).hexdigest() for number in (1, 2)},
+                )
+            reconciled = reconcile_lifecycle(
                 list(iter_events(settings.paths.event_dir)),
                 settings.paths.event_dir,
                 now_utc=datetime(2026, 9, 11, tzinfo=timezone.utc),
             )
+            self.assertEqual((reconciled.candidate_events, reconciled.promotion_events), (3, 3))
             project_events(list(iter_events(settings.paths.event_dir)), settings.paths.knowledge_dir)
             settings = _settings_for_selection(selection)
 

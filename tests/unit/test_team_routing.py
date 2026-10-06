@@ -1,9 +1,19 @@
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from ei.inference.base import InferenceBudget, ProviderResult
-from ei.team_routing import TeamRoutingDecision, decide_team_routing, route_applied_personal_knowledge
+from ei.operation_runtime import OperationBudget
+from ei.team_routing import (
+    TeamRoutingDecision,
+    decide_team_routing,
+    prepare_team_routing,
+    route_applied_personal_knowledge,
+    validate_prepared_team_routing,
+)
 
 
 def candidate(*, classification: str = "private-reusable") -> dict[str, object]:
@@ -60,6 +70,21 @@ def budget() -> InferenceBudget:
 
 
 class TeamRoutingTests(unittest.TestCase):
+    def test_disabled_prepare_is_explicit_and_never_constructs_provider(self):
+        settings = SimpleNamespace(
+            paths=SimpleNamespace(runtime_root=Path("runtime")),
+            knowledge_stores=SimpleNamespace(team=None),
+        )
+        with patch("ei.inference.router.ProviderRouter", side_effect=AssertionError("disabled team constructed provider")):
+            prepared = prepare_team_routing(
+                candidate(), settings, now=datetime(2026, 10, 5, tzinfo=timezone.utc),
+                operation_budget=OperationBudget(1000),
+            )
+        self.assertTrue(validate_prepared_team_routing(prepared))
+        self.assertEqual(prepared["status"], "NOT_ELIGIBLE")
+        self.assertEqual(prepared["reason_code"], "TEAM_DISABLED")
+        self.assertIsNone(prepared["normalized_payload"])
+
     def test_team_routing_rejects_local_classifications_without_provider(self) -> None:
         provider = SpyProvider()
         for classification in ("client-confidential", "machine-local", "secret"):
