@@ -32,21 +32,21 @@ class CaptureCatchupTests(unittest.TestCase):
         key_patch.start()
         self.addCleanup(key_patch.stop)
 
-    def ingest(self):
-        return ingest_sources(self.settings, [CodexMemoryAdapter([self.path])])
+    def ingest(self, source_path=None):
+        return ingest_sources(self.settings, [CodexMemoryAdapter([source_path or self.path])])
 
     def recover(self):
         return recover_page(self.settings, self.source, now=NOW, max_ms=10000)
 
     def test_ingest_then_recovery_reuses_actual_event(self):
-        self.assertEqual(self.ingest().created_events, 1)
+        self.assertEqual(self.ingest(self.path.resolve(strict=True)).created_events, 1)
         self.assertEqual(self.recover().secured, 1)
         self.assertEqual(len(list_queue_items(self.settings)), 0)
         self.assertEqual(len(list(self.settings.paths.event_dir.rglob("*.json"))), 1)
 
     def test_recovery_then_ingest_preserves_single_pending_candidate(self):
         self.assertEqual(self.recover().secured, 1)
-        self.assertEqual(self.ingest().created_events, 0)
+        self.assertEqual(self.ingest(self.path.resolve(strict=True)).created_events, 0)
         self.assertEqual(len(list_queue_items(self.settings)), 1)
         self.assertEqual(list(self.settings.paths.event_dir.rglob("*.json")), [])
 

@@ -262,7 +262,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             self.assertIn("-Target", command)
             self.assertNotIn("-ExecutionPolicy", command)
             self.assertFalse(process.call_args.kwargs["shell"])
-            self.assertEqual(process.call_args.kwargs["creationflags"], 0x08000000)
+            self.assertEqual(process.call_args.kwargs["creationflags"], 0x08000000 if os.name == "nt" else 0)
 
     def test_uninstall_removes_only_unchanged_notification_files_with_valid_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -367,7 +367,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
 
     def test_unverified_os_response_commit_failure_retains_prepared_recovery_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve(strict=True)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
             original_commit = _Transaction.commit
@@ -393,7 +393,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             self.assertEqual(result.notification_registration["reason_code"], "OS_RESPONSE_UNVERIFIED_JOURNAL_FINALIZE_FAILED_OSError")
             self.assertEqual(receipt["status"], "PREPARED")
             self.assertEqual(journal["status"], "IN_PROGRESS")
-            recovered = _recover_pending_transactions(selection.runtime_root)
+            recovered = _recover_pending_transactions(selection.runtime_root.resolve(strict=True))
             self.assertEqual(recovered[0]["status"], "PRESERVED_UNVERIFIED")
             self.assertTrue(receipt_path.is_file())
             self.assertEqual(json.loads(journal_path.read_text(encoding="utf-8"))["status"], "IN_PROGRESS")

@@ -311,8 +311,10 @@ class MaintainerTests(unittest.TestCase):
                 datetime(2026, 8, 26, tzinfo=timezone.utc),
             )
             append_event(event, settings.paths.event_dir)
-            item = enqueue_receipt(event, None, settings)
-            result = drain_queue(settings, provider=YesProvider(), max_items=1, time_budget_ms=5000)
+            key_provider = InMemoryKeyProvider("maintainer-drain-test-key", b"d" * 32)
+            with patch("ei.spool.default_key_provider", return_value=key_provider):
+                item = enqueue_receipt(event, None, settings)
+                result = drain_queue(settings, provider=YesProvider(), max_items=1, time_budget_ms=5000)
             self.assertEqual(result.processed, 1)
             self.assertEqual(result.remaining, 0)
             self.assertEqual(queue_health(settings).terminal, 1)

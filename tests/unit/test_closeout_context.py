@@ -17,9 +17,11 @@ from ei.hooks.codex import CodexAdapter
 from ei.hooks import registry
 from ei.ids import fingerprint
 from ei.install_manifest import normalize_install_manifest, validate_install_manifest
+from ei.key_provider import InMemoryKeyProvider
 from ei.operation_runtime import OperationBudget, trusted_capture_identity
 from ei.capture_ledger import read_receipt, record_receipt
 from ei.journal import validate_schema
+from ei.spool import read_spool, write_spool
 from tests.helpers import make_hook_settings
 from tests.unit.test_install_manifest import valid_v7_manifest
 
@@ -28,7 +30,14 @@ class InstalledAdapterFixture:
     def __init__(self, test: unittest.TestCase, *, turns: int = 3):
         self._temporary = tempfile.TemporaryDirectory()
         test.addCleanup(self._temporary.cleanup)
-        root = Path(self._temporary.name)
+        key_provider = getattr(test, "_installed_adapter_key_provider", None)
+        if key_provider is None:
+            key_provider = InMemoryKeyProvider("installed-adapter-test-key", b"i" * 32)
+            key_provider_patch = patch("ei.spool.default_key_provider", return_value=key_provider)
+            key_provider_patch.start()
+            test.addCleanup(key_provider_patch.stop)
+            setattr(test, "_installed_adapter_key_provider", key_provider)
+        root = Path(self._temporary.name).resolve(strict=True)
         engine = root / "engine"
         knowledge = root / "knowledge"
         runtime = root / "runtime"
@@ -206,6 +215,33 @@ class CloseoutContextTests(unittest.TestCase):
                 control,
                 budget=OperationBudget(budget_ms),
             )
+
+    def test_fixture_spool_roundtrip_uses_test_key_without_os_backend(self):
+        with patch(
+            "ei.key_provider.WindowsDPAPIKeyProvider",
+            side_effect=AssertionError("fixture called the Windows key backend"),
+        ), patch(
+            "ei.key_provider.MacOSKeychainProvider",
+            side_effect=AssertionError("fixture called the macOS key backend"),
+        ), patch(
+            "ei.key_provider.LinuxSecretServiceProvider",
+            side_effect=AssertionError("fixture called the Linux key backend"),
+        ):
+            first_fixture = InstalledAdapterFixture(self, turns=1)
+            first_payload = b"encrypted fixture payload one"
+            first_ref = write_spool(first_payload, "private-reusable", first_fixture.settings)
+            first_spool_paths = list(
+                first_fixture.settings.paths.spool_dir.rglob(f"{first_ref.spool_id}.json")
+            )
+            self.assertEqual(len(first_spool_paths), 1)
+            first_spool_path = first_spool_paths[0]
+            self.assertNotIn(first_payload, first_spool_path.read_bytes())
+
+            second_fixture = InstalledAdapterFixture(self, turns=1)
+            second_payload = b"encrypted fixture payload two"
+            second_ref = write_spool(second_payload, "private-reusable", second_fixture.settings)
+            self.assertEqual(read_spool(first_ref, first_fixture.settings), first_payload)
+            self.assertEqual(read_spool(second_ref, second_fixture.settings), second_payload)
 
     def test_explicit_two_targets_excludes_third_turn(self):
         fixture = InstalledAdapterFixture(self, turns=3)

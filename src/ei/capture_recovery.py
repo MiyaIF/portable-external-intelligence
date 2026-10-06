@@ -14,7 +14,7 @@ from .capture_ledger import record_receipt
 from .config import Settings
 from .models import ObservationInput, validate_host_label
 from .privacy import inspect_observation
-from .safe_fs import assert_safe_target, safe_atomic_write, safe_ensure_directory
+from .safe_fs import SafeFilesystemError, assert_safe_target, safe_atomic_write, safe_ensure_directory
 from .ingest import source_coordination, coordinate_record
 from .operation_runtime import OperationBudget
 
@@ -47,6 +47,27 @@ def unsupported_page() -> RecoveryPage:
 
 class _SourceParseError(ValueError):
     """A format failure in an already-verified source byte stream."""
+
+
+def _canonical_source_path(root: Path, target: Path) -> Path:
+    """Canonicalize only while the validated lexical source identity remains stable."""
+    lexical = assert_safe_target(root, target, allow_missing=False)
+
+    def identity(path: Path) -> tuple[int, int, int]:
+        info = path.stat(follow_symlinks=False)
+        return info.st_dev, info.st_ino, info.st_mode
+
+    before = identity(lexical)
+    canonical = lexical.resolve(strict=True)
+    resolved = identity(canonical)
+    try:
+        checked = assert_safe_target(root, target, allow_missing=False)
+    except SafeFilesystemError as exc:
+        raise ValueError("SOURCE_CHANGED_DURING_READ") from exc
+    after = identity(checked)
+    if before != resolved or before != after:
+        raise ValueError("SOURCE_CHANGED_DURING_READ")
+    return canonical
 
 
 def _parsed_records(adapter, path, content, metadata, deadline):
@@ -102,7 +123,7 @@ def _recover_page(settings: Settings, source: RecoverySource, *, now: datetime,
     committed = False
     code = "SOURCE_CORRELATION_UNKNOWN"
     try:
-        selected = assert_safe_target(source.root.parent, source.root, allow_missing=False)
+        selected = _canonical_source_path(source.root.parent, source.root)
         exact_file = selected.is_file()
         if exact_file and not is_readable_metadata_path(selected):
             raise ValueError("SOURCE_PATH_UNAUTHORIZED")

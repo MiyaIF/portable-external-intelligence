@@ -319,7 +319,8 @@ class CaptureRecoveryTests(unittest.TestCase):
         self.write_memory("a/memory.md")
         deleted = self.write_memory("b/memory.md", ("This directory will disappear before intake",))
         self.write_memory("c/memory.md", ("Recover the remaining structured candidate",))
-        self.assertEqual(self.recover(max_records=1).secured, 1)
+        initial = recover_page(self.settings, self.source, now=NOW, max_records=1, max_ms=20000)
+        self.assertEqual(initial.secured, 1, repr(initial))
         deleted.unlink()
         deleted.parent.rmdir()
         self.write_memory("aa/memory.md", ("Recover additions before the old cursor position",))
@@ -477,6 +478,45 @@ class CaptureRecoveryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, "test junction could not be created")
         with patch("ei.capture_recovery._read_verified", side_effect=AssertionError("link read")):
             self.assertEqual(self.recover().secured, 0)
+
+    def test_source_root_junction_swap_after_boundary_check_is_rejected(self):
+        from ei.safe_fs import assert_safe_target as real_assert_safe_target
+
+        outside = self.root / "outside-authorized-source"
+        outside.mkdir()
+        (outside / "memory.md").write_text(
+            "## Reusable knowledge\n- Outside boundary sentinel\n", encoding="utf-8"
+        )
+        swapped = False
+
+        def swap_after_source_check(root, target, **kwargs):
+            nonlocal swapped
+            validated = real_assert_safe_target(root, target, **kwargs)
+            if not swapped and Path(target) == self.source_root and not kwargs.get("allow_root", False):
+                self.source_root.rename(self.root / "source-before-swap")
+                if os.name == "nt":
+                    result = subprocess.run(
+                        ["cmd", "/c", "mklink", "/J", str(self.source_root), str(outside)],
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        timeout=10,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+                else:
+                    self.source_root.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return validated
+
+        with patch("ei.capture_recovery.assert_safe_target", side_effect=swap_after_source_check):
+            result = self.recover()
+
+        self.assertTrue(swapped)
+        self.assertEqual((result.secured, result.cursor_committed), (0, False), repr(result))
+        self.assertEqual(list_queue_items(self.settings), ())
+        spool_root = self.settings.paths.spool_dir
+        self.assertEqual(list(spool_root.rglob("*.json")) if spool_root.exists() else [], [])
+        self.assertEqual(result.reason_code, "SOURCE_CHANGED_DURING_READ", repr(result))
 
     def test_growth_during_stream_read_is_not_accepted(self):
         path = self.write_memory()

@@ -157,17 +157,21 @@ class GitSyncTests(unittest.TestCase):
         from ei import sync
         with tempfile.TemporaryDirectory() as tmp:
             settings, remote, work = self._bounded_fixture(Path(tmp))
+            work = work.resolve(strict=True)
             before = {path: path.read_bytes() for path in (work / "events").rglob("*.json")}
             original, budget = sync.GitRunner.run, OperationBudget(30000)
+            injector_fired = []
             def stage_then_expire(runner, args):
                 result = original(runner, args)
                 if runner.repo_root == work and args[1:3] == ["add", "--"]:
+                    injector_fired.append(True)
                     budget.deadline = 0
                 return result
             with patch("ei.sync.GitRunner.run", stage_then_expire):
                 result = sync_once(settings, budget=budget)
             self.assertFalse(result.ok)
             self.assertEqual(result.reason_code, "SYNC_SOURCE_RECONCILIATION_PENDING")
+            self.assertTrue(injector_fired)
             self.assertEqual(result.preflight["push_returncode"], 0)
             self.assertEqual({path: path.read_bytes() for path in before}, before)
             self.assertEqual(read_index_items(build_index(work / "knowledge", work / "knowledge" / "index.json"))[0]["rule"], "verified reusable sync rule 2")

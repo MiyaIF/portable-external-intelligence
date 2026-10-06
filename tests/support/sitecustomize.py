@@ -719,7 +719,7 @@ if (Test-EiSetupArguments) {
     if ($MyInvocation.ScriptName) { return }
     exit 125
   }
-  $preload = 'import os,sys;sys.path.insert(0,os.environ["EI_TEST_NOTIFICATION_SUPPORT"]);import sitecustomize;exec(sys.argv.pop(1))'
+  $preload = "import os,sys;sys.path.insert(0,os.environ['EI_TEST_NOTIFICATION_SUPPORT']);import sitecustomize;exec(sys.argv.pop(1))"
   $rawCliArguments = @($arguments[6..($arguments.Count - 1)])
   $mappedCliArguments = @($rawCliArguments)
   $pythonIndex = [Array]::IndexOf([string[]]$mappedCliArguments, '--python-exe')

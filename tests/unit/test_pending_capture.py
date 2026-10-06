@@ -187,6 +187,7 @@ class PendingCaptureTests(unittest.TestCase):
         self.assertEqual((item.state, item.last_error_code), (QueueState.FAILED_NEEDS_ATTENTION, "PENDING_EXPIRED"))
 
     def test_terminal_queue_mismatch_never_acknowledges_replay(self):
+        from ei.operation_runtime import OperationBudget
         for field, value in (("source_hash", "sha256:" + "f" * 64),
                              ("idempotency_key", "sha256:" + "e" * 64),
                              ("event_id", "evt_unrelated"),
@@ -196,7 +197,9 @@ class PendingCaptureTests(unittest.TestCase):
                              ("created_at", "2026-01-01T00:00:00Z")):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 self.settings = make_settings(Path(tmp))
-                original = self.accept()
+                original = accept_candidate(self.settings, identity(), observation(), now=NOW,
+                    key_provider=self.key, budget=OperationBudget(20000))
+                self.assertEqual(original.state, "SECURED", repr(original))
                 item = list_queue_items(self.settings)[0]
                 transition_queue_item(item, QueueState.NO_DISCARDED, self.settings, now=NOW)
                 path = runtime_lookup(self.settings.paths.queue_dir, item.queue_id)

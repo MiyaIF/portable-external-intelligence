@@ -49,7 +49,7 @@ class IndexTests(unittest.TestCase):
     def test_generation_path_must_match_its_manifest_identity(self):
         from ei.operation_runtime import OperationBudget
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve(strict=True)
             index = project_events(self._events(), root, budget=OperationBudget(10000))
             replacement = index.index_path.parent.with_name("0" * 64)
             index.index_path.parent.rename(replacement)

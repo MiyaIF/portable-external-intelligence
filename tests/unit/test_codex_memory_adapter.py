@@ -13,8 +13,9 @@ class CodexMemoryAdapterTests(unittest.TestCase):
             path.write_text("## Reusable knowledge\n- Verify persisted results\n", encoding="utf-8")
             raw, metadata = path.read_bytes(), path.stat()
             expected = list(CodexMemoryAdapter([]).read(path))
+            verified_path = path.resolve(strict=True)
             with patch.object(Path, "read_bytes", side_effect=AssertionError("reopened")), patch.object(Path, "stat", side_effect=AssertionError("restat")):
-                actual = list(CodexMemoryAdapter([]).read_verified(path.absolute(), raw, metadata))
+                actual = list(CodexMemoryAdapter([]).read_verified(verified_path, raw, metadata))
             self.assertEqual(actual, expected)
             self.assertTrue(actual[0].stable_record_id)
 

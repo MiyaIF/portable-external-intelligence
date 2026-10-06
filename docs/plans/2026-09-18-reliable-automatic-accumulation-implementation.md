@@ -1339,3 +1339,27 @@ Spec: 12.9。利用者は既存保存処理の拡張を承認済み。I2（priva
 - `max_records`は上限であり保証処理件数ではない。frontier再開テストは各回の上限と単調な保存進捗を保ち、最大20回の有界再開で20件すべての一意queueとSECURED receiptを検証する。期待件数の削減、skip、時間切れの成功扱いはしない。
 - 修正差分レビュー、既存の全体テストと公開時の情報漏えい検査を通して公開branchを更新する。実Host/OS認定や性能最適化の未完了を先行運用の合格と混同しない。
 - 先行運用の公開工程は、固定版の全体テスト、決定的な公開用抽出、抽出内容と検証済みtreeの一致、公開tree/履歴の情報漏えい検査、同じ公開SHAに対する既存CI（全体テスト・OS別clean-clone検証）を条件とする。抽出ツールのローカル全工程認定を省略した場合、そのreceiptは`exported_unvalidated`のまま保持し、正式なexport certificateや`PUBLIC_RELEASE_READY`を取得したと表示しない。実Host証拠と正式認定は別途残す。
+
+#### 公開CIで検出された依存脆弱性の修正
+
+**Files:** `requirements-ci.lock`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。
+
+CI用の間接依存`urllib3`だけを2.7.0から修正版2.8.0へ更新し、公式配布物のSHA256を検証する。runtime/build依存、scanner設定、権限、実インストール環境は変更しない。隔離環境でhash付きインストール、依存整合性・脆弱性検査、対象テストを実施し、差分レビューと固定版全体テスト後に既存公開branchへ反映する。
+
+公開CIで判明したOS鍵ストア依存の試験fixtureも隔離する。**Files:** `tests/unit/test_closeout_context.py`、`tests/unit/test_maintainer.py`。既存`InMemoryKeyProvider`をテストの寿命に限定して明示し、暗号化・spool・journal・復旧・証拠照合の実処理と既存assertionは維持する。製品のOS鍵ストア選択や鍵が利用不能な場合の動作は変更しない。実OS依存がなくても既存試験が通ることを対象moduleで確認する。
+
+**追加Files:** `tests/integration/test_unattended_setup.py`。Windows通知helperのfake-process試験がPOSIXにもWindows専用`creationflags`を要求していたため、Windowsでは`CREATE_NO_WINDOW`、POSIXでは0という既存製品契約に期待値を合わせる。shell無効、固定argv、ExecutionPolicy非変更の検査は維持する。
+
+#### 公開Windows CI: 短縮パスと試験起動境界
+
+**Files:** `src/ei/capture_recovery.py`、`tests/integration/test_capture_catchup.py`、`tests/unit/test_codex_memory_adapter.py`、`tests/unit/test_closeout_context.py`、`tests/unit/test_index.py`、`tests/integration/test_git_sync.py`、`tests/integration/test_multi_host_lifecycle.py`、`tests/integration/test_unattended_setup.py`、`tests/support/sitecustomize.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。
+
+同一取得元がWindows短縮パスと通常パスで別の保存経路になる不具合を修正する。元の字句パスのno-follow・containment検証を先に維持し、安全に検証した取得元identityだけを通常ingestと統一する。読取り前後のファイル同一性、本文hash、上限、deadline、既存plan/binding照合は緩めない。実aliasで両順序・中断再開の二重保存防止を回帰検証する。共通safe_fsの契約変更、新しい索引、既存履歴の書換えは行わない。
+
+パス正規化時も元の字句パスを保持し、no-follow検証前後のfilesystem identityと正規化先の同一性を照合する。検証と正規化の間でjunction等へ差し替えられた場合は取得を拒否する。`tests/unit/test_capture_recovery.py`で実際の参照先差し替えを再現し、範囲外本文の保存・queue作成・cursorの成功更新がないことを検証する。
+
+互換境界: `source-records` / `source-bindings`は今回の未マージ試験版で初めて導入され、前回公開コミットには存在しない。従来のナレッジ・イベントの互換性は維持する。一方、修正前の未マージ試験版が既に作った短縮パス由来メタデータの自動移行は今回追加せず、別Issueとして追跡する。既存runtimeや保留候補を削除して回避してはならない。
+
+試験fixtureのmanifest、故障注入条件、相対パス計算、private recovery引数も正規化済みパスで統一する。故障注入が実際に発火したことを確認する。PowerShell 5.1で失われるテストshim内のPython引用符だけを修正し、通常の引数転送で検証する。ExecutionPolicy変更・回避、実インストール設定やOS鍵ストアへの変更は行わない。
+
+**追加Files:** `tests/unit/test_capture.py`、`tests/unit/test_pending_capture.py`、`tests/unit/test_capture_recovery.py`。slot・scope分離・破損replay・削除frontierという機能試験の、成功が前提となる初回fixture作成だけに明示20秒の有限予算を渡し、結果の理由コードを含めて検証する。Windows CI失敗の時間切れ原因は未確定であり、この変更を性能修正とは呼ばない。製品既定値、共通test helper、後段の不正replay・件数・receipt・明示deadline検証は変更せず、失敗のretry/skip/黙殺は追加しない。

@@ -66,7 +66,7 @@ class MultiHostLifecycleTests(NotificationIsolationMixin, unittest.TestCase):
         from ei.operation_runtime import OperationBudget
         from ei.capture_ledger import list_receipts
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve(strict=True)
             self.notification_isolation.allow_notification_helper()
             installed = setup(self._selection(root, ("codex-cli",)))
             self.assertTrue(installed.ok, installed.to_dict())
@@ -90,6 +90,8 @@ class MultiHostLifecycleTests(NotificationIsolationMixin, unittest.TestCase):
                 if isinstance(value, str):
                     document["hosts"]["codex-cli"][key] = value.replace(str(old_home), str(new_home))
             installed.manifest_path.write_text(json.dumps(document), encoding="utf-8")
+            written_manifest = json.loads(installed.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(written_manifest["hosts"]["codex-cli"]["home"], str(new_home))
             changed = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
             handle_normalized_hook(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", "session_id": "session", "turn_id": "one"}, changed), changed, budget=OperationBudget(5000))
             self.assertEqual(len([item for item in list_receipts(changed) if item.state == "WAITING"]), 3)

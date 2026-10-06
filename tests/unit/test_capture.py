@@ -81,6 +81,7 @@ class CaptureTests(unittest.TestCase):
     def test_skill_terminal_expired_and_prepared_reservations_keep_session_slots(self):
         from datetime import datetime, timedelta, timezone
         from ei.key_provider import InMemoryKeyProvider
+        from ei.operation_runtime import OperationBudget
         from ei.pending_capture import reconcile_pending
         from ei.queue import QueueState, list_queue_items, transition_queue_item
         from ei.spool import SpoolError, delete_spool
@@ -93,7 +94,8 @@ class CaptureTests(unittest.TestCase):
                         with patch("ei.pending_capture.write_spool", side_effect=SpoolError("failed")):
                             self.assertFalse(record_agent_observation(*self._skill(settings, n), settings).created)
                     else:
-                        self.assertTrue(record_agent_observation(*self._skill(settings, n), settings).created)
+                        result = record_agent_observation(*self._skill(settings, n), settings, budget=OperationBudget(20000))
+                        self.assertTrue(result.created, repr(result))
                 if mode == "terminal":
                     for n, item in enumerate(list_queue_items(settings)):
                         if n % 2:
@@ -130,6 +132,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_duplicate_legacy_event_key_uses_one_session_slot(self):
         from ei.key_provider import InMemoryKeyProvider
+        from ei.operation_runtime import OperationBudget
         from tests.unattended_helpers import make_settings
 
         with tempfile.TemporaryDirectory() as tmp, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"s" * 32)):
@@ -137,8 +140,9 @@ class CaptureTests(unittest.TestCase):
             item, context = self._skill(settings, 1)
             for _ in range(3):
                 self._append_legacy_direct_event(settings, item, context)
-            self.assertTrue(record_agent_observation(*self._skill(settings, 2), settings).created)
-            self.assertTrue(record_agent_observation(*self._skill(settings, 3), settings).created)
+            for number in (2, 3):
+                result = record_agent_observation(*self._skill(settings, number), settings, budget=OperationBudget(20000))
+                self.assertTrue(result.created, repr(result))
             self.assertEqual(record_agent_observation(*self._skill(settings, 4), settings).reason_code, "SESSION_CAPTURE_LIMIT")
 
     def test_same_skill_key_reuses_original_target_without_new_body_or_coverage(self):
@@ -342,6 +346,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_same_claim_in_different_scopes_creates_distinct_observations_and_receipts(self):
         from tests.unattended_helpers import make_settings
+        from ei.operation_runtime import OperationBudget
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(Path(tmp))
             context_a = CaptureContext("s1", "t1", 1, "codex-cli", "codex-compatible", replace(identity("a"), session_hash=fingerprint("s1")))
@@ -354,8 +359,10 @@ class CaptureTests(unittest.TestCase):
             from ei.spool import read_spool
             import json
             with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"t" * 32)):
-                result_a = record_agent_observation(first, context_a, settings)
-                result_b = record_agent_observation(second, context_b, settings)
+                result_a = record_agent_observation(first, context_a, settings, budget=OperationBudget(20000))
+                self.assertTrue(result_a.created, repr(result_a))
+                result_b = record_agent_observation(second, context_b, settings, budget=OperationBudget(20000))
+                self.assertTrue(result_b.created, repr(result_b))
                 items = list_queue_items(settings)
                 self.assertEqual(len(items), 2)
                 self.assertEqual({item.capture_id for item in items}, {capture_key(context_a.capture_identity), capture_key(context_b.capture_identity)})
