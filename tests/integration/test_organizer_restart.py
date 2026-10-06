@@ -80,8 +80,8 @@ class OrganizerRestartTests(unittest.TestCase):
             path = settings.paths.runtime_dir / ("organizer-" + stable_hash("ollama") + ".json")
             fingerprint = "sha256:" + stable_hash({"organizer": router.organizer.to_dict(), "config": router.config})
             with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider()):
-                first = drain_queue(settings, provider=adapter, now=now)
-                self.assertEqual(first.deferred, 1)
+                first = drain_queue(settings, provider=adapter, now=now, time_budget_ms=30000)
+                self.assertEqual(first.deferred, 1, f"first={first!r}; provider_calls={provider.calls}")
                 held = OrganizerRecovery(path, "ollama").snapshot()
                 self.assertEqual(held["reason_code"], "AUTH_FAILED")
                 source = fixtures.source_hash("backlog-after-resume")

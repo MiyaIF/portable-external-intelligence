@@ -1119,6 +1119,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.splitlines(), ["EI_TEST_GUARD=True", "EI_TEST_ISOLATED=1"])
 
+    @unittest.skipUnless(sys.platform == "win32", "PowerShell wrapper is Windows-specific")
     def test_powershell_wrapper_forwards_operation_flags_and_exit_status(self) -> None:
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if not powershell:

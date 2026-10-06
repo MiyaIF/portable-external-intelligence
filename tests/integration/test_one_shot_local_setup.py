@@ -150,7 +150,7 @@ class OneShotLocalSetupTests(NotificationIsolationMixin, unittest.TestCase):
                 settings,
                 source_paths=(),
                 max_queue_items=10,
-                time_budget_ms=5000,
+                time_budget_ms=30000,
                 sync_policy="disabled",
             )
 

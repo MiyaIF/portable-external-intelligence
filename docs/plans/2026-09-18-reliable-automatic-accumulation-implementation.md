@@ -1363,3 +1363,15 @@ CI用の間接依存`urllib3`だけを2.7.0から修正版2.8.0へ更新し、�
 試験fixtureのmanifest、故障注入条件、相対パス計算、private recovery引数も正規化済みパスで統一する。故障注入が実際に発火したことを確認する。PowerShell 5.1で失われるテストshim内のPython引用符だけを修正し、通常の引数転送で検証する。ExecutionPolicy変更・回避、実インストール設定やOS鍵ストアへの変更は行わない。
 
 **追加Files:** `tests/unit/test_capture.py`、`tests/unit/test_pending_capture.py`、`tests/unit/test_capture_recovery.py`。slot・scope分離・破損replay・削除frontierという機能試験の、成功が前提となる初回fixture作成だけに明示20秒の有限予算を渡し、結果の理由コードを含めて検証する。Windows CI失敗の時間切れ原因は未確定であり、この変更を性能修正とは呼ばない。製品既定値、共通test helper、後段の不正replay・件数・receipt・明示deadline検証は変更せず、失敗のretry/skip/黙殺は追加しない。
+
+#### Windows専用wrapper試験の適用OS
+
+**Files:** `tests/integration/test_unattended_setup.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。
+
+Windows batchのfake Pythonと`git.exe`を前提とするPowerShell wrapperの引数・終了値試験は、既存の同種試験と同じWindows限定にする。PowerShellの有無だけでLinux/macOSへWindows fixtureを適用しない。一般のPOSIXセットアップ試験や製品実装・安全検査は変更せず、Windowsでは元の引数転送と終了値の検証を引き続き実行する。
+
+#### 公開Windows CI: 機能fixtureのbudgetとfault injection
+
+**Files:** `tests/unit/test_capture_recovery.py`、`tests/unit/test_gate.py`、`tests/integration/test_one_shot_local_setup.py`、`tests/integration/test_organizer_restart.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。検証報告: `.superpowers/sdd/2026-09-18-reliable-automatic-accumulation-implementation/ci-windows-functional-budget-report.md`。
+
+Windows CIの失敗を機能回帰と時間切れ・故障注入不成立に分けて検証する。frontier permission-error試験は、実8.3 TEMP（repo外）のcanonical targetを比較し、faultが実際に発火したことを確認する。one-shotの機能試験はrun_maintenanceの既定30秒、gate YESは明示30秒の共有OperationBudget、organizerの初回/再開は同じ30秒の試験budgetを用い、結果とprovider呼出数を失敗時に表示する。元のstatus・receipt・retry・件数assertionは維持する。これらは機能試験の時間依存を避ける限定fixture変更であり、製品budget・timeout挙動やstandalone 5秒経路を修正したとの主張はしない。organizer CI失敗の期限原因は証拠不足で未確定のまま記録する。

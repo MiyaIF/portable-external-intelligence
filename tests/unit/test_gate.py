@@ -81,7 +81,8 @@ class GateTests(unittest.TestCase):
             item = enqueue_receipt(event, ref, settings, now=NOW)
             provider = ProviderResult("local", "success", output={"decision": "YES", "reason_code": "evidence_verified", "candidate_title": "再利用ルール", "candidate_claim": "検証済みの再利用可能な判断ルールを次回も適用する", "evidence_refs": ["sha256:" + "1" * 64], "benefit": "reduced_rework", "classification": "private-reusable", "confidence": 0.9, "applicability_scope": "universal", "applicable_host_ids": [], "applicable_host_families": []})
             decision = decide_inheritance({"title": "再利用ルール", "claim": "検証済みの再利用可能な判断ルールを次回も適用する", "classification": "private-reusable", "source_kind": "agent_direct", "source_ref": "safe", "source_host_id": "codex-cli", "source_host_family": "codex-compatible"}, provider)
-            result = apply_gate_decision(decision, item, settings)
+            from ei.operation_runtime import OperationBudget
+            result = apply_gate_decision(decision, item, settings, budget=OperationBudget(30000))
             self.assertEqual(result.state, QueueState.YES_CURATING)
             self.assertIsNotNone(result.queue_item.payload_ref)
             self.assertIn("yes_count", (Path(settings.paths.runtime_dir) / "gate-aggregate.json").read_text(encoding="utf-8"))

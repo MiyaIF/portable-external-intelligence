@@ -346,17 +346,21 @@ class CaptureRecoveryTests(unittest.TestCase):
 
     def test_frontier_stat_permission_error_does_not_discard_the_entry(self):
         self.write_memory("memory.md")
-        blocked = self.write_memory("memory_summary.md", ("Keep a temporarily unreadable candidate pending",))
+        blocked = self.write_memory("memory_summary.md", ("Keep a temporarily unreadable candidate pending",)).resolve(strict=True)
         self.recover(max_records=1)
         cursor = next((self.settings.paths.local_state_dir / "capture-recovery").glob("*.json"))
         before = cursor.read_bytes()
         original_stat = Path.stat
+        denied = False
         def deny_selected(path, *args, **kwargs):
+            nonlocal denied
             if path == blocked:
+                denied = True
                 raise PermissionError("temporary denial")
             return original_stat(path, *args, **kwargs)
         with patch.object(Path, "stat", deny_selected):
             page = self.recover(max_records=1)
+        self.assertTrue(denied, "frontier stat permission fault was not injected")
         self.assertEqual((page.secured, page.cursor_committed), (0, False))
         self.assertEqual(cursor.read_bytes(), before)
         self.assertEqual(self.recover(max_records=1).secured, 1)
