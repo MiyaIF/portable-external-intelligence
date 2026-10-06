@@ -30,6 +30,9 @@ scheduler=0
 no_scheduler=0
 install_prerequisites=0
 check_only=0
+verify_operation=0
+allow_model_test=0
+allow_notification_test=0
 non_interactive=0
 accept_plan=0
 skip_venv=0
@@ -66,6 +69,9 @@ while [ "$#" -gt 0 ]; do
     --no-scheduler) no_scheduler=1; shift ;;
     --install-prerequisites) install_prerequisites=1; shift ;;
     --check-only) check_only=1; shift ;;
+    --verify-operation) verify_operation=1; shift ;;
+    --allow-model-test) allow_model_test=1; shift ;;
+    --allow-notification-test) allow_notification_test=1; shift ;;
     --non-interactive) non_interactive=1; shift ;;
     --accept-plan) accept_plan=1; shift ;;
     --skip-venv) skip_venv=1; shift ;;
@@ -124,6 +130,9 @@ fi
 [ "$scheduler" -eq 1 ] && set -- "$@" --scheduler
 [ "$no_scheduler" -eq 1 ] && set -- "$@" --no-scheduler
 [ "$check_only" -eq 1 ] && set -- "$@" --check-only
+[ "$verify_operation" -eq 1 ] && set -- "$@" --verify-operation
+[ "$allow_model_test" -eq 1 ] && set -- "$@" --allow-model-test
+[ "$allow_notification_test" -eq 1 ] && set -- "$@" --allow-notification-test
 [ "$non_interactive" -eq 1 ] && set -- "$@" --non-interactive
 [ "$accept_plan" -eq 1 ] && set -- "$@" --accept-plan
 [ "$skip_venv" -eq 1 ] && set -- "$@" --skip-venv

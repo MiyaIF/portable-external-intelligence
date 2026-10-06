@@ -11,7 +11,7 @@ from pathlib import Path
 from threading import get_ident
 from typing import Any, Mapping
 
-from .base import decimal_cost, require_aware
+from .base import InferenceBudget, ProviderResult, decimal_cost, require_aware
 
 
 DEFAULT_BACKOFF_SECONDS = (300, 900, 3600, 21600)
@@ -207,7 +207,9 @@ class BudgetLedger:
         candidate_id: str | None = None,
         purpose: str = "inheritance-gate",
         disabled_providers: set[str] | frozenset[str] | None = None,
+        operation_budget=None,
     ) -> None:
+        self.operation_budget = operation_budget
         settings = path_or_settings if hasattr(path_or_settings, "paths") else None
         if settings is not None:
             path = settings.paths.runtime_dir / "inference-budget.json"
@@ -239,59 +241,86 @@ class BudgetLedger:
             raise ValueError("BUDGET_ID_INVALID")
         return value
 
+    def _check_operation_budget(self) -> None:
+        if self.operation_budget is not None:
+            self.operation_budget.check()
+
     def _acquire(self) -> int:
+        self._check_operation_budget()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
         while True:
+            self._check_operation_budget()
             try:
-                descriptor = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-                os.write(descriptor, f"pid={os.getpid()}".encode("ascii"))
-                return descriptor
-            except (FileExistsError, PermissionError):
-                if not self.lock_path.exists():
-                    time.sleep(0.001)
-                    continue
+                descriptor = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
                 try:
-                    age = time.time() - self.lock_path.stat().st_mtime
-                    if age > 120:
-                        self.lock_path.unlink()
-                        continue
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 except OSError:
-                    age = 0
+                    os.close(descriptor)
+                    raise
+                return descriptor
+            except OSError:
                 if time.monotonic() - started >= 5:
                     raise BudgetLockError("BUDGET_LOCK_TIMEOUT")
-                time.sleep(0.01)
+                delay = min(0.01, self.operation_budget.remaining_ms() / 1000) if self.operation_budget is not None else 0.01
+                time.sleep(delay)
 
     def _release(self, descriptor: int) -> None:
         os.close(descriptor)
-        try:
-            self.lock_path.unlink()
-        except FileNotFoundError:
-            return
 
     def _read(self) -> dict[str, Any]:
+        self._check_operation_budget()
         if not self.path.exists():
+            if self.path.with_name(self.path.name + ".corrupt").exists():
+                raise ValueError("BUDGET_LEDGER_UNREADABLE")
             return {"schema_version": 1, "entries": {}, "runs": {}, "candidates": {}}
         try:
-            value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            quarantine = self.path.with_name(self.path.name + ".corrupt")
-            try:
-                os.replace(self.path, quarantine)
-            except OSError:
-                return {"schema_version": 1, "entries": {}, "runs": {}, "candidates": {}}
-            return {"schema_version": 1, "entries": {}, "runs": {}, "candidates": {}}
+            if self.operation_budget is None:
+                raw = self.path.read_bytes()
+            else:
+                with self.path.open("rb") as stream:
+                    raw = stream.read(8 * 1024 * 1024 + 1)
+                if len(raw) > 8 * 1024 * 1024:
+                    raise ValueError("BUDGET_LEDGER_TOO_LARGE")
+            self._check_operation_budget()
+            value = json.loads(raw.decode("utf-8"))
+        except TimeoutError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("BUDGET_LEDGER_UNREADABLE") from exc
         if not isinstance(value, dict) or value.get("schema_version") != 1:
             raise ValueError("BUDGET_LEDGER_SCHEMA_INVALID")
         for key in ("entries", "runs", "candidates"):
             if not isinstance(value.get(key), dict):
                 raise ValueError("BUDGET_LEDGER_SCHEMA_INVALID")
+            for counter in value[key].values():
+                self._check_operation_budget()
+                if not isinstance(counter, dict) or not isinstance(counter.get("day"), str):
+                    raise ValueError("BUDGET_LEDGER_SCHEMA_INVALID")
+                for field in ("input_tokens", "output_tokens"):
+                    if type(counter.get(field)) is not int or counter[field] < 0:
+                        raise ValueError("BUDGET_LEDGER_SCHEMA_INVALID")
+                decimal_cost(counter.get("cost"))
+        if not isinstance(value.get("reservations", {}), dict):
+            raise ValueError("BUDGET_LEDGER_SCHEMA_INVALID")
         return value
 
     def _write(self, value: Mapping[str, Any]) -> None:
+        self._check_operation_budget()
+        encoded = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        self._check_operation_budget()
         temporary = self.path.with_name(self.path.name + f".{os.getpid()}.{get_ident()}.tmp")
-        temporary.write_text(json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8", newline="\n")
         try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fsync(stream.fileno())
+            self._check_operation_budget()
             os.replace(temporary, self.path)
         finally:
             if temporary.exists():
@@ -351,6 +380,7 @@ class BudgetLedger:
         candidate_id: str | None = None,
         run_id: str | None = None,
         deadline_ms: int | None = None,
+        _attempt_id: str | None = None,
     ) -> BudgetResult:
         if not isinstance(provider_id, str) or not provider_id or len(provider_id) > 100:
             raise ValueError("PROVIDER_ID_INVALID")
@@ -374,19 +404,42 @@ class BudgetLedger:
         descriptor = self._acquire()
         try:
             data = self._read()
+            reservations = data.setdefault("reservations", {})
+            if _attempt_id in reservations:
+                empty = _new_counter()
+                return self._result(False, "ATTEMPT_ALREADY_RESERVED", provider_id, selected_purpose, input_tokens, output_tokens, amount, empty, empty, empty)
             entry_key = f"{provider_id}|{day_key}|{selected_purpose}"
             entry = self._counter(data["entries"].get(entry_key), day_key)
             run_key = f"{selected_run}|{provider_id}|{selected_purpose}"
-            run = self._counter(data["runs"].get(run_key), day_key)
+            run = dict(data["runs"].get(run_key, _new_counter()))
             candidate_key = hashlib.sha256((selected_candidate or "<none>").encode("utf-8", "replace")).hexdigest()
             candidate = self._counter(data["candidates"].get(candidate_key), day_key)
-            next_run = dict(run)
-            next_day = dict(entry)
+            # Existing purpose-keyed counters remain readable, but limits are
+            # aggregated across purposes/providers before admitting a call.
+            total_day = _new_counter()
+            total_run = _new_counter()
+            for value in data["entries"].values():
+                self._check_operation_budget()
+                if value.get("day") == day_key:
+                    _add(total_day, value["input_tokens"], value["output_tokens"], Decimal(value["cost"]), day_key)
+            for key, value in data["runs"].items():
+                self._check_operation_budget()
+                if key.startswith(selected_run + "|"):
+                    _add(total_run, value["input_tokens"], value["output_tokens"], Decimal(value["cost"]), day_key)
+            next_run = dict(total_run)
+            next_day = dict(total_day)
             next_candidate = dict(candidate)
             _add(next_run, input_tokens, output_tokens, amount, day_key)
             _add(next_day, input_tokens, output_tokens, amount, day_key)
             _add(next_candidate, input_tokens, output_tokens, amount, day_key)
             policy = self.policy
+            attempts = 0
+            if _attempt_id is not None:
+                for row in reservations.values():
+                    self._check_operation_budget()
+                    attempts += row["day"] == day_key and row["candidate_key"] == candidate_key
+            if _attempt_id is not None and attempts >= policy.retry_limit:
+                return self._result(False, "ATTEMPT_CAP_EXCEEDED", provider_id, selected_purpose, input_tokens, output_tokens, amount, run, entry, candidate)
             if next_run["input_tokens"] > policy.per_run_input_tokens or next_run["output_tokens"] > policy.per_run_output_tokens:
                 return self._result(False, "TOKEN_CAP_EXCEEDED", provider_id, selected_purpose, input_tokens, output_tokens, amount, run, entry, candidate, {"scope": "per_run"})
             if next_day["input_tokens"] > policy.per_day_input_tokens or next_day["output_tokens"] > policy.per_day_output_tokens:
@@ -401,9 +454,15 @@ class BudgetLedger:
                 return self._result(False, "COST_CAP_EXCEEDED", provider_id, selected_purpose, input_tokens, output_tokens, amount, run, entry, candidate, {"scope": "per_candidate"})
             if provider_id == "cloud-api" and (not policy.cloud_api_enabled or amount > policy.cloud_spend_cap or Decimal(next_day["cost"]) > policy.cloud_spend_cap):
                 return self._result(False, "PROVIDER_DISABLED", provider_id, selected_purpose, input_tokens, output_tokens, amount, run, entry, candidate, {"scope": "cloud_api"})
-            data["entries"][entry_key] = next_day
-            data["runs"][run_key] = next_run
+            _add(entry, input_tokens, output_tokens, amount, day_key)
+            _add(run, input_tokens, output_tokens, amount, day_key)
+            data["entries"][entry_key] = entry
+            data["runs"][run_key] = run
             data["candidates"][candidate_key] = next_candidate
+            if _attempt_id is not None:
+                reservations[_attempt_id] = {"provider_id": provider_id, "day": day_key,
+                    "entry_key": entry_key, "run_key": run_key, "candidate_key": candidate_key,
+                    "input_tokens": input_tokens, "output_tokens": output_tokens, "cost": str(amount), "settled": False}
             self._write(data)
             remaining = {
                 "per_run_input_tokens": max(0, policy.per_run_input_tokens - int(next_run["input_tokens"])),
@@ -411,6 +470,37 @@ class BudgetLedger:
                 "per_candidate_input_tokens": max(0, policy.per_candidate_input_tokens - int(next_candidate["input_tokens"])),
             }
             return self._result(True, "ALLOW", provider_id, selected_purpose, input_tokens, output_tokens, amount, next_run, next_day, next_candidate, remaining)
+        finally:
+            self._release(descriptor)
+
+    def reserve(self, attempt_id: str, provider_id: str, budget: InferenceBudget, now: datetime) -> BudgetResult:
+        self._safe_id(attempt_id)
+        return self.consume(provider_id, budget.max_input_tokens, budget.max_output_tokens, budget.max_cost, now,
+            purpose=budget.purpose, candidate_id=budget.candidate_id, run_id=budget.run_id or self.run_id,
+            deadline_ms=budget.deadline_ms, _attempt_id=attempt_id)
+
+    def settle(self, attempt_id: str, result: ProviderResult, now: datetime) -> None:
+        require_aware(now)
+        descriptor = self._acquire()
+        try:
+            data = self._read()
+            row = data.get("reservations", {}).get(attempt_id)
+            if row is None or row["provider_id"] != result.provider_id:
+                raise ValueError("BUDGET_RESERVATION_MISMATCH")
+            if row["settled"]:
+                return
+            # A zero/default response is not evidence that the call was free.
+            known = result.ok and result.metadata.get("usage_known") is True
+            actual_input = result.input_tokens if known else max(result.input_tokens, row["input_tokens"])
+            actual_output = result.output_tokens if known else max(result.output_tokens, row["output_tokens"])
+            actual_cost = result.cost if known and result.metadata.get("cost_known") is True else max(result.cost, Decimal(row["cost"]))
+            for section, key in (("entries", "entry_key"), ("runs", "run_key"), ("candidates", "candidate_key")):
+                counter = data[section][row[key]]
+                if section != "runs" and counter["day"] != row["day"]:
+                    continue
+                _add(counter, actual_input - row["input_tokens"], actual_output - row["output_tokens"], actual_cost - Decimal(row["cost"]), row["day"])
+            row["settled"] = True
+            self._write(data)
         finally:
             self._release(descriptor)
 

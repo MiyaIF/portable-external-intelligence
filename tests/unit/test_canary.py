@@ -12,6 +12,96 @@ from tests.helpers import make_hook_settings
 
 
 class CanaryTests(unittest.TestCase):
+    def test_missing_template_keeps_legacy_empty_hash_and_receipt_without_certification(self):
+        from ei.canary import _template_hash, build_canary_receipt_from_event, _read_receipts
+        from ei.hook_entry import normalize_hook_event
+        from ei.operation_runtime import OperationBudget
+        self.assertEqual(_template_hash(self.settings, "codex-cli"), "")
+        self.assertEqual(_template_hash(self.settings, "codex-cli", budget=OperationBudget(5000)), "")
+        event = normalize_hook_event("codex-cli", {"hook_event_name": "SessionStart", "session_id": "one"}, self.settings)
+        budget = OperationBudget(5000)
+        receipt = build_canary_receipt_from_event(event, self.settings, budget=budget)
+        record_canary(receipt, self.settings, budget=budget)
+        self.assertEqual(len(_read_receipts(self.settings)), 1)
+        self.assertNotEqual(read_hook_status("codex-cli", "codex-cli", self.settings, persist=False).hook_status, "HOOK_VERIFIED")
+
+    def test_template_budget_keeps_hash_and_propagates_interior_deadline(self):
+        from ei.canary import _template_hash, build_canary_receipt_from_event
+        from ei.hook_entry import normalize_hook_event
+        from ei.operation_runtime import OperationBudget
+        from unittest.mock import patch
+        self._install_template()
+        legacy = _template_hash(self.settings, "codex-cli")
+        self.assertEqual(_template_hash(self.settings, "codex-cli", budget=OperationBudget(5000)), legacy)
+        event = normalize_hook_event("codex-cli", {"hook_event_name": "SessionStart", "session_id": "one"}, self.settings)
+        with self.assertRaises(TimeoutError):
+            build_canary_receipt_from_event(event, self.settings, budget=OperationBudget(0))
+        with patch("ei.safe_fs._digest_chunks", side_effect=TimeoutError("OPERATION_BUDGET_EXHAUSTED")):
+            with self.assertRaises(TimeoutError):
+                build_canary_receipt_from_event(event, self.settings, budget=OperationBudget(5000))
+        self.assertFalse(self.settings.paths.runtime_dir.exists())
+
+    def test_bounded_template_and_receipt_paths_reject_root_aliases(self):
+        import os
+        import subprocess
+        from types import SimpleNamespace
+        from ei.canary import _template_hash
+        from ei.operation_runtime import OperationBudget
+        outside, link = self.root / "outside", self.root / "alias"
+        outside.mkdir()
+        target = outside / "hooks" / "codex" / "hooks.template.json"
+        target.parent.mkdir(parents=True)
+        target.write_text("{}", encoding="utf-8")
+        if os.name == "nt":
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.assertEqual(result.returncode, 0)
+        else:
+            link.symlink_to(outside, target_is_directory=True)
+        try:
+            settings = SimpleNamespace(paths=SimpleNamespace(engine_root=link))
+            with self.assertRaisesRegex(ValueError, "UNSAFE_REPARSE_POINT"):
+                _template_hash(settings, "codex-cli", budget=OperationBudget(5000))
+            settings = SimpleNamespace(paths=SimpleNamespace(engine_root=self.root / "engine", runtime_dir=link))
+            receipt = CertificationReceipt(host_id="codex-cli", host_instance_id="one", mode="fixture")
+            with self.assertRaisesRegex(ValueError, "UNSAFE_REPARSE_POINT"):
+                record_canary(receipt, settings, budget=OperationBudget(5000))
+            self.assertFalse((outside / "canary-receipts.jsonl").exists())
+        finally:
+            link.rmdir() if os.name == "nt" else link.unlink()
+
+    def test_read_only_status_creates_nothing_and_default_still_persists(self):
+        self._install_template()
+        read_hook_status("codex-cli", "one", self.settings, persist=False)
+        self.assertFalse(self.settings.paths.runtime_dir.exists())
+        read_hook_status("codex-cli", "one", self.settings)
+        self.assertTrue((self.settings.paths.runtime_dir / "hook-status.json").is_file())
+
+    def test_canary_deadline_does_not_append_after_partial_duplicate_scan(self):
+        from ei.operation_runtime import OperationBudget
+        from tests.integration.test_unattended_operation import RemainingBudget
+        from unittest.mock import patch
+        first = CertificationReceipt(host_id="codex-cli", host_instance_id="one", mode="fixture")
+        second = CertificationReceipt(host_id="codex-cli", host_instance_id="two", mode="fixture")
+        with self.assertRaises(TimeoutError):
+            record_canary(first, self.settings, budget=OperationBudget(0))
+        self.assertFalse(self.settings.paths.runtime_dir.exists())
+        record_canary(first, self.settings)
+        path = self.settings.paths.runtime_dir / "canary-receipts.jsonl"
+        before = path.read_bytes()
+        budget = RemainingBudget()
+        loads = json.loads
+        def expire(raw):
+            value = loads(raw)
+            budget.remaining = 0
+            return value
+        with patch("ei.canary.json.loads", side_effect=expire), self.assertRaises(TimeoutError):
+            record_canary(second, self.settings, budget=budget)
+        self.assertEqual(path.read_bytes(), before)
+        record_canary(first, self.settings, budget=OperationBudget(5000))
+        self.assertEqual(path.read_bytes(), before)
+        record_canary(second, self.settings, budget=OperationBudget(5000))
+        self.assertEqual(len(path.read_text().splitlines()), 2)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

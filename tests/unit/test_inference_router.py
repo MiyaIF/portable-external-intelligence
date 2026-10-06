@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import ei.inference.router as router_module
 from ei.inference.base import InferenceBudget, ProviderResult
+from ei.inference.budget import BudgetLedger
 from ei.inference.cli_subscription import SubscriptionCLIProvider
 from ei.inference.errors import (
     AUTH_FAILED,
@@ -260,7 +261,9 @@ class InferenceRouterTests(unittest.TestCase):
     def test_ollama_is_selected_when_local_openai_unavailable(self):
         local = FakeProvider("local-openai-compatible", "local", ProviderResult("local-openai-compatible", "failed", error_code=PROVIDER_UNAVAILABLE), available_value=True)
         ollama = FakeProvider("ollama", "local", ProviderResult("ollama", output={"decision": "YES"}))
-        router = ProviderRouter([local, ollama], organizer=OrganizerSelection("READY", "local-openai-compatible", None))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        router = ProviderRouter([local, ollama], organizer=OrganizerSelection("READY", "local-openai-compatible", None), budget_ledger=BudgetLedger(Path(tmp.name) / "ledger.json"))
         result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget(max_input_tokens=1000, max_output_tokens=1000), {"provider_order": ["local-openai-compatible", "ollama"]})
         self.assertEqual(result.provider_id, "local-openai-compatible")
         self.assertEqual(local.calls, 1)
@@ -273,10 +276,12 @@ class InferenceRouterTests(unittest.TestCase):
         other = FakeProvider(
             "subscription-cli", "subscription", ProviderResult("subscription-cli", output={"decision": "YES"})
         )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         router = ProviderRouter(
-            [selected, other], organizer=OrganizerSelection("READY", "ollama", None)
+            [selected, other], organizer=OrganizerSelection("READY", "ollama", None), budget_ledger=BudgetLedger(Path(tmp.name) / "ledger.json")
         )
-        result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget())
+        result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget(max_input_tokens=1000, max_output_tokens=1000))
         self.assertEqual(result.error_code, PROVIDER_UNAVAILABLE)
         self.assertEqual(selected.calls, 1)
         self.assertEqual(other.calls, 0)
@@ -345,6 +350,40 @@ class InferenceRouterTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].get_header("Content-type"), "application/json")
         self.assertLessEqual(calls[0][1], 30)
+
+    def test_managed_local_attempt_is_one_capped_transport_call(self):
+        calls = []
+        timeouts = []
+        reservation_remaining = []
+        clock = [0.0]
+        def opener(request, timeout):
+            calls.append(json.loads(request.data))
+            timeouts.append(timeout)
+            return FakeHTTPResponse(b"not-json")
+        provider = LocalOpenAICompatibleProvider("http://127.0.0.1:8123/v1/chat/completions", opener=opener)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = BudgetLedger(Path(tmp) / "ledger.json")
+            router = ProviderRouter([provider], organizer=OrganizerSelection("READY", provider.provider_id, None), budget_ledger=ledger)
+            reserve = ledger.reserve
+            def reserve_with_elapsed(*args, **kwargs):
+                start = clock[0]
+                result = reserve(*args, **kwargs)
+                clock[0] += 0.2
+                reservation_remaining.append(1000 - int((clock[0] - start) * 1000))
+                return result
+            for attempt in ("first", "next"):
+                with patch.object(router_module, "monotonic", side_effect=lambda: clock[0]), patch.object(ledger, "reserve", side_effect=reserve_with_elapsed):
+                    result = router.generate("gate", "gate-decision", {}, InferenceBudget(
+                        max_input_tokens=100, max_output_tokens=100, deadline_ms=1000, attempt_id=attempt))
+                self.assertEqual(result.error_code, MALFORMED_RESPONSE)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([call["max_tokens"] for call in calls], [100, 100])
+            self.assertEqual(len(timeouts), 2)
+            self.assertTrue(all(timeout > 0 and timeout <= remaining / 1000
+                for timeout, remaining in zip(timeouts, reservation_remaining)))
+            result = router.generate("gate", "gate-decision", {}, InferenceBudget(max_input_tokens=100, max_output_tokens=0))
+            self.assertEqual(result.error_code, "TOKEN_CAP_EXCEEDED")
+            self.assertEqual(len(calls), 2)
 
     def test_ollama_uses_argv_without_shell_interpolation(self):
         completed = SimpleNamespace(returncode=0, stdout='{"decision":"YES"}', stderr="")

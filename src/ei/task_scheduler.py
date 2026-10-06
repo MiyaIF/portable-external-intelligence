@@ -10,8 +10,11 @@ import shutil
 import subprocess
 import plistlib
 import shlex
+import re
+import time
+import ctypes
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -64,7 +67,10 @@ def _windows_quote(value: str) -> str:
     return quote_windows_argument(value)
 
 
-def _sha256_file(path: Path) -> str:
+def _sha256_file(path: Path, *, budget=None) -> str:
+    if budget is not None:
+        from .safe_fs import _file_digest
+        return _file_digest(path, budget=budget).removeprefix("sha256:")
     digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
@@ -170,12 +176,17 @@ def build_systemd_user_unit(action: MaintenanceAction, *, timer: bool = False) -
     if not isinstance(action, MaintenanceAction):
         raise TypeError("MAINTENANCE_ACTION_REQUIRED")
     if timer:
+        interval = _interval_minutes(action)
+        # systemd's usec_t is uint64; UINT64_MAX is its infinity sentinel.
+        if interval > ((2**64 - 2) // (120 * 1_000_000)):
+            raise ValueError("SCHEDULER_INTERVAL_OUT_OF_RANGE")
         return (
             "[Unit]\n"
             f"Description={action.task_name} timer\n\n"
             "[Timer]\n"
             "OnBootSec=2min\n"
-            f"OnUnitActiveSec={_interval_minutes(action)}min\n"
+            f"OnUnitActiveSec={interval}min\n"
+            f"OnUnitActiveSec={2 * interval}min\n"
             "Persistent=true\n"
             f"Unit={action.task_name}.service\n\n"
             "[Install]\n"
@@ -196,6 +207,82 @@ def build_systemd_user_unit(action: MaintenanceAction, *, timer: bool = False) -
 
 def build_systemd_user_timer(action: MaintenanceAction) -> str:
     return build_systemd_user_unit(action, timer=True)
+
+
+def _maintenance_action_from_record(value: object) -> MaintenanceAction | None:
+    required = {
+        "task_name", "executable", "argv", "arguments", "working_directory", "log_file",
+        "principal", "run_level", "execution_time_limit_seconds", "multiple_instance_policy",
+        "start_when_available", "wake_to_run", "triggers", "executable_sha256",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        return None
+    if any(not isinstance(value.get(key), str) for key in (
+        "task_name", "executable", "arguments", "working_directory", "log_file", "principal",
+        "run_level", "multiple_instance_policy", "executable_sha256",
+    )):
+        return None
+    if not isinstance(value.get("argv"), list) or not all(isinstance(item, str) for item in value["argv"]):
+        return None
+    if not isinstance(value.get("triggers"), list) or not all(isinstance(item, str) for item in value["triggers"]):
+        return None
+    if type(value.get("start_when_available")) is not bool or type(value.get("wake_to_run")) is not bool:
+        return None
+    if type(value.get("execution_time_limit_seconds")) is not int:
+        return None
+    return MaintenanceAction(
+        task_name=value["task_name"], executable=Path(value["executable"]), argv=tuple(value["argv"]),
+        arguments=value["arguments"], working_directory=Path(value["working_directory"]),
+        log_file=Path(value["log_file"]), principal=value["principal"], run_level=value["run_level"],
+        execution_time_limit_seconds=value["execution_time_limit_seconds"],
+        multiple_instance_policy=value["multiple_instance_policy"],
+        start_when_available=value["start_when_available"], wake_to_run=value["wake_to_run"],
+        triggers=tuple(value["triggers"]), executable_sha256=value["executable_sha256"],
+    )
+
+
+def _legacy_systemd_user_timer(action: MaintenanceAction) -> str:
+    lines = build_systemd_user_timer(action).splitlines()
+    timers = [index for index, line in enumerate(lines) if line.startswith("OnUnitActiveSec=")]
+    if len(timers) != 2:
+        raise ValueError("SCHEDULER_TIMER_RENDER_INVALID")
+    del lines[timers[1]]
+    return "\n".join(lines) + "\n"
+
+
+def _systemd_artifacts_are_owned(settings: Settings, current_action: MaintenanceAction) -> bool:
+    """Only replace unit files matching this engine's recorded generated definition."""
+    unit_dir = _systemd_user_dir()
+    service = unit_dir / f"{TASK_NAME}.service"
+    timer = unit_dir / f"{TASK_NAME}.timer"
+    present = (service.exists() or service.is_symlink(), timer.exists() or timer.is_symlink())
+    if not any(present):
+        return True
+    try:
+        state = _read_state(settings)
+    except ValueError:
+        return False
+    previous = _maintenance_action_from_record(state.get("action"))
+    if state.get("task_name") != TASK_NAME or previous is None or previous.working_directory != current_action.working_directory:
+        return False
+    service_raw, service_error = _read_scheduler_artifact(unit_dir, service)
+    timer_raw, timer_error = _read_scheduler_artifact(unit_dir, timer)
+    if service_error not in {None, "SCHEDULER_ARTIFACT_DIRECTORY_MISSING"} or timer_error not in {None, "SCHEDULER_ARTIFACT_DIRECTORY_MISSING"}:
+        return False
+    if service_raw is not None and service_raw != build_systemd_user_unit(previous).encode("utf-8"):
+        return False
+    if timer_raw is not None:
+        current_timer = build_systemd_user_timer(previous).encode("utf-8")
+        legacy_timer = _legacy_systemd_user_timer(previous).encode("utf-8")
+        if timer_raw not in {current_timer, legacy_timer}:
+            return False
+    # A service artifact must be present unless its recorded scheduler state
+    # describes a failed first registration that this explicit setup can retry.
+    if service_raw is None and state.get("registered") is True:
+        return False
+    if timer_raw is None and state.get("registered") is True:
+        return False
+    return True
 
 def scheduler_state_path(settings: Settings) -> Path:
     return settings.paths.runtime_dir / SCHEDULER_STATE_NAME
@@ -314,7 +401,9 @@ def _expected_action_argv(settings: Settings) -> tuple[str, ...]:
     return tuple(argv)
 
 
-def _state_action_checks(settings: Settings, expected: dict[str, Any]) -> tuple[dict[str, bool], list[str] | None, Path | None]:
+def _state_action_checks(settings: Settings, expected: dict[str, Any], *, budget=None) -> tuple[dict[str, bool], list[str] | None, Path | None]:
+    if budget is not None:
+        budget.check()
     raw_executable = expected.get("executable")
     raw_argv = expected.get("argv")
     try:
@@ -336,7 +425,9 @@ def _state_action_checks(settings: Settings, expected: dict[str, Any]) -> tuple[
     executable_hash_ok = False
     if executable_ok:
         try:
-            executable_hash_ok = _sha256_file(expected_executable) == _recorded_hash(expected.get("executable_sha256"))
+            executable_hash_ok = _sha256_file(expected_executable, budget=budget) == _recorded_hash(expected.get("executable_sha256"))
+        except TimeoutError:
+            raise
         except OSError:
             executable_hash_ok = False
     checks = {
@@ -349,6 +440,249 @@ def _state_action_checks(settings: Settings, expected: dict[str, Any]) -> tuple[
         "executable_content_identity": executable_ok and executable_hash_ok,
     }
     return checks, full_argv, expected_executable
+
+
+def _scheduler_query(argv, budget, *, env=None):
+    budget.check()
+    result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="strict",
+        stdin=subprocess.DEVNULL, timeout=min(2.0, budget.remaining_ms() / 1000), env=env, check=False)
+    budget.check()
+    if len(result.stdout.encode("utf-8")) > 262144 or len(result.stderr.encode("utf-8")) > 65536:
+        raise ValueError("SCHEDULER_QUERY_LIMIT")
+    return result
+
+
+def _scheduler_clocks(selected, budget):
+    """Continuous (includes sleep) and awake counters in microseconds."""
+    budget.check()
+    if selected == "linux":
+        from .index import _read_projection_bytes
+        boot = _read_projection_bytes(Path("/proc/sys/kernel/random/boot_id"), budget=budget, maximum=128).decode().strip()
+        return boot, time.clock_gettime_ns(time.CLOCK_BOOTTIME) // 1000, time.clock_gettime_ns(time.CLOCK_MONOTONIC) // 1000
+    if selected == "macos":
+        boot = _scheduler_query(["sysctl", "-n", "kern.boottime"], budget).stdout.strip()
+        class Timebase(ctypes.Structure):
+            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+        library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        base = Timebase()
+        if library.mach_timebase_info(ctypes.byref(base)) != 0 or not base.denom:
+            raise ValueError("SCHEDULER_CLOCK_UNAVAILABLE")
+        library.mach_absolute_time.restype = library.mach_continuous_time.restype = ctypes.c_uint64
+        return boot, library.mach_continuous_time() * base.numer // base.denom // 1000, library.mach_absolute_time() * base.numer // base.denom // 1000
+    if selected == "windows":
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetTickCount64.restype = ctypes.c_uint64
+        awake = ctypes.c_uint64()
+        if not kernel.QueryUnbiasedInterruptTime(ctypes.byref(awake)):
+            raise ValueError("SCHEDULER_CLOCK_UNAVAILABLE")
+        return None, kernel.GetTickCount64() * 1000, awake.value // 10
+    raise ValueError("SCHEDULER_QUERY_UNSUPPORTED")
+
+
+def _bus_properties(unit, interface, fields, budget):
+    prefix = ["busctl", "--user", "--allow-interactive-authorization=no", "--auto-start=no"]
+    located = _scheduler_query([*prefix, "call", "org.freedesktop.systemd1", "/org/freedesktop/systemd1", "org.freedesktop.systemd1.Manager", "GetUnit", "s", unit], budget)
+    tokens = shlex.split(located.stdout)
+    if located.returncode != 0 or len(tokens) != 2 or tokens[0] != "o" or not tokens[1].startswith("/org/freedesktop/systemd1/unit/"):
+        raise ValueError("SCHEDULER_QUERY_UNSUPPORTED")
+    queried = _scheduler_query([*prefix, "--json=short", "get-property", "org.freedesktop.systemd1", tokens[1], "org.freedesktop.systemd1." + interface, *fields], budget)
+    rows = [json.loads(line) for line in queried.stdout.splitlines() if line.strip()]
+    if queried.returncode != 0 or len(rows) != len(fields) or any(not isinstance(row, dict) or set(row) != {"type", "data"} for row in rows):
+        raise ValueError("SCHEDULER_QUERY_UNSUPPORTED")
+    signatures = {"TimersMonotonic": "a(stt)", "TimersCalendar": "a(sst)", "AccuracyUSec": "t", "RandomizedDelayUSec": "t",
+        "WakeSystem": "b", "LastTriggerUSecMonotonic": "t", "InvocationID": "ay", "ActiveState": "s", "UnitFileState": "s",
+        "NeedDaemonReload": "b", "Conditions": "a(sbbsi)", "Asserts": "a(sbbsi)", "FragmentPath": "s", "DropInPaths": "as",
+        "InactiveExitTimestampMonotonic": "t", "Job": "(uo)", "ExecStart": "a(sasbttttuii)", "ExecCondition": "a(sasbttttuii)",
+        "WorkingDirectory": "s", "Result": "s"}
+    for name, row in zip(fields, rows, strict=True):
+        budget.check()
+        signature, value = signatures[name], row["data"]
+        if row["type"] != signature or (signature == "t" and (type(value) is not int or not 0 <= value < 2**64)) or (signature == "b" and type(value) is not bool) or (signature == "s" and not isinstance(value, str)) or (signature[0] in {"a", "("} and not isinstance(value, list)):
+            raise ValueError("SCHEDULER_QUERY_INVALID")
+    return dict(zip(fields, (row["data"] for row in rows), strict=True))
+
+
+def _native_scheduler_sample(settings, *, now, budget):
+    from .operation_runtime import _read_json
+    from .index import _read_projection_bytes
+    state = _read_json(scheduler_state_path(settings), budget=budget) or {}
+    expected = state.get("action")
+    if state.get("registered") is not True or not isinstance(expected, dict):
+        raise ValueError("SCHEDULER_NOT_REGISTERED")
+    checks, argv, _ = _state_action_checks(settings, expected, budget=budget)
+    selected = _normalise_platform(None)
+    selected = "macos" if selected in {"darwin", "mac", "macos"} else selected
+    boot, continuous, awake = _scheduler_clocks(selected, budget)
+    native = {"platform": selected, "identity_verified": all(checks.values()), "registered": False,
+        "enabled": False, "running": False, "conditions_verified": False, "generation": None,
+        "boot_id": boot, "monotonic_us": continuous, "awake_us": awake, "observed_at": now.isoformat(), "next_run_at": None}
+    if selected == "linux":
+        unit_dir = _systemd_user_dir()
+        service_raw = _read_projection_bytes(unit_dir / f"{TASK_NAME}.service", budget=budget, maximum=65536)
+        timer_raw = _read_projection_bytes(unit_dir / f"{TASK_NAME}.timer", budget=budget, maximum=65536)
+        timer = _bus_properties(f"{TASK_NAME}.timer", "Timer", ["TimersMonotonic", "TimersCalendar", "AccuracyUSec", "RandomizedDelayUSec", "WakeSystem", "LastTriggerUSecMonotonic"], budget)
+        tu = _bus_properties(f"{TASK_NAME}.timer", "Unit", ["InvocationID", "ActiveState", "UnitFileState", "NeedDaemonReload", "Conditions", "Asserts", "FragmentPath", "DropInPaths"], budget)
+        su = _bus_properties(f"{TASK_NAME}.service", "Unit", ["InactiveExitTimestampMonotonic", "ActiveState", "NeedDaemonReload", "Conditions", "Asserts", "FragmentPath", "DropInPaths", "Job"], budget)
+        service = _bus_properties(f"{TASK_NAME}.service", "Service", ["ExecStart", "ExecCondition", "WorkingDirectory", "Result"], budget)
+        executable = service["ExecStart"]
+        definition = hashlib.sha256(service_raw + b"\0" + timer_raw).hexdigest()
+        identity = (native["identity_verified"] and isinstance(executable, list) and len(executable) == 1 and
+            isinstance(executable[0], list) and len(executable[0]) >= 2 and executable[0][1] == argv and
+            service["WorkingDirectory"] == str(settings.paths.engine_root) and
+            _unit_argv(_unit_value(service_raw, "Service", "ExecStart")) == argv and
+            _unit_value(timer_raw, "Timer", "Unit") == f"{TASK_NAME}.service" and
+            _unit_values(timer_raw, "Timer", "OnUnitActiveSec") in ([f"{settings.scheduler_interval_minutes}min"], [f"{settings.scheduler_interval_minutes}min", f"{2 * settings.scheduler_interval_minutes}min"]) and
+            tu["FragmentPath"] == str(unit_dir / f"{TASK_NAME}.timer") and su["FragmentPath"] == str(unit_dir / f"{TASK_NAME}.service"))
+        invocation = tu["InvocationID"]
+        generation = bytes(invocation).hex() if isinstance(invocation, list) and len(invocation) == 16 and all(type(item) is int and 0 <= item <= 255 for item in invocation) and any(invocation) else None
+        conditions = (all(row["NeedDaemonReload"] is False and row["Conditions"] == [] and row["Asserts"] == [] and row["DropInPaths"] == [] for row in (tu, su)) and
+            timer["TimersCalendar"] == [] and timer["WakeSystem"] is False and service["ExecCondition"] == [] and service["Result"] == "success" and
+            isinstance(su["Job"], list) and len(su["Job"]) == 2 and type(su["Job"][0]) is int and su["Job"][0] == 0 and tu["ActiveState"] == "active")
+        native.update(identity_verified=bool(identity), registered=True, enabled=tu["UnitFileState"] == "enabled",
+            running=su["ActiveState"] in {"active", "activating", "deactivating", "reloading"}, conditions_verified=conditions,
+            generation=generation, definition_hash=definition, activation_us=max(su["InactiveExitTimestampMonotonic"], timer["LastTriggerUSecMonotonic"]),
+            service_activation_us=su["InactiveExitTimestampMonotonic"], last_trigger_us=timer["LastTriggerUSecMonotonic"],
+            timers=timer["TimersMonotonic"], accuracy_us=timer["AccuracyUSec"], random_delay_us=timer["RandomizedDelayUSec"], last_exit=service["Result"])
+        due = [row[2] for row in native["timers"] if isinstance(row, list) and len(row) == 3 and type(row[2]) is int and row[2] > awake]
+        if due:
+            native["next_run_at"] = (now + timedelta(microseconds=min(due) - awake)).isoformat()
+        return native
+    if selected == "macos":
+        path = _launch_agents_dir() / f"{TASK_NAME}.plist"
+        raw = _read_projection_bytes(path, budget=budget, maximum=65536)
+        plist = plistlib.loads(raw)
+        result = _scheduler_query(["launchctl", "print", f"{_launchd_domain()}/{TASK_NAME}"], budget)
+        if result.returncode != 0:
+            raise ValueError("SCHEDULER_QUERY_UNSUPPORTED")
+        def field(name):
+            match = re.search(r"^\s*" + re.escape(name) + r"\s*=\s*([^\r\n]+)$", result.stdout, re.MULTILINE)
+            return match.group(1).strip() if match else None
+        last_exit, runs = field("last exit code"), field("runs")
+        native.update(identity_verified=bool(native["identity_verified"] and plist.get("Label") == TASK_NAME and plist.get("ProgramArguments") == argv and plist.get("WorkingDirectory") == str(settings.paths.engine_root)),
+            registered=True, enabled=None, plist_disabled=plist.get("Disabled", False), running=field("state") == "running",
+            definition_hash=hashlib.sha256(raw).hexdigest(), last_exit=int(last_exit) if last_exit and re.fullmatch(r"-?\d+", last_exit) else None,
+            runs=int(runs) if runs and runs.isdigit() else None)
+        return native
+    if selected == "windows":
+        query = ("$ErrorActionPreference='Stop';$t=Get-ScheduledTask -TaskName $env:EI_TASK_NAME;"
+            "$i=Get-ScheduledTaskInfo -TaskName $env:EI_TASK_NAME;"
+            "$s=New-Object -ComObject Schedule.Service;$s.Connect();$r=$s.GetFolder('\\').GetTask($env:EI_TASK_NAME);"
+            "[pscustomobject]@{xml=(Export-ScheduledTask -TaskName $env:EI_TASK_NAME);enabled=$t.Settings.Enabled;state=[string]$t.State;"
+            "last_exit=$i.LastTaskResult;last_run=$i.LastRunTime.ToUniversalTime().ToString('o');next_run=$i.NextRunTime.ToUniversalTime().ToString('o');"
+            "native_missed_runs=$r.NumberOfMissedRuns;boot=(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')}|ConvertTo-Json -Compress")
+        environment = {**os.environ, "EI_TASK_NAME": TASK_NAME}
+        result = _scheduler_query([shutil.which("powershell.exe") or "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", query], budget, env=environment)
+        if result.returncode != 0:
+            raise ValueError("SCHEDULER_QUERY_UNSUPPORTED")
+        value = json.loads(result.stdout)
+        import xml.etree.ElementTree as ET
+        xml = value["xml"]
+        if not isinstance(xml, str) or "<!DOCTYPE" in xml or "<!ENTITY" in xml:
+            raise ValueError("SCHEDULER_QUERY_INVALID")
+        root = ET.fromstring(xml)
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        actions = root.findall("t:Actions/t:Exec", ns)
+        identity = len(actions) == 1 and all(actions[0].findtext("t:" + key, namespaces=ns) == expected[attribute] for key, attribute in (("Command", "executable"), ("Arguments", "arguments"), ("WorkingDirectory", "working_directory")))
+        native.update(identity_verified=bool(native["identity_verified"] and identity), registered=True, enabled=value.get("enabled") is True,
+            running=value.get("state") == "Running", boot_id=value.get("boot"), definition_hash=hashlib.sha256(xml.encode()).hexdigest(),
+            last_exit=value.get("last_exit"), last_run_at=value.get("last_run"), next_run_at=value.get("next_run"), native_missed_runs=value.get("native_missed_runs"),
+            conditions={**{key: root.findtext("t:Settings/t:" + key, namespaces=ns) for key in ("DisallowStartIfOnBatteries", "StopIfGoingOnBatteries", "RunOnlyIfIdle", "RunOnlyIfNetworkAvailable", "StartWhenAvailable", "WakeToRun")},
+                "LogonType": root.findtext("t:Principals/t:Principal/t:LogonType", namespaces=ns)})
+        return native
+    raise ValueError("SCHEDULER_QUERY_UNSUPPORTED")
+
+
+def _linux_opportunities(previous, current, settings):
+    """Two actual armed points, never elapsed/interval or a missed-run counter."""
+    unknown = (None, "SCHEDULER_OPPORTUNITY_EVIDENCE_UNAVAILABLE", False)
+    if not isinstance(previous, dict):
+        return None, "SCHEDULER_BASELINE_REQUIRED", False
+    for row in (previous, current):
+        if any(row.get(key) is not True for key in ("identity_verified", "registered", "enabled", "conditions_verified")) or row.get("running") is not False:
+            return unknown
+        if any(type(row.get(key)) is not int or row[key] < 0 for key in ("monotonic_us", "awake_us", "activation_us", "accuracy_us", "random_delay_us")):
+            return unknown
+    for key in ("boot_id", "generation", "definition_hash"):
+        if not current.get(key) and key not in {"random_delay_us", "accuracy_us"} or previous.get(key) != current.get(key):
+            return unknown
+    old_time, new_time = _parse_time(previous.get("observed_at")), _parse_time(current.get("observed_at"))
+    if old_time is None or new_time is None or old_time.utcoffset() is None or new_time.utcoffset() is None:
+        return unknown
+    continuous = current["monotonic_us"] - previous["monotonic_us"]
+    awake = current["awake_us"] - previous["awake_us"]
+    wall = int((new_time - old_time).total_seconds() * 1_000_000)
+    if min(continuous, awake, wall) < 0 or abs(continuous - awake) > 2_000_000 or abs(wall - continuous) > 2_000_000:
+        return unknown
+    # A freshly re-armed schedule alone is not recovery. Require a distinct
+    # native timer trigger and a successful target activation after it.
+    fields = ("last_trigger_us", "service_activation_us")
+    if all(type(row.get(key)) is int and 0 <= row[key] < 2**64 - 1 for row in (previous, current) for key in fields):
+        if (current["last_exit"] == "success" if "last_exit" in current else False) and previous["last_trigger_us"] < current["last_trigger_us"] <= current["service_activation_us"] <= current["awake_us"] and previous["service_activation_us"] < current["service_activation_us"]:
+            return 0, "SCHEDULER_EXECUTION_RESUMED", False
+    for key in ("activation_us", "timers", "accuracy_us", "random_delay_us"):
+        if previous.get(key) != current.get(key):
+            return unknown
+    interval = settings.scheduler_interval_minutes * 60 * 1_000_000
+    timers = current.get("timers")
+    if not isinstance(timers, list) or len(timers) > 16 or interval <= 0 or interval * 2 >= 2**64 - 1:
+        return unknown
+    points = []
+    for row in timers:
+        if not isinstance(row, list) or len(row) != 3 or row[0] != "OnUnitActiveUSec":
+            continue
+        offset, due = row[1:]
+        if type(offset) is not int or type(due) is not int or due != current["activation_us"] + offset or due >= 2**64 - 1:
+            return unknown
+        points.append((offset, due))
+    if sorted(offset for offset, _ in points) != [interval, 2 * interval]:
+        return None, "SCHEDULER_SECOND_OPPORTUNITY_UNAVAILABLE", True
+    if any(due <= previous["awake_us"] for _, due in points):
+        return unknown
+    allowance = current["accuracy_us"] + current["random_delay_us"]
+    missed = sum(current["awake_us"] > due + allowance for _, due in points)
+    return missed, "SCHEDULER_MISSED_OPPORTUNITIES" if missed else "SCHEDULER_OPPORTUNITIES_PENDING", True
+
+
+def inspect_scheduler_opportunities(settings: Settings, *, now: datetime, budget=None, read_only=False) -> dict:
+    from .operation_runtime import OperationBudget, _read_json, settings_binding
+    budget = budget if budget is not None else OperationBudget(5000)
+    result = {"requested": False, "missed_eligible_runs": None, "next_run_at": None, "reason_code": "SCHEDULER_SELECTION_UNKNOWN", "native": {}}
+    try:
+        budget.check()
+        manifest = _read_json(Path(settings.paths.install_manifest_path), budget=budget) or {}
+        requested = manifest.get("scheduler_requested")
+        if type(requested) is not bool:
+            return result
+        result["requested"] = requested
+        if not requested:
+            return {**result, "missed_eligible_runs": 0, "reason_code": "SCHEDULER_EXPLICITLY_DISABLED"}
+        native = _native_scheduler_sample(settings, now=now, budget=budget)
+        result.update(native=native, next_run_at=native.get("next_run_at"))
+        if native.get("platform") == "macos":
+            return {**result, "reason_code": "SCHEDULER_GENERATION_EVIDENCE_UNAVAILABLE"}
+        if native.get("platform") == "windows":
+            return {**result, "reason_code": "SCHEDULER_OPPORTUNITY_EVIDENCE_UNAVAILABLE"}
+        if native.get("platform") != "linux":
+            return {**result, "reason_code": "SCHEDULER_QUERY_UNSUPPORTED"}
+        path = Path(settings.paths.runtime_root) / "scheduler-opportunities.json"
+        stored = _read_json(path, budget=budget)
+        previous = stored.get("sample") if isinstance(stored, dict) and set(stored) == {"schema_version", "binding", "sample"} and type(stored["schema_version"]) is int and stored["schema_version"] == 1 and stored["binding"] == settings_binding(settings) else None
+        count, reason, retain = _linux_opportunities(previous, native, settings)
+        result.update(missed_eligible_runs=count, reason_code=reason)
+        if not read_only and not retain:
+            value = {"schema_version": 1, "binding": settings_binding(settings), "sample": native}
+            raw = json.dumps(value, ensure_ascii=True, sort_keys=True).encode()
+            if len(raw) > 262144:
+                raise ValueError("SCHEDULER_QUERY_LIMIT")
+            budget.check()
+            safe_ensure_directory(path.parent)
+            budget.check()
+            safe_atomic_write(path.parent, path, raw)
+        return result
+    except TimeoutError:
+        return {**result, "reason_code": "SCHEDULER_BUDGET_EXHAUSTED"}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError, subprocess.SubprocessError):
+        return {**result, "reason_code": "SCHEDULER_QUERY_UNSUPPORTED"}
 
 
 def _interval_minutes_from_state(expected: dict[str, Any]) -> int:
@@ -365,19 +699,24 @@ def _interval_minutes_from_state(expected: dict[str, Any]) -> int:
 
 
 def _unit_value(raw: bytes, section: str, key: str) -> str | None:
+    matches = _unit_values(raw, section, key)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _unit_values(raw: bytes, section: str, key: str) -> list[str]:
     current = ""
     matches: list[str] = []
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return None
+        return []
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("[") and stripped.endswith("]"):
             current = stripped[1:-1]
         elif current == section and stripped.startswith(key + "="):
             matches.append(stripped[len(key) + 1 :])
-    return matches[0] if len(matches) == 1 else None
+    return matches
 
 
 def _unit_argv(value: str | None) -> list[str] | None:
@@ -516,6 +855,9 @@ def inspect_registered_task(
         digests: dict[str, str] = {}
         service_argv = _unit_argv(_unit_value(service_raw, "Service", "ExecStart")) if service_raw is not None else None
         service_working = _unit_argv(_unit_value(service_raw, "Service", "WorkingDirectory")) if service_raw is not None else None
+        recorded_action = _maintenance_action_from_record(expected)
+        service_definition_ok = service_raw is not None and recorded_action is not None and service_raw == build_systemd_user_unit(recorded_action).encode("utf-8")
+        timer_definition_ok = timer_raw is not None and recorded_action is not None and timer_raw == build_systemd_user_timer(recorded_action).encode("utf-8")
         checks.update(
             {
                 "service_argv": service_argv == expected_argv,
@@ -523,9 +865,11 @@ def inspect_registered_task(
                 "service_executable": bool(service_argv and expected_executable and service_argv[0] == str(expected_executable)),
                 "working_directory": service_working == [str(settings.paths.engine_root)],
                 "timer_unit": _unit_value(timer_raw, "Timer", "Unit") == f"{TASK_NAME}.service" if timer_raw is not None else False,
-                "timer_interval": _unit_value(timer_raw, "Timer", "OnUnitActiveSec") == f"{_interval_minutes_from_state(expected)}min" if timer_raw is not None else False,
+                "timer_interval": _unit_values(timer_raw, "Timer", "OnUnitActiveSec") == [f"{_interval_minutes_from_state(expected)}min", f"{2 * _interval_minutes_from_state(expected)}min"] if timer_raw is not None else False,
                 "timer_persistent": str(_unit_value(timer_raw, "Timer", "Persistent")).casefold() == "true" if timer_raw is not None else False,
-                "unit_content_identity": service_argv == expected_argv and service_working == [str(settings.paths.engine_root)],
+                "service_generated_definition": service_definition_ok,
+                "timer_generated_definition": timer_definition_ok,
+                "unit_content_identity": service_argv == expected_argv and service_working == [str(settings.paths.engine_root)] and service_definition_ok,
             }
         )
         if service_raw is not None:
@@ -613,8 +957,6 @@ def register_scheduler(
         command = [
             executable,
             "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
             "-File",
             str(script),
             "-RepoPath",
@@ -667,6 +1009,8 @@ def register_scheduler(
         return {"ok": False, "requested": True, "status": "REGISTRATION_FAILED", "reason_code": "SCHEDULER_PLATFORM_UNSUPPORTED", "registered": False, "retryable": False}
     if not script.is_file() or script.is_symlink():
         return {"ok": False, "requested": True, "status": "REGISTRATION_FAILED", "reason_code": "SCHEDULER_INSTALLER_MISSING", "registered": False, "retryable": False}
+    if normalized_platform == "linux" and not check_only and not _systemd_artifacts_are_owned(settings, action):
+        return {"ok": False, "requested": True, "status": "REGISTRATION_BLOCKED", "reason_code": "SCHEDULER_ARTIFACT_CONFLICT", "registered": False, "retryable": False, "platform": normalized_platform}
     # Re-registration is idempotent when the persisted action identity and
     # the live scheduler identity are both unchanged.  Keep check-only on the
     # explicit verification path below so it never writes a state receipt.
@@ -708,6 +1052,9 @@ def register_scheduler(
             write_scheduler_state(settings, action, False)
         return {"ok": False, "requested": True, "status": "REGISTRATION_FAILED", "reason_code": "SCHEDULER_REGISTRATION_FAILED", "registered": False, "retryable": True, "error_type": type(exc).__name__, "platform": normalized_platform}
     if completed.returncode != 0:
+        if normalized_platform == "windows" and "PSSecurityException" in str(completed.stderr):
+            state_path = None if check_only else write_scheduler_state(settings, action, False, completed.returncode)
+            return {"ok": False, "requested": True, "status": "REGISTRATION_DENIED", "reason_code": "SCHEDULER_REGISTRATION_DENIED", "registered": False, "retryable": False, "error_type": "PSSecurityException", "state_path": str(state_path) if state_path else None, "platform": normalized_platform}
         state_path = None if check_only else write_scheduler_state(settings, action, False, completed.returncode)
         return {"ok": False, "requested": True, "status": "REGISTRATION_FAILED", "reason_code": "SCHEDULER_REGISTRATION_FAILED", "registered": False, "retryable": True, "returncode": completed.returncode, "state_path": str(state_path) if state_path else None, "platform": normalized_platform}
     if check_only:

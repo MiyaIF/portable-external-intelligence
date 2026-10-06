@@ -4,6 +4,37 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from ei import queue
+from ei.runtime_catalog import lookup as runtime_lookup, inventory_paths as runtime_inventory
+
+
+class QueueBoundedLockTests(unittest.TestCase):
+    def test_atomic_write_and_fsync_errors_remove_their_own_temporary(self):
+        for boundary in ("write", "fsync"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "queue_failure.json"
+                with patch("ei.queue.os." + boundary, side_effect=OSError("disk full")), self.assertRaises(OSError):
+                    queue._atomic_json(path, {"queue_id": "synthetic"})
+                self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
+                self.assertFalse(path.exists())
+
+    def test_atomic_write_handles_short_os_writes(self):
+        import os
+        real_write = os.write
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.json"
+            with patch("ei.queue.os.write", side_effect=lambda fd, data: real_write(fd, data[:7])):
+                queue._atomic_json(path, {"marker": "complete durable metadata"})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"marker": "complete durable metadata"})
+
+    def test_permission_and_stat_lock_failures_are_bounded(self):
+        for failure in (PermissionError(), FileExistsError()):
+            with self.subTest(failure=type(failure).__name__), tempfile.TemporaryDirectory() as tmp:
+                with patch("ei.queue.os.open", side_effect=failure), patch.object(Path, "stat", side_effect=OSError()) as stat_probe, patch("ei.queue.time.monotonic", side_effect=[0, 0, 6]), patch("ei.queue.time.sleep") as retry_sleep:
+                    with self.assertRaisesRegex(queue.QueueError, "QUEUE_LOCK_PERMISSION_DENIED|QUEUE_LOCK_TIMEOUT"):
+                        queue._acquire(Path(tmp))
+                    self.assertEqual(stat_probe.call_count, int(isinstance(failure, FileExistsError)))
+                    self.assertEqual(retry_sleep.call_count, int(isinstance(failure, FileExistsError)))
 
 from ei.hooks.registry import normalize_hook_event
 from ei.key_provider import InMemoryKeyProvider
@@ -19,7 +50,7 @@ from ei.queue import (
     write_emergency_envelope,
     transition_queue_item,
 )
-from ei.spool import read_spool, write_spool
+from ei.spool import SpoolError, read_spool, write_spool
 from ei.config import RuntimePaths, Settings
 from ei.setup_contract import OrganizerSelection
 
@@ -57,6 +88,188 @@ def make_event(settings, event_name="Stop", turn_id="t1"):
 
 
 class QueueTests(unittest.TestCase):
+    def test_duplicate_lookup_reads_receive_the_original_budget(self):
+        import ei.runtime_catalog as runtime
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            item = enqueue_receipt(make_event(settings), None, settings, now=NOW)
+            managed = runtime.lookup(settings.paths.queue_dir, item.queue_id)
+            (settings.paths.queue_dir / managed.name).write_bytes(managed.read_bytes())
+            budget = OperationBudget(5000)
+            original = runtime.read_entry
+            def checked(root, path, passed=None):
+                self.assertIs(passed, budget)
+                return original(root, path, passed)
+            with patch.object(runtime, "read_entry", side_effect=checked):
+                self.assertEqual(read_queue_item(item.queue_id, settings, budget=budget), item)
+
+    def test_failed_claim_file_write_retries_later_with_one_attempt_and_original_ttl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            ref = write_spool("candidate", "public", settings, key_provider=InMemoryKeyProvider(), now=NOW)
+            item = enqueue_receipt(make_event(settings), ref, settings, now=NOW)
+            with patch("ei.queue._atomic_json", side_effect=OSError("interrupted before file")), self.assertRaises(OSError):
+                claim_queue_item("worker", settings, now=NOW)
+            actual = claim_queue_item("worker", settings, now=NOW + timedelta(seconds=1))
+            self.assertEqual((actual.attempts, actual.created_at, actual.payload_ref), (1, item.created_at, ref))
+            self.assertEqual(actual.lease_expires_at, (NOW + timedelta(seconds=301)).isoformat().replace("+00:00", "Z"))
+
+    def test_emergency_managed_replay_is_bounded_and_preserves_unprocessed_suffix(self):
+        from ei.runtime_catalog import lookup
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            items = [enqueue_receipt(make_event(settings, turn_id=str(index)), None, settings, now=NOW) for index in range(3)]
+            for item in items:
+                path = write_emergency_envelope(item, settings, reason_code="QUEUE_WRITE_FAILED", now=NOW)
+                self.assertIn("managed", path.parts)
+            first = recover_emergency_spool(settings, now=NOW, max_records=1)
+            self.assertEqual(len(first), 1)
+            second = recover_emergency_spool(settings, now=NOW, max_records=1)
+            self.assertEqual(len(second), 1)
+            self.assertNotEqual(first[0].queue_id, second[0].queue_id)
+            self.assertEqual(queue_health(settings).emergency_items, 1)
+
+    def test_result_attachment_exhausted_budget_has_no_mutation(self):
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            ref = write_spool("result", "public", settings, key_provider=InMemoryKeyProvider(), now=NOW, purpose="validated-result", capture_id="sha256:" + "a" * 64)
+            item = enqueue_receipt(make_event(settings), None, settings, now=NOW)
+            claimed = claim_queue_item("worker", settings, now=NOW)
+            with self.assertRaises(TimeoutError):
+                queue.attach_validated_result(claimed, ref, settings, budget=OperationBudget(0))
+            self.assertIsNone(read_queue_item(item.queue_id, settings).validated_result_ref)
+
+    def test_pre_file_queue_failure_replays_same_receipt_without_false_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            event = make_event(settings)
+            original = queue._atomic_json
+            def fail_payload(path, value, **kwargs):
+                if path.is_relative_to(settings.paths.queue_dir):
+                    raise OSError("full")
+                return original(path, value, **kwargs)
+            with patch("ei.queue._atomic_json", side_effect=fail_payload):
+                failed = enqueue_receipt(event, None, settings, now=NOW)
+            self.assertEqual(failed.state, QueueState.QUARANTINED)
+            actual = enqueue_receipt(event, None, settings, now=NOW + timedelta(days=1))
+            self.assertEqual(actual.state, QueueState.READY)
+            self.assertEqual(actual.created_at, NOW.isoformat().replace("+00:00", "Z"))
+            self.assertEqual(read_queue_item(actual.queue_id, settings), actual)
+
+    def test_claim_timeout_does_not_advance_past_uncommitted_lease(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            first = enqueue_receipt(make_event(settings, turn_id="first"), None, settings, now=NOW)
+            second = enqueue_receipt(make_event(settings, turn_id="second"), None, settings, now=NOW)
+            expected = min(first.queue_id, second.queue_id)
+            with patch("ei.queue._store", side_effect=TimeoutError("deadline")), self.assertRaises(TimeoutError):
+                claim_queue_item("worker", settings, now=NOW, max_records=1)
+            self.assertEqual(claim_queue_item("worker", settings, now=NOW, max_records=1).queue_id, expected)
+
+    def test_managed_queue_can_be_read_claimed_and_transitioned_by_legacy_api(self):
+        from ei.runtime_catalog import lookup
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            item = enqueue_receipt(make_event(settings), None, settings, now=NOW)
+            self.assertIn("managed", lookup(settings.paths.queue_dir, item.queue_id).parts)
+            self.assertEqual(read_queue_item(item.queue_id, settings), item)
+            claimed = claim_queue_item("worker", settings, now=NOW)
+            self.assertEqual(claimed.queue_id, item.queue_id)
+            self.assertEqual(transition_queue_item(claimed, QueueState.DONE, settings).state, QueueState.DONE)
+
+    def test_claim_retries_legacy_no_cleanup_without_claiming_it_for_ai(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            key = InMemoryKeyProvider()
+            ref = write_spool("legacy candidate", "public", settings, key_provider=key, now=NOW)
+            item = enqueue_receipt(make_event(settings), ref, settings, now=NOW)
+            with patch("ei.queue.delete_spool", side_effect=SpoolError("SPOOL_DELETE_FAILED")), self.assertRaises(SpoolError):
+                transition_queue_item(item, QueueState.NO_DISCARDED, settings, now=NOW)
+            before = read_queue_item(item.queue_id, settings)
+            self.assertIsNone(before.capture_id)
+            real_delete = queue.delete_spool
+            def unlocked_delete(*args, **kwargs):
+                self.assertFalse((settings.paths.queue_dir / ".queue.lock").exists())
+                return real_delete(*args, **kwargs)
+            with patch("ei.queue.delete_spool", side_effect=unlocked_delete):
+                self.assertIsNone(claim_queue_item("worker", settings, now=NOW + timedelta(seconds=300)))
+            after = read_queue_item(item.queue_id, settings)
+            self.assertEqual((after.state, after.attempts), (QueueState.NO_DISCARDED, before.attempts))
+            self.assertIsNone(after.payload_ref)
+            self.assertFalse((runtime_lookup(settings.paths.spool_dir, ref.spool_id)).exists())
+
+    def test_claim_cleanup_attempt_is_bounded_and_failure_does_not_starve_other_no(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            key = InMemoryKeyProvider()
+            items = []
+            for turn in ("cleanup-one", "cleanup-two"):
+                ref = write_spool(turn, "public", settings, key_provider=key, now=NOW)
+                item = enqueue_receipt(make_event(settings, turn_id=turn), ref, settings, now=NOW)
+                with patch("ei.queue.delete_spool", side_effect=SpoolError("SPOOL_DELETE_FAILED")), self.assertRaises(SpoolError):
+                    transition_queue_item(item, QueueState.NO_DISCARDED, settings, now=NOW)
+                items.append(item)
+            first, second = sorted(items, key=lambda item: item.queue_id)
+            for item in (first, second):
+                self.assertEqual(read_queue_item(item.queue_id, settings).next_eligible_at, "2026-08-26T12:05:00Z")
+            attempts = []
+            real_delete = queue.delete_spool
+            def fail_first_then_delete(ref, *args, **kwargs):
+                attempts.append(ref.spool_id)
+                if len(attempts) == 1:
+                    raise SpoolError("SPOOL_DELETE_FAILED")
+                return real_delete(ref, *args, **kwargs)
+            with patch("ei.queue.delete_spool", side_effect=fail_first_then_delete):
+                self.assertIsNone(claim_queue_item("worker", settings, now=NOW + timedelta(seconds=300)))
+                self.assertEqual(len(attempts), 1)
+                self.assertIsNone(claim_queue_item("worker", settings, now=NOW + timedelta(seconds=300)))
+            self.assertEqual(len(attempts), 2)
+            self.assertNotEqual(attempts[0], attempts[1])
+            remaining = [read_queue_item(item.queue_id, settings) for item in (first, second)]
+            failed_cleanup = next(item for item in remaining if item.payload_ref is not None)
+            cleaned = next(item for item in remaining if item.payload_ref is None)
+            self.assertEqual(failed_cleanup.payload_ref.spool_id, attempts[0])
+            self.assertEqual(failed_cleanup.next_eligible_at, "2026-08-26T12:10:00Z")
+            self.assertIsNone(cleaned.next_eligible_at)
+            self.assertTrue(runtime_lookup(settings.paths.spool_dir, failed_cleanup.payload_ref.spool_id).exists())
+            self.assertFalse(runtime_lookup(settings.paths.spool_dir, attempts[1]).exists())
+
+    def test_claim_resumes_one_scan_after_cleanup_before_leasing_other_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            key = InMemoryKeyProvider()
+            items = []
+            for turn in ("mixed-one", "mixed-two"):
+                ref = write_spool(turn, "public", settings, key_provider=key, now=NOW)
+                items.append(enqueue_receipt(make_event(settings, turn_id=turn), ref, settings, now=NOW))
+            discarded, ready = sorted(items, key=lambda item: item.queue_id)
+            with patch("ei.queue.delete_spool", side_effect=SpoolError("SPOOL_DELETE_FAILED")), self.assertRaises(SpoolError):
+                transition_queue_item(discarded, QueueState.NO_DISCARDED, settings, now=NOW)
+            scans = 0
+            real_page = queue.RuntimeCatalog.page
+            real_advance = queue.RuntimeCatalog.advance
+            real_delete = queue.delete_spool
+            def counted_page(catalog, consumer, **kwargs):
+                nonlocal scans
+                if catalog.root == settings.paths.queue_dir and consumer == "claim":
+                    scans += 1
+                return real_page(catalog, consumer, **kwargs)
+            def unlocked_delete(*args, **kwargs):
+                self.assertFalse((settings.paths.queue_dir / ".queue.lock").exists())
+                self.assertEqual(read_queue_item(ready.queue_id, settings).state, QueueState.READY)
+                return real_delete(*args, **kwargs)
+            def locked_advance(catalog, *args, **kwargs):
+                self.assertTrue((catalog.root / ".queue.lock").exists())
+                return real_advance(catalog, *args, **kwargs)
+            with patch.object(queue.RuntimeCatalog, "page", counted_page), patch.object(queue.RuntimeCatalog, "advance", locked_advance), patch("ei.queue.delete_spool", side_effect=unlocked_delete):
+                claimed = claim_queue_item("worker", settings, now=NOW + timedelta(seconds=300))
+            self.assertEqual(claimed.queue_id, ready.queue_id)
+            self.assertEqual(scans, 1)
+            self.assertIsNone(read_queue_item(discarded.queue_id, settings).payload_ref)
+            self.assertEqual(read_spool(ready.payload_ref, settings, now=NOW, key_provider=key), b"mixed-one" if ready == items[0] else b"mixed-two")
+
     def test_legacy_source_host_omission_is_read_without_rewriting_or_reprocessing(self):
         for state in ("NO_DISCARDED", "DONE"):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
@@ -66,7 +279,7 @@ class QueueTests(unittest.TestCase):
                 raw.pop("source_host_id")
                 raw.pop("source_host_family")
                 raw["state"] = state
-                path = settings.paths.queue_dir / f"{item.queue_id}.json"
+                path = runtime_lookup(settings.paths.queue_dir, item.queue_id)
                 path.write_text(json.dumps(raw), encoding="utf-8")
                 before = path.read_bytes(), path.stat().st_mtime_ns
                 try:
@@ -100,8 +313,8 @@ class QueueTests(unittest.TestCase):
             key = InMemoryKeyProvider("queue-key", b"q" * 32)
             ref = write_spool("durable before queue", "private-reusable", settings, key_provider=key, now=NOW, spool_id="spool-queue")
             item = enqueue_receipt(make_event(settings), ref, settings, now=NOW)
-            self.assertTrue((settings.paths.spool_dir / "spool-queue.json").exists())
-            self.assertTrue((settings.paths.queue_dir / f"{item.queue_id}.json").exists())
+            self.assertTrue((runtime_lookup(settings.paths.spool_dir, "spool-queue")).exists())
+            self.assertTrue((runtime_lookup(settings.paths.queue_dir, item.queue_id)).exists())
             self.assertEqual(read_spool(ref, settings, key_provider=key, now=NOW + timedelta(seconds=1)), b"durable before queue")
 
     def test_idempotent_replay_reuses_same_queue_item_and_collision_is_rejected(self):
@@ -161,8 +374,9 @@ class QueueTests(unittest.TestCase):
                 organizer=OrganizerSelection("READY", "ollama", None),
                 provider_order=("ollama", "subscription-cli"),
             )
-            item = enqueue_receipt(make_event(old_settings, turn_id="legacy-organizer"), None, old_settings, now=NOW)
-            path = old_settings.paths.queue_dir / f"{item.queue_id}.json"
+            with patch("ei.queue._store"):
+                item = enqueue_receipt(make_event(old_settings, turn_id="legacy-organizer"), None, old_settings, now=NOW)
+            path = old_settings.paths.queue_dir / (item.queue_id + ".json")
             raw = item.to_dict()
             raw["provider_preference"] = ["ollama", "subscription-cli"]
             path.write_text(json.dumps(raw), encoding="utf-8")
@@ -175,7 +389,7 @@ class QueueTests(unittest.TestCase):
             claimed = claim_queue_item("current-organizer", current_settings, NOW, lease_seconds=30)
 
             self.assertEqual(claimed.provider_preference, ("subscription-cli",))
-            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted = json.loads(runtime_lookup(current_settings.paths.queue_dir, item.queue_id).read_text(encoding="utf-8"))
             self.assertEqual(persisted["provider_preference"], ["subscription-cli"])
             self.assertEqual(persisted["state"], QueueState.IN_PROGRESS.value)
 
@@ -201,7 +415,7 @@ class QueueTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
             item = enqueue_receipt(make_event(settings), None, settings, now=NOW)
-            path = settings.paths.queue_dir / f"{item.queue_id}.json"
+            path = runtime_lookup(settings.paths.queue_dir, item.queue_id)
             raw = item.to_dict()
             raw["state"] = "DEFERRED_QUOTA"
             path.write_text(json.dumps(raw), encoding="utf-8")
@@ -217,8 +431,8 @@ class QueueTests(unittest.TestCase):
             item = enqueue_receipt(make_event(settings), ref, settings, now=NOW)
             updated = transition_queue_item(item, QueueState.NO_DISCARDED, settings, now=NOW, reason_code="project_specific")
             self.assertIsNone(updated.payload_ref)
-            self.assertFalse((settings.paths.spool_dir / "spool-no.json").exists())
-            serialized = (settings.paths.queue_dir / f"{item.queue_id}.json").read_text(encoding="utf-8")
+            self.assertFalse((runtime_lookup(settings.paths.spool_dir, "spool-no")).exists())
+            serialized = (runtime_lookup(settings.paths.queue_dir, item.queue_id)).read_text(encoding="utf-8")
             self.assertNotIn("no body survives", serialized)
 
     def test_queue_write_failure_creates_bounded_emergency_envelope(self):
@@ -227,14 +441,14 @@ class QueueTests(unittest.TestCase):
             event = make_event(settings)
             original = __import__("ei.queue", fromlist=["_atomic_json"])._atomic_json
 
-            def write(path, value):
-                if path.parent == settings.paths.queue_dir:
+            def write(path, value, **kwargs):
+                if path.is_relative_to(settings.paths.queue_dir):
                     raise OSError("simulated queue write failure")
-                return original(path, value)
+                return original(path, value, **kwargs)
 
             with patch("ei.queue._atomic_json", side_effect=write):
                 item = enqueue_receipt(event, None, settings, now=NOW)
-            emergency = list(settings.paths.emergency_spool_dir.glob("emergency_*.json"))
+            emergency = list(runtime_inventory(settings.paths.emergency_spool_dir, prefix="emergency_"))
             self.assertEqual(len(emergency), 1)
             data = json.loads(emergency[0].read_text(encoding="utf-8"))
             self.assertNotIn("body", data)
@@ -243,15 +457,23 @@ class QueueTests(unittest.TestCase):
     def test_emergency_recovery_deletes_only_after_normal_queue_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
-            item = enqueue_receipt(make_event(settings), None, settings, now=NOW)
-            path = settings.paths.queue_dir / f"{item.queue_id}.json"
-            path.unlink()
+            original = queue._atomic_json
+            def fail_queue(path, value, **kwargs):
+                if path.is_relative_to(settings.paths.queue_dir):
+                    raise OSError("simulated queue write failure")
+                return original(path, value, **kwargs)
+            with patch("ei.queue._atomic_json", side_effect=fail_queue):
+                failed = enqueue_receipt(make_event(settings), None, settings, now=NOW)
+            emergency = next(runtime_inventory(settings.paths.emergency_spool_dir, prefix="emergency_"))
+            item = QueueItem.from_dict(json.loads(emergency.read_text(encoding="utf-8"))["queue_item"])
+            with patch("ei.queue._store", side_effect=OSError("still full")):
+                self.assertEqual(recover_emergency_spool(settings, now=NOW), ())
+            self.assertTrue(emergency.exists())
             from ei.queue import write_emergency_envelope
-            write_emergency_envelope(item, settings, reason_code="QUEUE_WRITE_FAILED", now=NOW)
             recovered = recover_emergency_spool(settings, now=NOW + timedelta(seconds=1))
             self.assertEqual(len(recovered), 1)
-            self.assertTrue((settings.paths.queue_dir / f"{item.queue_id}.json").exists())
-            self.assertEqual(len(list(settings.paths.emergency_spool_dir.glob("emergency_*.json"))), 0)
+            self.assertTrue((runtime_lookup(settings.paths.queue_dir, item.queue_id)).exists())
+            self.assertEqual(list(runtime_inventory(settings.paths.emergency_spool_dir, prefix="emergency_")), [])
 
     def test_emergency_spool_full_reports_health_without_silent_eviction(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,7 +485,7 @@ class QueueTests(unittest.TestCase):
             write_emergency_envelope(first, settings, reason_code="QUEUE_WRITE_FAILED", now=NOW)
             with self.assertRaisesRegex(QueueError, "EMERGENCY_SPOOL_FULL"):
                 write_emergency_envelope(second, settings, reason_code="QUEUE_WRITE_FAILED", now=NOW)
-            emergency = list(settings.paths.emergency_spool_dir.glob("emergency_*.json"))
+            emergency = list(runtime_inventory(settings.paths.emergency_spool_dir, prefix="emergency_"))
             self.assertEqual(len(emergency), 1)
             health = json.loads((settings.paths.emergency_spool_dir / "health.json").read_text(encoding="utf-8"))
             self.assertEqual(health["status"], "EMERGENCY_SPOOL_FULL")

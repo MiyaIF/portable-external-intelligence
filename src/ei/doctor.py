@@ -680,10 +680,48 @@ def _queue_check(settings: Settings, strict: bool) -> dict[str, Any]:
 
 
 def _spool_files(settings: Settings) -> tuple[Path, ...]:
+    from .runtime_catalog import inventory_paths
     root = Path(settings.paths.spool_dir).expanduser().resolve()
     if not root.exists():
         return ()
-    return tuple(sorted(path for path in root.glob("*.json") if path.is_file() and path.name != ".spool-capacity.json"))
+    return tuple(inventory_paths(root))
+
+
+def _spool_accounting_diagnostic(root: Path) -> tuple[str, str | None]:
+    """Read-only metadata diagnosis, never an admission or custody proof."""
+    import sqlite3
+    from contextlib import closing
+    from .safe_fs import assert_safe_target
+    from .runtime_catalog import _PURPOSES
+    database = root / ".runtime-catalog.sqlite"
+    if not database.exists():
+        return ("UNKNOWN", "RUNTIME_CATALOG_MISSING") if (root / "managed").exists() else ("NOT_PRESENT", None)
+    try:
+        assert_safe_target(root, database, allow_missing=False, expected_type="file")
+        for suffix in ("-journal", "-wal", "-shm"):
+            if Path(str(database) + suffix).exists():
+                return "UNKNOWN", "RUNTIME_CATALOG_BUSY"
+        # immutable avoids recovery/sidecar creation on this inspection path.
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro&immutable=1", uri=True)) as connection:
+            if connection.execute("PRAGMA user_version").fetchone()[0] != 1:
+                return "UNKNOWN", "RUNTIME_CATALOG_CORRUPT"
+            halted = connection.execute("SELECT value FROM state WHERE name='halted'").fetchone()
+            complete = connection.execute("SELECT value FROM state WHERE name='complete'").fetchone()
+            pending = connection.execute("SELECT phase FROM entries WHERE phase!='registered' LIMIT 1").fetchone()
+            accounting = connection.execute("SELECT purpose,items,bytes FROM accounting LIMIT 8").fetchall()
+            if any(purpose not in _PURPOSES or any(type(v) is not int or v < 0 for v in (items, size)) for purpose, items, size in accounting):
+                return "UNKNOWN", "RUNTIME_ACCOUNTING_UNKNOWN"
+            totals = {purpose: (items, size) for purpose, items, size in accounting}
+            for purpose in _PURPOSES:
+                present = connection.execute("SELECT 1 FROM entries WHERE purpose=? LIMIT 1", (purpose,)).fetchone() is not None
+                items, size = totals.get(purpose, (0, 0))
+                if (present and (purpose not in totals or size == 0 or (purpose != "validated-result" and items == 0))) or (not present and (items or size)) or (purpose == "validated-result" and items):
+                    return "UNKNOWN", "RUNTIME_ACCOUNTING_UNKNOWN"
+            if halted or complete != ("1",) or pending:
+                return "UNKNOWN", "RUNTIME_INVENTORY_PARTIAL"
+        return "UNVERIFIED", None
+    except (sqlite3.Error, OSError, ValueError):
+        return "UNKNOWN", "RUNTIME_CATALOG_CORRUPT"
 
 
 def _spool_check(settings: Settings, strict: bool) -> dict[str, Any]:
@@ -693,7 +731,8 @@ def _spool_check(settings: Settings, strict: bool) -> dict[str, Any]:
         invalid = 0
         expired = 0
         key_missing = 0
-        for path in _spool_files(settings):
+        files = _spool_files(settings)
+        for path in files:
             value = _read_json(path)
             if not value or value.get("algorithm") != "AES-256-GCM" or not isinstance(value.get("key_id"), str):
                 invalid += 1
@@ -708,18 +747,23 @@ def _spool_check(settings: Settings, strict: bool) -> dict[str, Any]:
                 invalid += 1
             if not str(value.get("key_id", "")):
                 key_missing += 1
-        key_state = "NOT_REQUIRED" if not _spool_files(settings) else "PRESENT_IN_ENVELOPE"
-        ok = invalid == 0 and key_missing == 0
+        key_state = "NOT_REQUIRED" if not files else "PRESENT_IN_ENVELOPE"
+        accounting_state, accounting_reason = _spool_accounting_diagnostic(Path(settings.paths.spool_dir))
+        ok = invalid == 0 and key_missing == 0 and accounting_state != "UNKNOWN"
         return _check(
             "spool",
             ok or not strict,
             required=strict,
-            reason_code="SPOOL_ENVELOPE_INVALID" if invalid else "SPOOL_KEY_ID_MISSING" if key_missing else None,
+            reason_code="SPOOL_ENVELOPE_INVALID" if invalid else "SPOOL_KEY_ID_MISSING" if key_missing else accounting_reason,
             health=health,
             invalid_envelopes=invalid,
             expired_envelopes=expired,
             key_state=key_state,
             quarantine=health.get("quarantined", 0),
+            accounting_state=accounting_state,
+            accounting_reason_code=accounting_reason,
+            admission_verified=False,
+            custody_verified=False,
         )
     except (OSError, SpoolError, ValueError) as exc:
         return _check(
@@ -747,13 +791,15 @@ def _projection_check(settings: Settings, strict: bool, event_count: int) -> dic
     try:
         index = build_index(knowledge, index_path)
         events = list(iter_events(settings.paths.event_dir)) if settings.paths.event_dir.exists() else []
-        freshness = projection_freshness_report(index_path, events)
+        freshness = projection_freshness_report(index.index_path, events)
+        from .project import projection_mirror_status
         return _check(
             "projection",
             not strict or freshness["freshness"] == "CURRENT"
             or (freshness["freshness"] == "UNKNOWN" and event_count == 0 and index.item_count == 0),
             required=strict,
             **freshness,
+            human_mirror=projection_mirror_status(knowledge),
             candidate_diagnostics=list(candidate_diagnostics(events)),
             index_present=True,
             item_count=index.item_count,

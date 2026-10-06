@@ -19,14 +19,41 @@ POWERSHELL = shutil.which("pwsh") or shutil.which("powershell")
 SHELL = shutil.which("sh")
 
 
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
 @unittest.skipUnless(POWERSHELL, "PowerShell not installed")
-class WindowsPrerequisiteTests(unittest.TestCase):
+class WindowsPrerequisiteTests(NotificationIsolationMixin, unittest.TestCase):
+    def _outer_powershell_environment(self) -> dict[str, str]:
+        environment = self.notification_child_environment()
+        host_system_root = os.environ.get("WINDIR")
+        self.assertTrue(
+            host_system_root
+            and (Path(host_system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe").is_file()
+        )
+        environment["SystemRoot"] = str(Path(host_system_root).resolve())
+        environment.pop("PSModulePath", None)
+        powershell_modules = Path(host_system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
+        self.assertTrue(powershell_modules.is_dir(), "Windows PowerShell system modules are unavailable")
+        environment["PSModulePath"] = str(powershell_modules.resolve())
+        return environment
+
     @unittest.skipUnless(shutil.which("powershell.exe"), "Windows PowerShell not installed")
     def test_windows_powershell_51_runs_the_same_bootstrap(self):
         from unittest.mock import patch
-        environment = os.environ.copy()
-        environment.pop("PSModulePath", None)  # do not inherit PowerShell 7 module paths into PS5
-        policy = subprocess.run([shutil.which("powershell.exe"), "-NoProfile", "-Command", "Get-ExecutionPolicy"], capture_output=True, text=True, timeout=10, env=environment)
+        environment = self._outer_powershell_environment()
+        expected_module_path = Path(os.environ["WINDIR"]).resolve() / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
+        self.assertEqual(environment.get("PSModulePath"), str(expected_module_path.resolve()))
+        policy = subprocess.run(
+            [shutil.which("powershell.exe"), "-NoProfile", "-Command", "Get-ExecutionPolicy"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+        )
         if policy.returncode != 0:
             self.skipTest("Unable to inspect host execution policy without changing it")
         if policy.stdout.strip() in {"Restricted", "AllSigned"}:
@@ -39,16 +66,33 @@ class WindowsPrerequisiteTests(unittest.TestCase):
         # Parse the actual bootstrap literal as data and invoke it with --help.
         # This tests PS5's native argv marshalling without changing script policy.
         wrapper = (ROOT / "scripts/setup.ps1").as_posix().replace("'", "''")
-        python = Path(sys.executable).as_posix().replace("'", "''")
+        python = self.isolated_python_executable().as_posix().replace("'", "''")
         source = (ROOT / "src").as_posix().replace("'", "''")
         harness = f"""
 $ast = [System.Management.Automation.Language.Parser]::ParseFile('{wrapper}', [ref]$null, [ref]$null)
 $assignment = $ast.Find({{param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $node.Left.Extent.Text -eq '$bootstrap'}}, $true)
 $nativeCode = $assignment.Right.Find({{param($node) $node -is [System.Management.Automation.Language.StringConstantExpressionAst]}}, $true).Value
-& '{python}' -I -B -X utf8 -c $nativeCode '{source}' --help
-exit $LASTEXITCODE
+$outerSystemRoot = $env:SystemRoot
+try {{
+    $env:SystemRoot = [IO.Path]::GetFullPath($env:EI_TEST_NOTIFICATION_PRIVATE_SYSTEM_ROOT)
+    & '{python}' -I -B -X utf8 -c $nativeCode '{source}' --help
+    $bootstrapExit = $LASTEXITCODE
+}} finally {{
+    $env:SystemRoot = $outerSystemRoot
+}}
+exit $bootstrapExit
 """
-        result = subprocess.run([shutil.which("powershell.exe"), "-NoProfile", "-Command", harness], capture_output=True, text=True, timeout=20)
+        environment = self._outer_powershell_environment()
+        result = subprocess.run(
+            [shutil.which("powershell.exe"), "-NoProfile", "-Command", harness],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ei.installer", result.stdout)
 
@@ -56,14 +100,16 @@ exit $LASTEXITCODE
     def test_setup_wrapper_check_only_accepts_bootstrap_and_scheduler_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            python_shim = self.powershell_python_shim()
+            environment = self._outer_powershell_environment()
             completed = subprocess.run([
                 POWERSHELL, "-NoProfile", "-File", str(ROOT / "scripts/setup.ps1"),
                 "-CheckOnly", "-NonInteractive", "-InstallPrerequisites", "-NoScheduler", "-Json",
                 "-KnowledgeMode", "local", "-KnowledgeRoot", str(root / "knowledge"), "-RuntimeRoot", str(root / "runtime"),
                 "-Hosts", "codex-cli", "-HostHome", f"codex-cli={root / 'host'}",
                 "-OrganizerProvider", "subscription-cli", "-OrganizerHost", "codex-cli",
-                "-PythonExe", sys.executable, "-SkipVenv",
-            ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+                "-PythonExe", str(python_shim), "-SkipVenv",
+            ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=environment)
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
             self.assertEqual(json.loads(completed.stdout)["status"], "CHECK_ONLY")
             self.assertEqual(list(root.iterdir()), [])
@@ -120,7 +166,7 @@ try {{
 
 
 @unittest.skipUnless(SHELL, "POSIX shell not installed")
-class PosixPrerequisiteTests(unittest.TestCase):
+class PosixPrerequisiteTests(NotificationIsolationMixin, unittest.TestCase):
     def test_apt_install_disallows_package_removal(self):
         script = (ROOT / "scripts/prerequisites.sh").as_posix()
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,14 +193,16 @@ ei_dependency_manager
     def test_setup_wrapper_check_only_accepts_bootstrap_and_scheduler_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            python_shim = self.isolated_python_executable()
+            environment = self.notification_child_environment()
             completed = subprocess.run([
                 SHELL, str(ROOT / "scripts/setup.sh"),
                 "--check-only", "--non-interactive", "--install-prerequisites", "--no-scheduler", "--json",
                 "--knowledge-mode", "local", "--knowledge-root", str(root / "knowledge"), "--runtime-root", str(root / "runtime"),
                 "--hosts", "codex-cli", "--host-home", f"codex-cli={root / 'host'}",
                 "--organizer-provider", "subscription-cli", "--organizer-host", "codex-cli",
-                "--python-exe", sys.executable, "--skip-venv",
-            ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+                "--python-exe", str(python_shim), "--skip-venv",
+            ], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, env=environment)
             self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
             self.assertEqual(json.loads(completed.stdout)["status"], "CHECK_ONLY")
             self.assertEqual(list(root.iterdir()), [])

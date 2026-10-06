@@ -124,6 +124,10 @@ Hookは候補をsanitized envelopeとしてappend-only eventへ渡します。�
 
 取得は整理AIを必要としません。個人projectionと、設定時だけ使うteam projectionを同じ上限で統合します。整理AIが利用不能でも、すでにactiveなpatternは取得できます。
 
+無操作運用でのreceipt・未整理spool・保存済みknowledgeの違い、通知時の対応、保持期限と実証範囲は[無操作運用ガイド](docs/unattended-operation.md)を参照してください。隔離fixtureやCIは実HostでのHook受信、scheduler実行、OS通知表示の証明にはなりません。
+
+登録Host adapterからのcloseout関連付けは、明示されたtrusted対象と構造化評価がある場合だけ動作します。既存のpublic adaptersはnative closeout coverage metadataを提供せず、contextが不足する対象の関連付けは`UNKNOWN`です。fake adapterの受入テストはpublic Host対応の宣言ではありません。
+
 ## 状態の意味
 
 - `SETUP_COMPLETE` は設定完了であり、`not proof`（external sync、member distribution、live hook、production completion、measured effect）の証明ではありません。これらは別のreceiptで確認します。

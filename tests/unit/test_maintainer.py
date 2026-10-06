@@ -9,12 +9,13 @@ from unittest.mock import patch
 
 from ei.config import load_settings
 from ei.hooks.registry import normalize_hook_event
+from ei.index import build_index
 from ei.journal import append_event, iter_events
 from ei.key_provider import InMemoryKeyProvider
-from ei.maintainer import drain_queue, process_failure, run_maintenance
+from ei.maintainer import _process_claimed, drain_queue, process_failure, run_maintenance
 from ei.models import Event
 from ei.project import project_events
-from ei.queue import QueueState, enqueue_receipt, queue_health, read_queue_item
+from ei.queue import QueueState, claim_queue_item, enqueue_receipt, queue_health, read_queue_item
 from ei.spool import write_spool
 from ei.setup_contract import OrganizerSelection
 
@@ -104,13 +105,14 @@ class MaintainerTests(unittest.TestCase):
             self.assertEqual(result.status, "partial")
             self.assertEqual(result.projection.get("freshness"), "CURRENT")
             self.assertEqual(source.read_bytes(), before)
-            self.assertTrue((settings.paths.knowledge_dir / "observations/obs_saved.md").is_file())
+            index = build_index(settings.paths.knowledge_dir, settings.paths.knowledge_dir / "index.json")
+            self.assertTrue((Path(index.index_path).parent / "observations/obs_saved.md").is_file())
 
     def test_concurrent_event_is_reported_as_pending_not_current(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(tmp)
-            def append_after_projection(events, root):
-                index = project_events(events, root)
+            def append_after_projection(events, root, **kwargs):
+                index = project_events(events, root, **kwargs)
                 append_event(Event.create("observation.recorded", "2026-01-01T00:00:00+00:00",
                     "test", "test", {"observation_id": "obs_late", "claim": "遅延した記録",
                     "classification": "private-reusable"}, event_id="evt_late"), settings.paths.event_dir)
@@ -122,8 +124,8 @@ class MaintainerTests(unittest.TestCase):
             self.assertIn("PROJECTION_STALE", [row["error_code"] for row in result.errors])
             self.assertEqual(run_maintenance(settings, sync_policy="disabled").projection["freshness"], "CURRENT")
 
-    def _enqueue_candidate(self, settings, *, payload_ref=None):
-        source = source_hash("candidate")
+    def _enqueue_candidate(self, settings, *, payload_ref=None, label="candidate"):
+        source = source_hash(label)
         event = Event.create_v2(
             "observation.recorded",
             "maintainer-test",
@@ -151,6 +153,71 @@ class MaintainerTests(unittest.TestCase):
         )
         append_event(event, settings.paths.event_dir)
         return enqueue_receipt(event, payload_ref, settings)
+
+    def test_auth_hold_is_shared_and_inference_deadline_is_not_hook_deadline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            self._enqueue_candidate(settings, label="one")
+            self._enqueue_candidate(settings, label="two")
+            provider = ErrorProvider("ollama", "AUTH_FAILED")
+            budgets = []
+            generate = provider.generate
+            def capture(schema, data, budget):
+                budgets.append(budget)
+                return generate(schema, data, budget)
+            provider.generate = capture
+            result = drain_queue(settings, provider=provider, time_budget_ms=10000)
+            self.assertEqual(provider.calls, 1)
+            self.assertEqual(result.deferred, 2)
+            self.assertGreater(budgets[0].deadline_ms, settings.prompt_budget_ms)
+            self.assertLessEqual(budgets[0].deadline_ms, 10000)
+            self.assertTrue(budgets[0].run_id)
+
+    def test_empty_queue_does_not_probe_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = ErrorProvider("ollama", "AUTH_FAILED")
+            drain_queue(make_settings(tmp), provider=provider)
+            self.assertEqual(provider.calls, 0)
+
+    def test_candidates_in_one_drain_receive_the_same_run_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            self._enqueue_candidate(settings, label="one")
+            self._enqueue_candidate(settings, label="two")
+            provider = YesProvider()
+            budgets = []
+            generate = provider.generate
+            def capture(schema, data, budget):
+                budgets.append(budget)
+                return generate(schema, data, budget)
+            with patch.object(provider, "generate", side_effect=capture), patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider()):
+                result = drain_queue(settings, provider=provider, time_budget_ms=10000)
+            self.assertEqual(result.completed, 2)
+            self.assertEqual(budgets[0].run_id, budgets[1].run_id)
+            self.assertNotEqual(budgets[0].attempt_id, budgets[1].attempt_id)
+
+    def test_exhausted_maintenance_budget_defers_without_provider(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            self._enqueue_candidate(settings)
+            now = datetime.now(timezone.utc)
+            item = claim_queue_item("worker", settings, now=now)
+            provider = ErrorProvider("ollama", "AUTH_FAILED")
+            outcome, updated = _process_claimed(item, settings, provider, now, maintenance_remaining_ms=0)
+            self.assertEqual(outcome, "deferred")
+            self.assertEqual(updated.last_error_code, "DEADLINE_EXCEEDED")
+            self.assertEqual(provider.calls, 0)
+
+    def test_storage_failure_preserves_recovery_opportunity_after_retry_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            item = self._enqueue_candidate(settings)
+            now = datetime.now(timezone.utc)
+            from datetime import timedelta
+            with patch("ei.maintainer.save_validated_result", side_effect=OSError("disk full")):
+                for step in range(5):
+                    drain_queue(settings, provider=YesProvider(), now=now + timedelta(days=step))
+            self.assertEqual(read_queue_item(item.queue_id, settings).state, QueueState.DEFERRED)
 
     def test_malformed_response_retries_then_requires_attention(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,7 +347,7 @@ class MaintainerTests(unittest.TestCase):
             self.assertGreaterEqual(result.expired_spool, 1, "EXPIRED_SPOOL_NOT_COLLECTED")
             self.assertGreaterEqual(result.ingest_sources, 2, "INGEST_SOURCE_COUNT_INCOMPLETE")
             self.assertTrue(
-                (settings.paths.knowledge_dir / "manifest.json").is_file(),
+                (Path(build_index(settings.paths.knowledge_dir, settings.paths.knowledge_dir / "index.json").index_path).parent / "manifest.json").is_file(),
                 "KNOWLEDGE_PROJECTION_MANIFEST_MISSING",
             )
             self.assertIn("projection", result.to_dict(), "MAINTENANCE_PROJECTION_MISSING")

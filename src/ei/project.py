@@ -12,7 +12,7 @@ from urllib.parse import quote
 
 from .lifecycle import select_always_on
 from .models import Event, KnowledgeIndex, validate_host_applicability_mapping
-from .safe_fs import SafeFilesystemError, safe_unlink
+from .safe_fs import SafeFilesystemError, safe_unlink, assert_safe_target, safe_atomic_write, safe_ensure_directory
 from .projection_state import projection_source_state
 from .reconciliation import candidate_diagnostics
 
@@ -319,11 +319,27 @@ def _index_markdown(patterns: Mapping[str, Mapping[str, Any]], observations: Map
     return "\n".join(lines).rstrip() + "\n"
 
 
-def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeIndex:
+def _project_events_legacy(events: Iterable[Event], knowledge_dir: Path, *, documents=None, budget=None) -> KnowledgeIndex:
+    def check():
+        if budget is not None:
+            budget.check()
+    total_bytes = 0
+    def write(path, content):
+        nonlocal total_bytes
+        check()
+        if documents is None:
+            return _atomic_write(path, content)
+        raw = content.encode("utf-8")
+        total_bytes += len(raw)
+        if total_bytes > 64 * 1024 * 1024 or len(documents) >= 120000 or len(raw) > 8 * 1024 * 1024:
+            raise ValueError("PROJECTION_STORAGE_LIMIT")
+        documents[path.relative_to(root).as_posix()] = raw
+    check()
     events = list(events)
     observations: dict[str, dict[str, Any]] = {}
     patterns: dict[str, dict[str, Any]] = {}
     for event in sorted(events, key=lambda item: (item.occurred_at, item.event_id)):
+        check()
         _validate_projection_host_fields(event.payload)
         if event.event_type == "observation.recorded":
             observation_id = event.payload.get("observation_id")
@@ -338,8 +354,9 @@ def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeInd
         if _privacy_allowed(value)
     }
     root = Path(knowledge_dir)
-    root.mkdir(parents=True, exist_ok=True)
-    previous_projection_paths = _previous_projection_paths(root)
+    if documents is None:
+        root.mkdir(parents=True, exist_ok=True)
+    previous_projection_paths = _previous_projection_paths(root) if documents is None else set()
     directories = (
         root / "rules",
         root / "library",
@@ -350,14 +367,15 @@ def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeInd
         root / "patterns",
     )
     for directory in directories:
-        directory.mkdir(parents=True, exist_ok=True)
+        if documents is None:
+            directory.mkdir(parents=True, exist_ok=True)
 
     generated: dict[str, str] = {}
     active_patterns = [patterns[key] for key in sorted(patterns) if patterns[key].get("status") == "active"]
     selected = select_always_on(active_patterns, {}, 8500, 11500)
     selected_ids = {item.pattern_id for item in selected}
     always_on = _always_on_content(active_patterns, selected_ids)
-    _atomic_write(root / "rules" / "always-on.md", always_on)
+    write(root / "rules" / "always-on.md", always_on)
     generated["rules/always-on.md"] = _hash_content(always_on)
 
     for observation_id in sorted(observations):
@@ -366,13 +384,13 @@ def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeInd
             Path("memories") / f"{observation_id}.md",
             Path("observations") / f"{observation_id}.md",
         ):
-            _atomic_write(root / relative, content)
+            write(root / relative, content)
             generated[relative.as_posix()] = _hash_content(content)
 
     active: list[str] = []
     archive: list[str] = []
     candidates: list[str] = []
-    diagnostics = {row["pattern_id"]: row for row in candidate_diagnostics(events)}
+    diagnostics = {row["pattern_id"]: row for row in candidate_diagnostics(events, budget=budget)}
     for pattern_id in sorted(patterns):
         pattern = patterns[pattern_id]
         status = pattern.get("status", "candidate")
@@ -380,21 +398,21 @@ def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeInd
         if status == "active":
             active.append(pattern_id)
             for relative in (Path("rules") / f"{pattern_id}.md", Path("patterns") / f"{pattern_id}.md", Path("library") / f"{pattern_id}.md"):
-                _atomic_write(root / relative, content)
+                write(root / relative, content)
                 generated[relative.as_posix()] = _hash_content(content)
         elif status == "candidate":
             candidates.append(pattern_id)
             for relative in (Path("library") / f"{pattern_id}.md", Path("candidates") / f"{pattern_id}.md"):
-                _atomic_write(root / relative, content)
+                write(root / relative, content)
                 generated[relative.as_posix()] = _hash_content(content)
         else:
             archive.append(pattern_id)
             relative = Path("archive") / f"{pattern_id}.md"
-            _atomic_write(root / relative, content)
+            write(root / relative, content)
             generated[relative.as_posix()] = _hash_content(content)
 
     index_content = _index_markdown(patterns, observations)
-    _atomic_write(root / "index.md", index_content)
+    write(root / "index.md", index_content)
     generated["index.md"] = _hash_content(index_content)
     index_document = {
         "schema_version": 2,
@@ -408,12 +426,13 @@ def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeInd
         "files": dict(sorted(generated.items())),
     }
     index_content_json = json.dumps(index_document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    _atomic_write(root / "index.json", index_content_json)
+    write(root / "index.json", index_content_json)
     generated["index.json"] = _hash_content(index_content_json)
-    _remove_stale_projection(root, previous_projection_paths, set(generated))
+    if documents is None:
+        _remove_stale_projection(root, previous_projection_paths, set(generated))
     manifest = {"schema_version": 2, "files": dict(sorted(generated.items()))}
     manifest_content = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
-    _atomic_write(root / "manifest.json", manifest_content)
+    write(root / "manifest.json", manifest_content)
     manifest_hash = _hash_content(manifest_content)
     return KnowledgeIndex(
         index_path=root / "index.json",
@@ -428,6 +447,269 @@ def project_events(events: Iterable[Event], knowledge_dir: Path) -> KnowledgeInd
         always_on_chars=len(always_on),
         candidate_pattern_ids=tuple(candidates),
     )
+
+
+_GENERATION_OWNER = ".ei-projection-owner.json"
+_GENERATION_MAX_BYTES = 64 * 1024 * 1024
+PROJECTION_ATTRIBUTES = b".projection-generations/** -text\n"
+
+
+def valid_projection_attributes(raw):
+    # Only this control file may differ in line endings. Generation contents
+    # remain byte-authenticated and must never undergo Git text conversion.
+    return raw in (PROJECTION_ATTRIBUTES, PROJECTION_ATTRIBUTES.replace(b"\n", b"\r\n"))
+
+
+def _ensure_projection_attributes(root, budget):
+    from .index import _read_projection_bytes
+    budget.check()
+    target = assert_safe_target(root, root / ".gitattributes", allow_missing=True, expected_type="file")
+    if target.exists():
+        if not valid_projection_attributes(_read_projection_bytes(target, budget=budget, maximum=4096)):
+            raise ValueError("PROJECTION_ATTRIBUTES_CONFLICT")
+    else:
+        _write_bounded(root, target, PROJECTION_ATTRIBUTES, budget)
+
+
+def _generation_binding(manifest_sha256):
+    from .ids import canonical_json
+    return hashlib.sha256(canonical_json({"domain": "ei-projection-generation-v1", "manifest_sha256": manifest_sha256})).hexdigest()
+
+
+def _owner_document(root, documents):
+    return {"schema_version": 1, "owner": "ei-projection-v1", "generation_binding": _generation_binding(hashlib.sha256(documents["manifest.json"]).hexdigest()),
+            "files": {name: {"sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)} for name, raw in sorted(documents.items())}}
+
+
+def _encode(value):
+    return (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+
+
+def _write_bounded(root, path, raw, budget):
+    budget.check()
+    assert_safe_target(root, path, allow_missing=True, expected_type="file")
+    safe_ensure_directory(path.parent)
+    budget.check()
+    safe_atomic_write(root, path, raw)
+
+
+def _inspect_generation(root, generation, budget):
+    """Check ownership of every present file before cleanup or reuse."""
+    from .index import _read_projection_bytes
+    budget.check()
+    assert_safe_target(root, generation, allow_missing=False, expected_type="dir")
+    owner_path = generation / _GENERATION_OWNER
+    try:
+        owner_raw = _read_projection_bytes(owner_path, budget=budget)
+        owner = json.loads(owner_raw)
+    except (OSError, ValueError) as exc:
+        if isinstance(exc, TimeoutError):
+            raise
+        raise ValueError("PROJECTION_GENERATION_UNOWNED") from exc
+    if not isinstance(owner, dict) or set(owner) != {"schema_version", "owner", "generation_binding", "files"} or type(owner["schema_version"]) is not int or owner["schema_version"] != 1 or owner["owner"] != "ei-projection-v1" or owner["generation_binding"] != _generation_binding(generation.name) or not isinstance(owner["files"], dict):
+        raise ValueError("PROJECTION_GENERATION_UNOWNED")
+    plan = owner["files"]
+    if not isinstance(plan.get("manifest.json"), dict) or plan["manifest.json"].get("sha256") != generation.name:
+        raise ValueError("PROJECTION_GENERATION_UNOWNED")
+    if len(plan) + 1 > 120000:
+        raise ValueError("PROJECTION_STORAGE_LIMIT")
+    allowed_dirs = set()
+    planned_bytes = len(owner_raw)
+    for name, metadata in plan.items():
+        budget.check()
+        relative = _safe_relative(name)
+        if relative is None or relative.as_posix() != name or len(relative.parts) > 2 or name == _GENERATION_OWNER or not isinstance(metadata, dict) or set(metadata) != {"sha256", "size"} or type(metadata["size"]) is not int or metadata["size"] < 0 or not isinstance(metadata["sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", metadata["sha256"]):
+            raise ValueError("PROJECTION_GENERATION_UNOWNED")
+        planned_bytes += metadata["size"]
+        if relative.parent != Path("."):
+            allowed_dirs.add(relative.parent.as_posix())
+    if planned_bytes > _GENERATION_MAX_BYTES:
+        raise ValueError("PROJECTION_STORAGE_LIMIT")
+    files, directories, pending = [], [], [generation]
+    while pending:
+        directory = pending.pop()
+        budget.check()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                budget.check()
+                path = Path(entry.path)
+                assert_safe_target(generation, path, allow_missing=False)
+                relative = path.relative_to(generation).as_posix()
+                if entry.is_dir(follow_symlinks=False):
+                    if relative not in allowed_dirs:
+                        raise ValueError("PROJECTION_GENERATION_UNOWNED")
+                    directories.append(path)
+                    pending.append(path)
+                elif relative == _GENERATION_OWNER:
+                    continue
+                else:
+                    metadata = plan.get(relative)
+                    if metadata is None or not entry.is_file(follow_symlinks=False):
+                        raise ValueError("PROJECTION_GENERATION_UNOWNED")
+                    raw = _read_projection_bytes(path, budget=budget)
+                    if len(raw) != metadata["size"] or hashlib.sha256(raw).hexdigest() != metadata["sha256"]:
+                        raise ValueError("PROJECTION_GENERATION_CONFLICT")
+                    files.append(path)
+    return owner, files, directories
+
+
+def _cleanup_generations(root, keep, budget):
+    container = root / ".projection-generations"
+    if not container.exists():
+        return
+    assert_safe_target(root, container, allow_missing=False, expected_type="dir")
+    generations = []
+    with os.scandir(container) as entries:
+        for entry in entries:
+            budget.check()
+            if len(generations) >= 3 or not re.fullmatch(r"[0-9a-f]{64}", entry.name) or not entry.is_dir(follow_symlinks=False):
+                raise ValueError("PROJECTION_STORAGE_LIMIT")
+            generation = Path(entry.path)
+            _inspect_generation(root, generation, budget)
+            generations.append(generation)
+    for generation in generations:
+        if generation.name in keep:
+            continue
+        owner, files, directories = _inspect_generation(root, generation, budget)
+        for path in files:
+            budget.check()
+            safe_unlink(generation, path)
+        for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+            budget.check()
+            assert_safe_target(generation, path, allow_missing=False, expected_type="dir")
+            path.rmdir()
+        budget.check()
+        safe_unlink(generation, generation / _GENERATION_OWNER)
+        assert_safe_target(root, generation, allow_missing=False, expected_type="dir")
+        generation.rmdir()
+
+
+def _prepare_generation(root, documents, budget):
+    from .index import build_index
+    budget.check()
+    manifest_hash = hashlib.sha256(documents["manifest.json"]).hexdigest()
+    generation = root / ".projection-generations" / manifest_hash
+    owner = _owner_document(root, documents)
+    owner_raw = _encode(owner)
+    if sum(len(raw) for raw in documents.values()) + len(owner_raw) > _GENERATION_MAX_BYTES or len(documents) + 1 > 120000 or len(owner_raw) > 8 * 1024 * 1024:
+        raise ValueError("PROJECTION_STORAGE_LIMIT")
+    if generation.exists():
+        existing, _, _ = _inspect_generation(root, generation, budget)
+        if existing != owner:
+            raise ValueError("PROJECTION_GENERATION_CONFLICT")
+    else:
+        container = root / ".projection-generations"
+        safe_ensure_directory(container)
+        with os.scandir(container) as entries:
+            for count, _ in enumerate(entries, 1):
+                budget.check()
+                if count >= 3:
+                    raise ValueError("PROJECTION_STORAGE_LIMIT")
+        safe_ensure_directory(generation)
+        _write_bounded(root, generation / _GENERATION_OWNER, owner_raw, budget)
+    for name, raw in documents.items():
+        budget.check()
+        path = generation / name
+        if not path.exists():
+            _write_bounded(generation, path, raw, budget)
+    index = build_index(generation, generation / "index.json", budget=budget)
+    return {"path": generation.relative_to(root).as_posix(), "manifest_sha256": manifest_hash}, index
+
+
+def _mirror_content(reference):
+    return ("# External Intelligence\n\n"
+            "検証済みの生成スナップショットです。\n\n"
+            f"[知識一覧を開く]({reference['path']}/index.md)\n").encode("utf-8")
+
+
+def projection_mirror_status(root):
+    from .index import _load_index_document
+    try:
+        document, _ = _load_index_document(Path(root) / "index.json")
+        descriptor = document.get("projection_generation")
+        if descriptor is None:
+            return "LEGACY"
+        from .index import _resolve_generation, _read_projection_bytes
+        _resolve_generation(Path(root), document)
+        return "CURRENT" if hashlib.sha256(_read_projection_bytes(Path(root) / "index.md")).hexdigest() == descriptor["mirror_sha256"] else "PENDING"
+    except (OSError, ValueError):
+        return "PENDING"
+
+
+def _repair_mirror(root, descriptor, budget):
+    from .index import _read_projection_bytes
+    expected = _mirror_content(descriptor)
+    if hashlib.sha256(expected).hexdigest() != descriptor["mirror_sha256"]:
+        raise ValueError("INDEX_GENERATION_INVALID")
+    target = assert_safe_target(root, root / "index.md", allow_missing=True, expected_type="file")
+    current = _read_projection_bytes(target, budget=budget) if target.exists() else None
+    if current != expected:
+        _write_bounded(root, root / "index.md", expected, budget)
+
+
+def project_events(events: Iterable[Event], knowledge_dir: Path, *, budget=None) -> KnowledgeIndex:
+    if budget is None:
+        return _project_events_legacy(events, knowledge_dir)
+    from .inference.budget import BudgetLedger
+    from .index import build_index, _load_index_document, _read_projection_bytes
+    budget.check()
+    bounded_events = []
+    for event in events:
+        budget.check()
+        bounded_events.append(event)
+        if len(bounded_events) > 50000:
+            raise ValueError("JOURNAL_BOUNDED_LIMIT")
+    root = Path(knowledge_dir)
+    safe_ensure_directory(root)
+    lock = BudgetLedger(root / ".projection-publish.json", operation_budget=budget)
+    descriptor_fd = lock._acquire()
+    try:
+        _ensure_projection_attributes(root, budget)
+        current_document = None
+        current = previous = None
+        if (root / "index.json").exists():
+            current_index = build_index(root, root / "index.json", budget=budget)
+            current_document, _ = _load_index_document(root / "index.json", budget=budget)
+            descriptor = current_document.get("projection_generation")
+            if descriptor is not None:
+                # An interrupted human mirror is repaired before preparing a
+                # later generation. The JSON pointer remains the sole authority.
+                _repair_mirror(root, descriptor, budget)
+                current = {key: descriptor[key] for key in ("path", "manifest_sha256")}
+                previous = descriptor["previous"]
+        documents = {}
+        _project_events_legacy(bounded_events, root, documents=documents, budget=budget)
+        wanted = hashlib.sha256(documents["manifest.json"]).hexdigest()
+        keep = {ref["path"].split("/")[-1] for ref in (current, previous) if ref is not None} | {wanted}
+        if current_document is not None and current is None:
+            # Freeze the first legacy snapshot too: old KnowledgeIndex handles
+            # at root/index.json can resolve their retained manifest identity.
+            legacy = {}
+            manifest = json.loads(_read_projection_bytes(root / "manifest.json", budget=budget))
+            for name in manifest["files"]:
+                relative = _safe_relative(name)
+                if relative is None:
+                    raise ValueError("INDEX_FILE_PATH_INVALID")
+                legacy[name] = _read_projection_bytes(root / relative, budget=budget)
+            legacy["manifest.json"] = _read_projection_bytes(root / "manifest.json", budget=budget)
+            keep.add(hashlib.sha256(legacy["manifest.json"]).hexdigest())
+            _cleanup_generations(root, keep, budget)
+            current, _ = _prepare_generation(root, legacy, budget)
+        _cleanup_generations(root, keep, budget)
+        reference, index = _prepare_generation(root, documents, budget)
+        if current is not None and current["path"] == reference["path"]:
+            prior = previous
+        else:
+            prior = current
+        document = json.loads(documents["index.json"])
+        mirror = _mirror_content(reference)
+        document["projection_generation"] = {**reference, "previous": prior,
+            "mirror_sha256": hashlib.sha256(mirror).hexdigest()}
+        _write_bounded(root, root / "index.json", _encode(document), budget)
+        _repair_mirror(root, document["projection_generation"], budget)
+        return index
+    finally:
+        lock._release(descriptor_fd)
 
 
 __all__ = ["ProjectionResult", "project_events"]

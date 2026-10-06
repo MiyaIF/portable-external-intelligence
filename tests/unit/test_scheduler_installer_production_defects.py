@@ -25,7 +25,10 @@ from ei.task_scheduler import (
 )
 
 
-class SchedulerInstallerProductionDefectTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unittest.TestCase):
     def _scheduler_fixture(self, root: Path):
         engine = root / "engine source"
         knowledge = root / "private knowledge"
@@ -90,8 +93,12 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
             timer_path = unit_dir / f"{TASK_NAME}.timer"
-            service_path.write_text(build_systemd_user_unit(action), encoding="utf-8")
-            timer_path.write_text(build_systemd_user_timer(action), encoding="utf-8")
+            service_bytes = build_systemd_user_unit(action).encode("utf-8")
+            timer_bytes = build_systemd_user_timer(action).encode("utf-8")
+            service_path.write_bytes(service_bytes)
+            timer_path.write_bytes(timer_bytes)
+            self.assertEqual(service_path.read_bytes(), service_bytes)
+            self.assertEqual(timer_path.read_bytes(), timer_bytes)
 
             with (
                 patch.dict(os.environ, {"EI_SYSTEMD_USER_DIR": str(unit_dir)}, clear=False),
@@ -112,8 +119,8 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
             settings, action, python = self._scheduler_fixture(Path(tmp))
             unit_dir = Path(tmp) / "systemd user override"
             unit_dir.mkdir()
-            (unit_dir / f"{TASK_NAME}.service").write_text(build_systemd_user_unit(action), encoding="utf-8")
-            (unit_dir / f"{TASK_NAME}.timer").write_text(build_systemd_user_timer(action), encoding="utf-8")
+            (unit_dir / f"{TASK_NAME}.service").write_bytes(build_systemd_user_unit(action).encode("utf-8"))
+            (unit_dir / f"{TASK_NAME}.timer").write_bytes(build_systemd_user_timer(action).encode("utf-8"))
             python.write_bytes(b"tampered-python-content")
 
             with (
@@ -133,8 +140,12 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
             timer_path = unit_dir / f"{TASK_NAME}.timer"
-            service_path.write_text(build_systemd_user_unit(action), encoding="utf-8")
-            timer_path.write_text(build_systemd_user_timer(action), encoding="utf-8")
+            service_bytes = build_systemd_user_unit(action).encode("utf-8")
+            timer_bytes = build_systemd_user_timer(action).encode("utf-8")
+            service_path.write_bytes(service_bytes)
+            timer_path.write_bytes(timer_bytes)
+            self.assertEqual(service_path.read_bytes(), service_bytes)
+            self.assertEqual(timer_path.read_bytes(), timer_bytes)
             sync_settings = Settings(paths=settings.paths, sync_enabled=True)
 
             with (
@@ -167,8 +178,8 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
             timer_path = unit_dir / f"{TASK_NAME}.timer"
-            service_path.write_text(build_systemd_user_unit(action), encoding="utf-8")
-            timer_path.write_text(build_systemd_user_timer(action), encoding="utf-8")
+            service_path.write_bytes(build_systemd_user_unit(action).encode("utf-8"))
+            timer_path.write_bytes(build_systemd_user_timer(action).encode("utf-8"))
 
             with (
                 patch.dict(os.environ, {"EI_SYSTEMD_USER_DIR": str(unit_dir)}, clear=False),
@@ -191,8 +202,8 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
             timer_path = unit_dir / f"{TASK_NAME}.timer"
-            service_path.write_text(build_systemd_user_unit(action).replace("--json", "--wrong"), encoding="utf-8")
-            timer_path.write_text(build_systemd_user_timer(action), encoding="utf-8")
+            service_path.write_bytes(build_systemd_user_unit(action).replace("--json", "--wrong").encode("utf-8"))
+            timer_path.write_bytes(build_systemd_user_timer(action).encode("utf-8"))
 
             with (
                 patch.dict(os.environ, {"EI_SYSTEMD_USER_DIR": str(unit_dir)}, clear=False),
@@ -259,6 +270,7 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
             non_interactive=True,
             accept_plan=True,
         )
+        self.notification_isolation.allow_notification_helper()
         result = setup(selection)
         self.assertTrue(result.ok, result.to_dict())
         return runtime / "install-manifest.json"
@@ -319,6 +331,7 @@ class SchedulerInstallerProductionDefectTests(unittest.TestCase):
                 accept_plan=True,
             )
 
+            self.notification_isolation.allow_notification_helper()
             with patch("ei.installer.run_doctor", side_effect=RuntimeError("diagnostics unavailable")):
                 result = setup(selection)
 

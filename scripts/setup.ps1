@@ -29,6 +29,9 @@ param(
   [switch]$NoScheduler,
   [switch]$InstallPrerequisites,
   [switch]$CheckOnly,
+  [switch]$VerifyOperation,
+  [switch]$AllowModelTest,
+  [switch]$AllowNotificationTest,
   [switch]$NonInteractive,
   [switch]$AcceptPlan,
   [switch]$SkipVenv,
@@ -75,6 +78,9 @@ if ($Experiment) { $cli += "--experiment" }
 if ($Scheduler) { $cli += "--scheduler" }
 if ($NoScheduler) { $cli += "--no-scheduler" }
 if ($CheckOnly) { $cli += "--check-only" }
+if ($VerifyOperation) { $cli += "--verify-operation" }
+if ($AllowModelTest) { $cli += "--allow-model-test" }
+if ($AllowNotificationTest) { $cli += "--allow-notification-test" }
 if ($NonInteractive) { $cli += "--non-interactive" }
 if ($AcceptPlan) { $cli += "--accept-plan" }
 if ($SkipVenv) { $cli += "--skip-venv" }

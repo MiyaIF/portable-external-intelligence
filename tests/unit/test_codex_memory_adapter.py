@@ -1,11 +1,23 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ei.adapters.codex_memory import CodexMemoryAdapter
 
 
 class CodexMemoryAdapterTests(unittest.TestCase):
+    def test_verified_bytes_reuse_parser_without_reopening_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "memory.md"
+            path.write_text("## Reusable knowledge\n- Verify persisted results\n", encoding="utf-8")
+            raw, metadata = path.read_bytes(), path.stat()
+            expected = list(CodexMemoryAdapter([]).read(path))
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("reopened")), patch.object(Path, "stat", side_effect=AssertionError("restat")):
+                actual = list(CodexMemoryAdapter([]).read_verified(path.absolute(), raw, metadata))
+            self.assertEqual(actual, expected)
+            self.assertTrue(actual[0].stable_record_id)
+
     def test_extracts_reusable_bullets_without_writing_source(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -30,7 +30,97 @@ from ei.retrieve import RetrievalQuery, host_scope_allowed
 from ei.cli import _recall
 
 
-class MultiHostLifecycleTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class MultiHostLifecycleTests(NotificationIsolationMixin, unittest.TestCase):
+    def test_capture_namespace_requires_full_current_manifest_and_is_canonical(self):
+        from dataclasses import replace
+        from ei import operation_runtime as runtime
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            selection = self._selection(root, ("codex-cli", "claude-code"))
+            self.notification_isolation.allow_notification_helper()
+            installed = setup(selection)
+            self.assertTrue(installed.ok, installed.to_dict())
+            settings = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
+            namespace = getattr(runtime, "capture_namespace", None)
+            self.assertTrue(callable(namespace), "trusted shared capture namespace is missing")
+            first = namespace(settings, "codex-cli", budget=runtime.OperationBudget(5000))
+            self.assertIsNotNone(first)
+            other = namespace(settings, "claude-code", budget=runtime.OperationBudget(5000))
+            self.assertNotEqual(first[0], other[0])
+            self.assertEqual(first[1], other[1])
+            document = json.loads(installed.manifest_path.read_text(encoding="utf-8"))
+            document["hosts"]["codex-cli"]["home"] = str(root / "codex-cli-home" / ".")
+            installed.manifest_path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertEqual(first, namespace(settings, "codex-cli", budget=runtime.OperationBudget(5000)))
+            moved = replace(settings.hosts["codex-cli"], hook_config_path=root / "moved-home" / "hooks.json")
+            self.assertIsNone(namespace(replace(settings, hosts={**settings.hosts, "codex-cli": moved}), "codex-cli", budget=runtime.OperationBudget(5000)))
+            document["unexpected"] = True
+            installed.manifest_path.write_text(json.dumps(document), encoding="utf-8")
+            self.assertIsNone(namespace(settings, "codex-cli", budget=runtime.OperationBudget(5000)))
+
+    def test_hook_namespace_does_not_invent_stable_turns_and_move_keeps_old_receipt(self):
+        from ei.hook_entry import normalize_hook_event, handle_normalized_hook
+        from ei.operation_runtime import OperationBudget
+        from ei.capture_ledger import list_receipts
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
+            installed = setup(self._selection(root, ("codex-cli",)))
+            self.assertTrue(installed.ok, installed.to_dict())
+            settings = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
+            for payload in ({}, {"session_id": "session-only"}):
+                result = handle_normalized_hook(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", **payload}, settings), settings, budget=OperationBudget(5000))
+                self.assertTrue(result.continue_work)
+            self.assertTrue(all(item.state == "UNKNOWN" and not item.covered_target_ids for item in list_receipts(settings)))
+            for turn in ("one", "two"):
+                result = handle_normalized_hook(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", "session_id": "session", "turn_id": turn}, settings), settings, budget=OperationBudget(5000))
+                self.assertEqual(result.status, "ok")
+            receipts = tuple(item for item in list_receipts(settings) if item.state != "UNKNOWN")
+            self.assertEqual(len(receipts), 2)
+            self.assertTrue(all(item.state == "WAITING" for item in receipts))
+            before = {path: path.read_bytes() for path in (settings.paths.local_state_dir / "capture").rglob("*.json")}
+            self.assertTrue(before)
+            document = json.loads(installed.manifest_path.read_text(encoding="utf-8"))
+            old_home, new_home = root / "codex-cli-home", root / "moved-codex-home"
+            new_home.mkdir()
+            for key, value in document["hosts"]["codex-cli"].items():
+                if isinstance(value, str):
+                    document["hosts"]["codex-cli"][key] = value.replace(str(old_home), str(new_home))
+            installed.manifest_path.write_text(json.dumps(document), encoding="utf-8")
+            changed = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
+            handle_normalized_hook(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", "session_id": "session", "turn_id": "one"}, changed), changed, budget=OperationBudget(5000))
+            self.assertEqual(len([item for item in list_receipts(changed) if item.state == "WAITING"]), 3)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            self.assertEqual(list(settings.paths.queue_dir.rglob("*.json")), [])
+            self.assertEqual(list(settings.paths.event_dir.rglob("*.json")), [])
+
+    def test_skill_uses_verified_namespace_and_original_budget_without_plaintext_journal(self):
+        from ei.capture import record_agent_observation
+        from ei.key_provider import InMemoryKeyProvider
+        from ei.models import CaptureContext
+        from ei.operation_runtime import OperationBudget
+        from ei.queue import list_queue_items
+        from tests.unit.test_pending_capture import observation
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
+            self.assertTrue(setup(self._selection(root, ("codex-cli",))).ok)
+            settings = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
+            context = CaptureContext("session", "turn", 1, "codex-cli", "codex-compatible")
+            key = InMemoryKeyProvider("test-key", b"s" * 32)
+            with patch("ei.spool.default_key_provider", return_value=key):
+                result = record_agent_observation(observation(), context, settings)
+            self.assertEqual(result.reason_code, "PENDING_SECURED", result)
+            self.assertEqual(len(list_queue_items(settings)), 1)
+            self.assertEqual(list(settings.paths.event_dir.rglob("*.json")), [])
+            with patch("ei.capture.iter_events", side_effect=AssertionError("scan after deadline")):
+                stopped = record_agent_observation(observation(), context, settings, budget=OperationBudget(0))
+            self.assertEqual(stopped.reason_code, "CAPTURE_BUDGET_EXHAUSTED")
+
     def _selection(self, root: Path, hosts: tuple[str, ...]) -> SetupSelection:
         homes = {host: root / f"{host}-home" for host in hosts}
         for home in homes.values():
@@ -88,6 +178,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
     def test_manifest_keeps_hook_ownership_per_host(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             result = setup(self._selection(root, ("codex-cli", "claude-code")))
             self.assertTrue(result.ok, result.to_dict())
             manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
@@ -102,6 +193,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
     def test_doctor_reports_one_organizer_and_each_work_host(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             result = setup(self._selection(root, ("codex-cli", "claude-code")))
             self.assertTrue(result.ok, result.to_dict())
             settings = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime", allow_uninstalled_manifest=True)
@@ -112,6 +204,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
     def test_receipt_for_one_instance_does_not_verify_another_host(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             result = setup(self._selection(root, ("codex-cli", "claude-code")))
             self.assertTrue(result.ok, result.to_dict())
             settings = load_settings(
@@ -166,6 +259,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
                 non_interactive=True,
                 accept_plan=True,
             )
+            self.notification_isolation.allow_notification_helper()
             first = setup(selected)
             self.assertTrue(first.ok, first.to_dict())
             profile_path = root / "runtime" / "host-profiles" / "test-compatible-cli.json"
@@ -208,6 +302,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         host_b = "test-compatible-cli-" + "b"
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             both = self._shared_selection(root, ("codex-cli", host_a, host_b))
             first = setup(both)
             self.assertTrue(first.ok, first.to_dict())
@@ -365,6 +460,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
             # setup deliberately records canonical target paths.
             first_root = Path(first_raw).resolve()
             second_root = Path(second_raw).resolve()
+            self.notification_isolation.allow_notification_helper()
             first = setup(self._shared_selection(first_root, ("codex-cli", host_a, host_b)))
             second = setup(self._shared_selection(second_root, ("codex-cli", host_b, host_a)))
             self.assertTrue(first.ok, first.to_dict())
@@ -421,6 +517,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         host_b = "test-compatible-cli-" + "b"
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             first = setup(self._shared_selection(root, ("codex-cli", host_a, host_b)))
             self.assertTrue(first.ok, first.to_dict())
             first_manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
@@ -437,6 +534,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             both = self._shared_selection(root, ("codex-cli", host_a, host_b))
+            self.notification_isolation.allow_notification_helper()
             first = setup(both)
             self.assertTrue(first.ok, first.to_dict())
             manifest_path = first.manifest_path
@@ -486,6 +584,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
             first_event = next(iter(hooks["hooks"]))
             hooks["hooks"][first_event][0]["hooks"][0]["command"] += " --tampered"
             shared_hook.write_text(json.dumps(hooks, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            self.notification_isolation.reject_notification_helper()
             removed_last = setup(self._shared_selection(root, ("codex-cli",)))
             self.assertFalse(removed_last.ok)
             self.assertEqual(removed_last.reconciliation["status"], "BLOCKED")
@@ -504,6 +603,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             both = self._shared_selection(root, ("codex-cli", host_a, host_b))
+            self.notification_isolation.allow_notification_helper()
             first = setup(both)
             self.assertTrue(first.ok, first.to_dict())
             manifest_path = first.manifest_path
@@ -566,6 +666,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
             root = Path(raw)
             hosts = ("codex-cli", host_a, host_b)
             selection = self._shared_selection(root, hosts)
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
             manifest_path = first.manifest_path
@@ -584,6 +685,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
             context_path = Path(record_a["context_path"])
             context_path.write_text(context_path.read_text(encoding="utf-8") + "\nTAMPERED\n", encoding="utf-8")
 
+            self.notification_isolation.reject_notification_helper()
             result = setup(selection)
             self.assertFalse(result.ok, result.to_dict())
             self.assertEqual(result.reconciliation["status"], "BLOCKED")
@@ -596,6 +698,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         hosts = ("codex-cli", host_a, host_b)
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve()
+            self.notification_isolation.allow_notification_helper()
             first = setup(self._shared_selection(root, hosts))
             self.assertTrue(first.ok, first.to_dict())
             manifest_path = first.manifest_path
@@ -654,6 +757,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         host_b = "test-compatible-cli-" + "b"
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             first = setup(self._shared_selection(root, ("codex-cli", host_a, host_b)))
             self.assertTrue(first.ok, first.to_dict())
             manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
@@ -678,6 +782,7 @@ class MultiHostLifecycleTests(unittest.TestCase):
         hosts = ("codex-cli", host_a, host_b)
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             first = setup(self._shared_selection(root, hosts))
             self.assertTrue(first.ok, first.to_dict())
             manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))

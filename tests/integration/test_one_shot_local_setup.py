@@ -30,7 +30,10 @@ from ei.project import project_events
 from ei.skill_installer import canonical_tree_hash
 
 
-class OneShotLocalSetupTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class OneShotLocalSetupTests(NotificationIsolationMixin, unittest.TestCase):
     def test_update_installs_changed_source_skill_without_mutating_knowledge(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -57,6 +60,7 @@ class OneShotLocalSetupTests(unittest.TestCase):
                 non_interactive=True,
                 accept_plan=True,
             )
+            self.notification_isolation.allow_notification_helper()
             installed = setup(selection)
             self.assertTrue(installed.ok, installed.to_dict())
             manifest_path = runtime / "install-manifest.json"
@@ -95,6 +99,7 @@ class OneShotLocalSetupTests(unittest.TestCase):
                 non_interactive=True,
                 accept_plan=True,
             )
+            self.notification_isolation.allow_notification_helper()
             installed = setup(selection)
             self.assertTrue(installed.ok, installed.to_dict())
             settings = load_settings(
@@ -167,7 +172,7 @@ class OneShotLocalSetupTests(unittest.TestCase):
                     "--json",
                 ],
                 cwd=engine,
-                env={**os.environ, "PYTHONPATH": str(engine / "src")},
+                env=self.notification_child_environment(engine_root=engine),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -191,7 +196,7 @@ class OneShotLocalSetupTests(unittest.TestCase):
                     "--json",
                 ],
                 cwd=engine,
-                env={**os.environ, "PYTHONPATH": str(engine / "src")},
+                env=self.notification_child_environment(engine_root=engine),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -215,7 +220,7 @@ class OneShotLocalSetupTests(unittest.TestCase):
                     "--json",
                 ],
                 cwd=engine,
-                env={**os.environ, "PYTHONPATH": str(engine / "src")},
+                env=self.notification_child_environment(engine_root=engine, allow_notification_helper=True),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -253,6 +258,7 @@ class OneShotLocalSetupTests(unittest.TestCase):
             self.assertFalse(selection.knowledge_root.exists())
             self.assertEqual(checked.knowledge["mode"], "local")
 
+            self.notification_isolation.allow_notification_helper()
             applied = setup(selection)
 
             self.assertTrue(applied.ok, applied.to_dict())

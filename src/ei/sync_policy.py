@@ -96,6 +96,8 @@ def is_managed_path(value: str) -> bool:
         return False
     parts = normalized.split("/")
     root = parts[0].casefold()
+    if normalized == "knowledge/.gitattributes":
+        return True
     if root == "events":
         return len(parts) >= 2 and parts[-1].casefold().endswith(".json")
     if root == "knowledge":

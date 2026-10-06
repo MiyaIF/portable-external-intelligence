@@ -32,6 +32,7 @@ BUILTIN_HOST_ALIASES = {
     "qwen": "qwen-code",
 }
 LEGACY_RESERVED_HOST_IDS = frozenset({"codex-app"})
+CAPTURE_CAPABILITIES = ("lifecycle", "candidate_input", "source_enumeration", "receipt_correlation", "direct_user_display")
 PROFILE_KEYS = frozenset(
     {
         "schema_version",
@@ -62,6 +63,7 @@ class HostProfile:
     hook_config_path: Path
     global_context_path: Path
     skill_roots: tuple[Path, ...]
+    capture_capabilities: tuple[tuple[str, str], ...] = tuple((name, "UNKNOWN") for name in CAPTURE_CAPABILITIES)
 
 
 def is_custom_host_id(value: object) -> bool:
@@ -168,7 +170,11 @@ def _sequence(value: object, *, field: str, executable: bool = False) -> tuple[s
 def build_host_profile(data: Mapping[str, Any], host_home: Path) -> HostProfile:
     """Validate a data-only profile and bind its relative paths to ``host_home``."""
 
-    if not isinstance(data, Mapping) or set(data) != PROFILE_KEYS:
+    if not isinstance(data, Mapping) or set(data) - {"capture_capabilities"} != PROFILE_KEYS:
+        raise _invalid()
+    capabilities = data.get("capture_capabilities", dict.fromkeys(CAPTURE_CAPABILITIES, "UNKNOWN"))
+    if (not isinstance(capabilities, Mapping) or set(capabilities) != set(CAPTURE_CAPABILITIES)
+            or any(not isinstance(value, str) or value not in {"SUPPORTED", "UNSUPPORTED", "UNKNOWN"} for value in capabilities.values())):
         raise _invalid()
     if type(data.get("schema_version")) is not int or data.get("schema_version") != 1:
         raise _invalid()
@@ -199,6 +205,7 @@ def build_host_profile(data: Mapping[str, Any], host_home: Path) -> HostProfile:
         hook_config_path=_bound_path(Path(host_home), hook_config),
         global_context_path=_bound_path(Path(host_home), context),
         skill_roots=skill_roots,
+        capture_capabilities=tuple((name, capabilities[name]) for name in CAPTURE_CAPABILITIES),
     )
 
 
@@ -260,7 +267,7 @@ def install_host_profiles(profile_paths: Sequence[Path], runtime_root: Path) -> 
         if profile.host_id in result:
             raise ValueError("HOST_PROFILE_DUPLICATE")
         result[profile.host_id] = profile
-        documents[profile.host_id] = {key: document[key] for key in sorted(PROFILE_KEYS)}
+        documents[profile.host_id] = {key: document[key] for key in sorted(document)}
     planned_targets: dict[str, Path] = {}
     try:
         for host_id in documents:

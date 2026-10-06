@@ -5,6 +5,7 @@ from typing import Any, Mapping, TYPE_CHECKING
 
 from .canary import read_hook_status
 from .config import load_settings
+from .operation_activation import verify_operation
 from .stdio import write_utf8
 from .task_scheduler import inspect_registered_task
 
@@ -77,7 +78,20 @@ def render_activation(report: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def setup_result_with_guidance(selection: SetupSelection, result: SetupResult, *, interactive: bool = False, check_only: bool = False) -> dict[str, Any]:
+def setup_result_with_guidance(
+    selection: SetupSelection,
+    result: SetupResult,
+    *,
+    interactive: bool = False,
+    check_only: bool = False,
+    verify_operation_requested: bool = False,
+    allow_model_test: bool = False,
+    allow_notification_test: bool = False,
+) -> dict[str, Any]:
+    if any(type(value) is not bool for value in (
+        interactive, check_only, verify_operation_requested, allow_model_test, allow_notification_test,
+    )):
+        raise TypeError("SETUP_OPERATION_BOOLEAN_REQUIRED")
     value = result.to_dict()
     if check_only or value.get("status") == "CHECK_ONLY":
         return value
@@ -93,6 +107,23 @@ def setup_result_with_guidance(selection: SetupSelection, result: SetupResult, *
             report["verification_error"] = "ACTIVATION_STATUS_UNAVAILABLE"
     if interactive:
         write_utf8(render_activation(report))
+        if isinstance(value.get("manifest_path"), str) and not verify_operation_requested:
+            write_utf8("最初の自動運用確認を行いますか？ [y/N]: ", end="")
+            try:
+                verify_operation_requested = input().strip().casefold() in {"y", "yes"}
+            except (EOFError, KeyboardInterrupt):
+                verify_operation_requested = False
+            if verify_operation_requested:
+                write_utf8("選択したAIを使うテストを許可しますか？利用枠を消費する場合があります [y/N]: ", end="")
+                try:
+                    allow_model_test = input().strip().casefold() in {"y", "yes"}
+                except (EOFError, KeyboardInterrupt):
+                    allow_model_test = False
+                write_utf8("OS通知テストを許可しますか？画面に通知が表示される場合があります [y/N]: ", end="")
+                try:
+                    allow_notification_test = input().strip().casefold() in {"y", "yes"}
+                except (EOFError, KeyboardInterrupt):
+                    allow_notification_test = False
         # No receipt/state reads on check-only. Never start a model, fabricate
         # receipts, mutate trust, or interpret the user's answer as verification.
         if isinstance(value.get("manifest_path"), str):
@@ -111,4 +142,36 @@ def setup_result_with_guidance(selection: SetupSelection, result: SetupResult, *
                     write_utf8("状態の再取得に失敗しました。設定は保持しています。setupを再実行して確認できます。")
                 write_utf8(render_activation(report))
     value["activation"] = report
+    if verify_operation_requested:
+        settings = load_settings(
+            engine_root=selection.engine_root or selection.repo_root,
+            knowledge_root=selection.personal_knowledge_root or selection.knowledge_root,
+            runtime_root=selection.runtime_root,
+        )
+        operation = verify_operation(
+            settings,
+            allow_model_test=allow_model_test,
+            allow_notification_test=allow_notification_test,
+        )
+        if interactive and operation.get("notification_send") == "SENT":
+            write_utf8("テスト通知が画面に表示されましたか？ [y/N]: ", end="")
+            try:
+                confirmed = input().strip().casefold() in {"y", "yes"}
+            except (EOFError, KeyboardInterrupt):
+                confirmed = False
+            if confirmed:
+                confirmation = verify_operation(
+                    settings,
+                    allow_model_test=False,
+                    allow_notification_test=False,
+                    confirmed_notification_seen=True,
+                )
+                value["operation_verification"] = {
+                    "initial": operation,
+                    "display_confirmation": confirmation,
+                }
+            else:
+                value["operation_verification"] = operation
+        else:
+            value["operation_verification"] = operation
     return value

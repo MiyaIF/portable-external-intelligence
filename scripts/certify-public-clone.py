@@ -34,7 +34,13 @@ from ei.config import PUBLIC_CLI_HOST_IDS  # noqa: E402
 from ei.ids import canonical_json  # noqa: E402
 from ei.models import Event  # noqa: E402
 from ei.project import project_events  # noqa: E402
-from ei.safe_fs import safe_atomic_write, safe_ensure_directory  # noqa: E402
+from ei.safe_fs import (  # noqa: E402
+    assert_safe_target,
+    safe_atomic_write,
+    safe_ensure_directory,
+    safe_replace,
+    safe_unlink,
+)
 from ei.test_runner import TestRunnerError, discover_test_modules, run_complete_suite  # noqa: E402
 
 
@@ -565,6 +571,56 @@ def _local_lifecycle_commands(
     }
 
 
+def _seed_offline_operation_policy(workspace: Path, runtime: Path) -> Path:
+    """Disable routine OS delivery in the certifier-owned fresh runtime."""
+
+    workspace = Path(workspace).expanduser().absolute()
+    runtime = Path(runtime).expanduser().absolute()
+    if runtime != workspace / "machine runtime 日本語":
+        raise CertificationError("CERTIFICATION_OPERATION_ROOT_INVALID")
+    staging_path: Path | None = None
+    try:
+        assert_safe_target(workspace.parent, workspace, allow_missing=False, expected_type="dir")
+        assert_safe_target(workspace, runtime, allow_missing=True)
+        safe_ensure_directory(runtime, mode=0o700)
+        policy_path = runtime / "automatic-operation.json"
+        assert_safe_target(workspace, policy_path, allow_missing=True)
+        if policy_path.exists() or policy_path.is_symlink():
+            raise CertificationError("CERTIFICATION_OPERATION_POLICY_CONFLICT")
+        policy = {
+            "schema_version": 1,
+            "settings": {
+                "notifications": {"enabled": False, "channel": "os"},
+                "initial_test": {"allow_model_test": False, "allow_notification_test": False},
+            },
+            "evidence": {},
+        }
+        raw = canonical_json(policy)
+        if len(raw) > 65536:
+            raise CertificationError("CERTIFICATION_OPERATION_POLICY_INVALID")
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".automatic-operation-", suffix=".tmp", dir=runtime, delete=False
+        ) as staged_file:
+            staging_path = Path(staged_file.name)
+            staged_file.write(raw)
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
+        safe_replace(workspace, staging_path, workspace, policy_path, source_type="file", replace_existing=False)
+        staging_path = None
+        assert_safe_target(workspace, policy_path, allow_missing=False, expected_type="file")
+        return policy_path
+    except CertificationError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CertificationError("CERTIFICATION_OPERATION_POLICY_UNAVAILABLE") from exc
+    finally:
+        if staging_path is not None:
+            try:
+                safe_unlink(workspace, staging_path, allow_missing=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise CertificationError("CERTIFICATION_OPERATION_POLICY_CLEANUP_FAILED") from exc
+
+
 def _confirmed_uninstall_command(
     command: Sequence[str],
     check_result: Mapping[str, Any],
@@ -826,6 +882,7 @@ def certify(source_value: Path | str, *, offline_fixtures: bool, timeout_seconds
                 "runtime": workspace / "machine runtime 日本語",
                 "homes": workspace / "host homes 日本語",
             }
+            _seed_offline_operation_policy(workspace, roots["runtime"])
             commands = _local_lifecycle_commands(clone, roots, python_executable, homes)
             setup = _step(steps, "setup_apply", lambda: _run([python_executable, *commands["setup"]], cwd=clone, env=environment, timeout=timeout_seconds, code="SETUP_FAILED"))
             setup_result = _completed_json(setup, "SETUP_FAILED")

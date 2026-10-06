@@ -10,6 +10,50 @@ from ei.reconciliation import reconcile_lifecycle
 
 
 class ReconciliationTests(unittest.TestCase):
+    def test_zero_budget_reconciliation_and_diagnostics_do_not_consume_input(self):
+        from ei.operation_runtime import OperationBudget
+        from ei.reconciliation import candidate_diagnostics
+        def forbidden():
+            raise AssertionError("input consumed after deadline")
+            yield
+        with tempfile.TemporaryDirectory() as tmp:
+            for action in (lambda: reconcile_lifecycle(forbidden(), Path(tmp) / "events", budget=OperationBudget(0)),
+                           lambda: candidate_diagnostics(forbidden(), budget=OperationBudget(0))):
+                try:
+                    with self.assertRaises(TimeoutError):
+                        action()
+                except TypeError as exc:
+                    self.fail(str(exc))
+            self.assertFalse((Path(tmp) / "events").exists())
+
+    def test_bounded_lifecycle_append_reuses_deadline_and_replay_finishes_after_interrupt(self):
+        from ei.operation_runtime import OperationBudget
+        from unittest.mock import patch
+        claim = "同じ手順を複数案件で検証し、外部書込み後に保存結果を読み直して数式と値を確かめ、品質と再現性を保ち、再作業を防止する。" * 2
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "events"
+            events = [self._observation(n, claim, f"source-{n}", f"cwd-{n}", f"2026-08-0{n}T00:00:00Z") for n in (1, 2)]
+            for event in events:
+                append_event(event, root)
+            budget = OperationBudget(10000)
+            real_append = append_event
+            calls = []
+            def interrupt(event, event_dir, **kwargs):
+                calls.append(kwargs.get("budget"))
+                value = real_append(event, event_dir, **kwargs)
+                raise TimeoutError("OPERATION_BUDGET_EXHAUSTED")
+            with patch("ei.reconciliation.append_event", side_effect=interrupt):
+                try:
+                    with self.assertRaises(TimeoutError):
+                        reconcile_lifecycle(iter_events(root), root, budget=budget)
+                except TypeError as exc:
+                    self.fail(str(exc))
+            self.assertEqual(calls, [budget])
+            self.assertEqual(sum(event.event_type == "pattern.candidate_created" for event in iter_events(root)), 1)
+            result = reconcile_lifecycle(iter_events(root), root, budget=OperationBudget(10000))
+            self.assertEqual(result.promotion_events, 1)
+            self.assertEqual(sum(event.event_type == "pattern.candidate_created" for event in iter_events(root)), 1)
+
     def _observation(self, index: int, claim: str, source: str, cwd: str, occurred_at: str) -> Event:
         source_digest = "sha256:" + hashlib.sha256(source.encode("utf-8")).hexdigest()
         cwd_digest = "sha256:" + hashlib.sha256(cwd.encode("utf-8")).hexdigest()

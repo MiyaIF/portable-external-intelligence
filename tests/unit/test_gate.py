@@ -39,6 +39,39 @@ def make_isolated_hook_settings(root: Path) -> Settings:
 
 
 class GateTests(unittest.TestCase):
+    def test_budget_is_forwarded_to_queue_and_zero_budget_does_not_mutate(self):
+        from unittest.mock import patch
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            item = enqueue_receipt(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", "session_id": "s1", "turn_id": "t1"}, settings), None, settings, now=NOW)
+            decision = GateDecision("DEFERRED", "QUOTA_EXHAUSTED", next_eligible_at=NOW)
+            with patch("ei.gate.transition_queue_item", return_value=item) as transition:
+                try:
+                    with self.assertRaises(TimeoutError):
+                        apply_gate_decision(decision, item, settings, budget=OperationBudget(0))
+                    transition.assert_not_called()
+                    budget = OperationBudget(1000)
+                    apply_gate_decision(decision, item, settings, budget=budget)
+                except TypeError as exc:
+                    self.fail(str(exc))
+                self.assertIs(transition.call_args.kwargs["budget"], budget)
+
+    def test_bounded_aggregate_rejects_oversized_file_without_reset(self):
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_isolated_hook_settings(Path(tmp))
+            item = enqueue_receipt(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", "session_id": "s1", "turn_id": "t1"}, settings), None, settings, now=NOW)
+            path = Path(settings.paths.runtime_dir) / "gate-aggregate.json"
+            original = b" " * 262145
+            path.write_bytes(original)
+            try:
+                with self.assertRaisesRegex(ValueError, "GATE_AGGREGATE_TOO_LARGE"):
+                    apply_gate_decision(GateDecision("NO", "no_evidence"), item, settings, budget=OperationBudget(1000))
+            except TypeError as exc:
+                self.fail(str(exc))
+            self.assertEqual(path.read_bytes(), original)
+
     def test_yes_decision_reaches_curating_without_raw_body(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))

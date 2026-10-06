@@ -2,8 +2,10 @@ import contextlib
 import io
 import inspect
 import json
+import os
 import shutil
 import sys
+import subprocess
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -24,7 +26,10 @@ def bearer_secret(marker: str) -> str:
     return f"{authorization}: {bearer} {marker}"
 
 
-class CliTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class CliTests(NotificationIsolationMixin, unittest.TestCase):
     def _repo(self, root: Path) -> None:
         (root / "config").mkdir()
         (root / "config" / "defaults.json").write_text('{"retrieval":{"max_chars":5000,"max_results":5}}', encoding="utf-8")
@@ -123,7 +128,60 @@ class CliTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code, 0)
-            self.assertEqual(json.loads(stdout.getvalue())["status"], "discarded")
+            result = json.loads(stdout.getvalue())
+            self.assertEqual(result["status"], "discarded")
+            self.assertEqual(result["knowledge"], "DISCARDED")
+            self.assertEqual(result["association"]["status"], "UNKNOWN")
+
+    def test_ordinary_closeout_without_decision_keeps_provider_route(self):
+        from ei.inference.base import ProviderResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._repo(root)
+            input_path = root / "closeout.json"
+            input_path.write_text(json.dumps({
+                "candidate_id": "legacy-closeout",
+                "title": "Verification before completion",
+                "claim": "After a write, reload the same target and verify the saved value.",
+                "source_ref": "test",
+                "classification": "private-reusable",
+            }), encoding="utf-8")
+            stdout = io.StringIO()
+            with patch(
+                "ei.inference.router.ProviderRouter.generate",
+                return_value=ProviderResult(
+                    "test-provider", "failed", error_code="PROVIDER_UNAVAILABLE",
+                    schema_name="gate-decision",
+                ),
+            ) as generate, contextlib.redirect_stdout(stdout):
+                code = main([
+                    "closeout", "--repo", str(root), "--codex-home", str(root / "codex"),
+                    "--runtime-root", str(root / "runtime"), "--input-json", str(input_path), "--json",
+                ])
+            generate.assert_called_once()
+            self.assertEqual(code, 5, stdout.getvalue())
+            self.assertEqual(json.loads(stdout.getvalue())["knowledge"], "FAILED")
+
+    def test_python_module_closeout_keeps_service_exception_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            engine = Path(__file__).resolve().parents[2]
+            self._repo(root)
+            invalid = root / "closeout.json"
+            invalid.write_text("[]", encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHONPATH"] = os.pathsep.join((str(engine / "src"), str(engine)))
+            result = subprocess.run(
+                [sys.executable, "-B", "-X", "utf8", "-m", "ei.cli", "closeout",
+                 "--repo", str(root), "--codex-home", str(root / "codex"),
+                 "--runtime-root", str(root / "runtime"), "--input-json", str(invalid), "--json"],
+                cwd=engine, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, encoding="utf-8", timeout=15,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertNotIn("Traceback", result.stdout)
+            self.assertEqual(json.loads(result.stdout)["error_code"], "CLOSEOUT_OBJECT_REQUIRED")
     def test_inventory_existing_writes_sanitized_report(self):
         fixture = Path("tests/fixtures/migration/legacy-memory-repo")
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,21 +292,48 @@ class CliTests(unittest.TestCase):
     def test_already_current_check_only_json_exposes_no_mutation_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with contextlib.redirect_stdout(io.StringIO()):
-                first_code = main([*self._setup_arguments(root), "--non-interactive", "--accept-plan", "--json"])
-            self.assertEqual(first_code, 0)
+            helper = installer_module._run_windows_notification_registration
+            with patch.object(installer_module, "_run_windows_notification_registration", wraps=helper) as notification_helper:
+                self.notification_isolation.allow_notification_helper()
+                try:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        first_code = main([*self._setup_arguments(root), "--non-interactive", "--accept-plan", "--json"])
+                finally:
+                    self.notification_isolation.reject_notification_helper()
+                self.assertEqual(first_code, 0)
+                if sys.platform == "win32":
+                    self.assertGreater(notification_helper.call_count, 0)
+                else:
+                    notification_helper.assert_not_called()
+                notification_helper.reset_mock()
 
-            output = io.StringIO()
-            with contextlib.redirect_stdout(output):
-                code = main([*self._setup_arguments(root), "--non-interactive", "--accept-plan", "--check-only", "--json"])
-            self.assertEqual(code, 0, output.getvalue())
-            payload = json.loads(output.getvalue())
-            self.assertEqual(payload["status"], "CHECK_ONLY")
-            self.assertEqual(payload["reconciliation"]["status"], "ALREADY_CURRENT")
-            self.assertEqual(payload["plan"], [])
-            self.assertFalse(
-                any(item.get("action") in {"create", "update", "remove", "create-or-update"} for item in payload["plan"])
-            )
+                def snapshot_tree():
+                    snapshot = {}
+                    for path in root.rglob("*"):
+                        relative = path.relative_to(root).as_posix()
+                        if path.is_symlink():
+                            snapshot[relative] = ("symlink", str(path.readlink()))
+                        elif path.is_dir():
+                            snapshot[relative] = ("directory", None)
+                        elif path.is_file():
+                            snapshot[relative] = ("file", path.read_bytes())
+                    return snapshot
+
+                before_check_only = snapshot_tree()
+
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    code = main([*self._setup_arguments(root), "--non-interactive", "--accept-plan", "--check-only", "--json"])
+                self.assertEqual(code, 0, output.getvalue())
+                notification_helper.assert_not_called()
+                self.assertEqual(snapshot_tree(), before_check_only, "check-only changed the prepared setup tree")
+                payload = json.loads(output.getvalue())
+                self.assertEqual(payload["status"], "CHECK_ONLY")
+                self.assertEqual(payload["reconciliation"]["status"], "ALREADY_CURRENT")
+                self.assertEqual(payload["plan"], [])
+                self.assertFalse(
+                    any(item.get("action") in {"create", "update", "remove", "create-or-update"} for item in payload["plan"])
+                )
 
     def test_noninteractive_apply_without_accept_plan_is_rejected_before_mutation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -260,6 +345,86 @@ class CliTests(unittest.TestCase):
             self.assertEqual(json.loads(output.getvalue())["error_code"], "SETUP_PLAN_ACCEPTANCE_REQUIRED")
             self.assertFalse((root / "private knowledge").exists())
             self.assertFalse((root / "runtime").exists())
+
+    def _run_resume_organizer_cli(self, *, dry_run: bool):
+        from datetime import datetime, timezone
+        from ei.gate import GateDecision
+        from ei.organizer_recovery import OrganizerRecovery
+        from ei.setup_contract import OrganizerSelection
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = Path(tmp) / "runtime"
+            runtime.mkdir()
+            organizer = OrganizerSelection("READY", "ollama", None)
+            settings = SimpleNamespace(organizer=organizer, paths=SimpleNamespace(runtime_dir=runtime))
+            config = {}
+            binding = "sha256:" + cli_module.stable_hash({"organizer": organizer.to_dict(), "config": config})
+            state_path = runtime / ("organizer-" + cli_module.stable_hash("ollama") + ".json")
+            seeded = OrganizerRecovery(state_path, "ollama", config_fingerprint=binding)
+            seeded.run(lambda: GateDecision("FAILED", "AUTH_FAILED", provider_id="ollama"),
+                datetime(2026, 9, 25, tzinfo=timezone.utc))
+            before = state_path.read_bytes()
+
+            class Provider:
+                provider_id = "ollama"
+                enabled = True
+
+                def available(self):
+                    raise AssertionError("Resume must not probe availability")
+
+                def generate(self, *args, **kwargs):
+                    raise AssertionError("Resume must not invoke inference")
+
+                def repair_auth(self):
+                    raise AssertionError("Resume must not clear a provider latch itself")
+
+            provider = Provider()
+
+            class Router:
+                def __init__(self, *, settings):
+                    self.organizer = settings.organizer
+                    self.config = config
+                    self.selected_calls = 0
+
+                def selected(self):
+                    self.selected_calls += 1
+                    return provider
+
+            output = io.StringIO()
+            argv = ["resume-organizer", "--repo", tmp, "--runtime-root", str(runtime), "--json"]
+            if dry_run:
+                argv.append("--dry-run")
+            router_calls = []
+
+            def make_router(*, settings):
+                router = Router(settings=settings)
+                router_calls.append(router)
+                return router
+
+            with patch.object(cli_module, "_settings", return_value=settings), \
+                    patch.object(cli_module, "ProviderRouter", side_effect=make_router), \
+                    patch("builtins.input", side_effect=AssertionError("Resume must not prompt")), \
+                    patch("ei.cli.subprocess.run", side_effect=AssertionError("Resume must not spawn")), \
+                    patch("ei.cli.subprocess.Popen", side_effect=AssertionError("Resume must not spawn")), \
+                    contextlib.redirect_stdout(output):
+                code = main(argv)
+
+            result = json.loads(output.getvalue())
+            self.assertEqual(code, 0)
+            self.assertEqual(result["status"], "RETRY_REQUESTED")
+            self.assertEqual(result["provider_id"], "ollama")
+            self.assertEqual(router_calls[0].selected_calls, 1)
+            if dry_run:
+                self.assertEqual(state_path.read_bytes(), before)
+            else:
+                self.assertNotEqual(state_path.read_bytes(), before)
+                self.assertEqual(OrganizerRecovery(state_path, "ollama", config_fingerprint=binding).snapshot()["retry_request"]["provider_id"], "ollama")
+
+    def test_resume_organizer_only_records_explicit_retry(self):
+        self._run_resume_organizer_cli(dry_run=False)
+
+    def test_resume_organizer_dry_run_does_not_write_or_probe(self):
+        self._run_resume_organizer_cli(dry_run=True)
 
     def test_noninteractive_setup_requires_explicit_organizer_and_work_host(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -517,6 +682,7 @@ class CliTests(unittest.TestCase):
             self.assertTrue(selection.accept_plan)
 
     def test_status_separates_one_organizer_from_all_work_hosts_and_queue(self):
+        from tests.unattended_helpers import make_settings
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest_path = root / "runtime" / "install-manifest.json"
@@ -531,25 +697,14 @@ class CliTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            paths = SimpleNamespace(
-                install_manifest_path=manifest_path,
-                local_state_dir=root / "state",
-                runtime_root=root / "runtime",
-                event_dir=root / "events",
-            )
-            settings = SimpleNamespace(
-                paths=paths,
-                hosts={},
-                sync_enabled=False,
-                experiment_enabled=False,
-                experiment_id="retrieval-v1",
-            )
+            settings = make_settings(root)
+            before = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
             output = io.StringIO()
             with patch("ei.cli._status_host", side_effect=lambda _settings, _manifest, host_id: {"host_id": host_id, "hook": {}, "skill": {}, "capture_primary": "NATIVE_SOURCE"}), patch(
-                "ei.cli.queue_health", return_value=SimpleNamespace(to_dict=lambda: {"status": "ready"})
-            ), patch("ei.cli.spool_health", return_value=SimpleNamespace(to_dict=lambda: {"status": "ready"})), patch(
+                "ei.cli.queue_health", side_effect=AssertionError("status must not refresh queue state")
+            ), patch("ei.cli.spool_health", side_effect=AssertionError("status must not refresh spool state")), patch(
                 "ei.cli._capture_health", return_value={"status": "ready"}
-            ), patch("ei.cli._provider_status", return_value={"status": "ready"}), patch(
+            ), patch("ei.cli.ProviderRouter", side_effect=AssertionError("status provider probe")), patch(
                 "ei.cli._projection_status", return_value={"status": "ready"}
             ), patch("ei.cli.team_status_snapshot", return_value={"status": "DISABLED"}), patch(
                 "ei.cli.measurement_paths", return_value={"exposures": root / "e", "outcomes": root / "o"}
@@ -560,7 +715,9 @@ class CliTests(unittest.TestCase):
             self.assertEqual(value["organizer"]["provider_id"], "subscription-cli")
             self.assertEqual(value["organizer"]["host_id"], "codex-cli")
             self.assertEqual(value["work_hosts"], ["codex-cli", "claude-code"])
-            self.assertEqual(value["queue"], {"status": "ready"})
+            self.assertEqual(value["queue"], {"status": "UNKNOWN", "pending_count": None, "source": "bounded_custody_cache"})
+            self.assertIsNone(value["spool"]["pending_bytes"])
+            self.assertEqual({path: path.read_bytes() for path in root.rglob("*") if path.is_file()}, before)
 
     def test_interactive_wizard_builds_custom_profile_without_writing_before_approval(self):
         class Tty(io.StringIO):
@@ -605,6 +762,7 @@ class CliTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            self.notification_isolation.allow_notification_helper()
             user_home = root / "user-home"
             codex_home = root / "codex-home"
             custom_home = root / "custom-home"
@@ -615,9 +773,9 @@ class CliTests(unittest.TestCase):
                 "1", "1", "1", "yes", "new", "1", "Test Compatible CLI",
                 "test-compatible", str(custom_home), ".config/test/settings.json",
                 ".config/test/context.md", ".config/test/skills", "1", str(personal),
-                "", "yes", str(team), "member-a", "no", "no", "yes", "",
+                "", "yes", str(team), "member-a", "no", "no", "yes", "no", "",
             ]
-            second_answers = ["", "", "", "no", "", "", "", "", "yes", ""]
+            second_answers = ["", "", "", "no", "", "", "", "", "yes", "no", ""]
             args = [
                 "setup", "--repo", str(Path.cwd()), "--host-home", f"codex-cli={codex_home}",
                 "--python-exe", sys.executable, "--skip-venv",
@@ -666,6 +824,7 @@ class CliTests(unittest.TestCase):
     def test_public_setup_installs_synthetic_profile_and_persists_custom_host(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            self.notification_isolation.allow_notification_helper()
             profile = root / "test-compatible-cli.profile.json"
             profile.write_text(
                 json.dumps(
@@ -852,6 +1011,7 @@ class CliTests(unittest.TestCase):
                     accept_plan=True,
                 )
 
+            self.notification_isolation.allow_notification_helper()
             first = installer_setup(selection())
             self.assertTrue(first.ok, first.to_dict())
             runtime_profile = runtime / "host-profiles" / "test-compatible-cli.json"
@@ -926,6 +1086,7 @@ class CliTests(unittest.TestCase):
                 accept_plan=True,
             )
             settings = _settings_for_selection(selection)
+            self.notification_isolation.allow_notification_helper()
             installed = installer_setup(selection)
             self.assertTrue(installed.ok, installed.to_dict())
             manifest_path = runtime / "install-manifest.json"

@@ -172,6 +172,9 @@ class SourceRecord:
     candidate_text: str | None = None
     source_host_id: str = ""
     source_host_family: str = ""
+    stable_record_id: str = ""
+    session_id: str = ""
+    turn_id: str = ""
 
     def __post_init__(self) -> None:
         text_fields = (
@@ -190,6 +193,9 @@ class SourceRecord:
             self.provenance_key,
             self.source_host_id,
             self.source_host_family,
+            self.stable_record_id,
+            self.session_id,
+            self.turn_id,
         )
         if any(not isinstance(value, str) for value in text_fields):
             raise TypeError("SOURCE_RECORD_TEXT_INVALID")
@@ -242,6 +248,13 @@ class SourceAdapter(Protocol):
         ...
 
     def read(self, source: Path) -> Iterable[SourceRecord]:
+        ...
+
+    def accepts_path(self, source: Path) -> bool:
+        ...
+
+    def read_verified(self, source: Path, content: bytes, metadata: os.stat_result) -> Iterable[SourceRecord]:
+        """Parse already verified bytes without any filesystem access."""
         ...
 
     def iter_records(self, cursor: Mapping[str, Any]) -> Iterable[SourceRecord]:

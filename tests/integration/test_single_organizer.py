@@ -12,11 +12,14 @@ from ei.cli import _recall
 from ei.config import RuntimePaths, Settings
 from ei.doctor import _settings_check
 from ei.inference.base import InferenceBudget, ProviderResult
+from ei.inference.budget import BudgetLedger
 from ei.inference.router import ProviderRouter
+from ei.ids import stable_hash
 from ei.key_provider import InMemoryKeyProvider
 from ei.maintainer import drain_queue
 from ei.queue import QueueState, enqueue_receipt, queue_health, read_queue_item, transition_queue_item
-from ei.spool import write_spool
+from ei.spool import read_spool, write_spool
+from ei.organizer_recovery import OrganizerRecovery
 from ei.setup_contract import OrganizerSelection
 from ei.hooks.registry import normalize_hook_event
 from ei.models import Event
@@ -70,13 +73,16 @@ class SingleOrganizerIntegrationTests(unittest.TestCase):
         self.addCleanup(provider_patch.stop)
 
     def test_selected_organizer_failure_does_not_call_other_provider(self):
-        selected = CountingProvider("ollama", ProviderResult("ollama", "failed", error_code="PROVIDER_UNAVAILABLE"))
-        other = CountingProvider("subscription-cli", ProviderResult("subscription-cli", output={"decision": "YES"}))
-        router = ProviderRouter([selected, other], organizer=OrganizerSelection("READY", "ollama", None))
-        result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget())
-        self.assertEqual(result.error_code, "PROVIDER_UNAVAILABLE")
-        self.assertEqual(selected.calls, 1)
-        self.assertEqual(other.calls, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = isolated_settings(Path(tmp))
+            selected = CountingProvider("ollama", ProviderResult("ollama", "failed", error_code="PROVIDER_UNAVAILABLE"))
+            other = CountingProvider("subscription-cli", ProviderResult("subscription-cli", output={"decision": "YES"}))
+            router = ProviderRouter([selected, other], organizer=settings.organizer, budget_ledger=BudgetLedger(settings))
+            result = router.generate("gate", "gate-decision", {"candidate": "safe"},
+                InferenceBudget(max_input_tokens=1000, max_output_tokens=1000))
+            self.assertEqual(result.error_code, "PROVIDER_UNAVAILABLE")
+            self.assertEqual(selected.calls, 1)
+            self.assertEqual(other.calls, 0)
 
     def test_queue_health_reports_new_non_destructive_states(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -280,25 +286,37 @@ class SingleOrganizerIntegrationTests(unittest.TestCase):
             )
             start = datetime(2026, 9, 9, tzinfo=timezone.utc)
 
-            states = []
-            for claim_number in range(3):
-                drain_queue(
-                    settings,
-                    provider=provider,
-                    max_items=1,
-                    now=start + timedelta(seconds=300 * claim_number),
-                )
-                current = read_queue_item(item.queue_id, settings)
-                states.append((current.state, current.attempts))
-
-            self.assertEqual(
-                states,
-                [
-                    (QueueState.FAILED_RETRYABLE, 1),
-                    (QueueState.FAILED_RETRYABLE, 2),
-                    (QueueState.FAILED_NEEDS_ATTENTION, 3),
-                ],
+            # Early drains do not claim; after needs_action a due claim may
+            # defer again, but must not perform another provider call.
+            cases = (
+                (0, 1, 1, 300, False),
+                (300, 2, 2, 1200, False),
+                (600, 2, 2, 1200, False),
+                (1200, 3, 3, 4800, True),
+                (4800, 4, 3, 26400, True),
+                (4801, 4, 3, 26400, True),
             )
+            for elapsed, claims, calls, due, needs_action in cases:
+                with self.subTest(elapsed=elapsed):
+                    moment = start + timedelta(seconds=elapsed)
+                    drain_queue(settings, provider=provider, max_items=1, now=moment)
+                    current = read_queue_item(item.queue_id, settings)
+                    self.assertEqual(current.state, QueueState.DEFERRED)
+                    self.assertEqual(current.attempts, claims)
+                    self.assertEqual(provider.calls, calls)
+                    self.assertEqual(datetime.fromisoformat(current.next_eligible_at), start + timedelta(seconds=due))
+                    self.assertEqual(current.payload_ref, payload_ref)
+                    self.assertIn("claim", json.loads(read_spool(current.payload_ref, settings, now=moment)))
+                    # Reconstruct the reader to assert durable provider state.
+                    recovery = OrganizerRecovery(
+                        settings.paths.runtime_dir / ("organizer-" + stable_hash("ollama") + ".json"), "ollama")
+                    state = recovery.snapshot()
+                    self.assertEqual(state["attempts"], calls)
+                    self.assertEqual(state["malformed_attempts"], calls)
+                    self.assertEqual(state["needs_action"], needs_action)
+                    self.assertEqual(state["reason_code"], "MALFORMED_RESPONSE")
+                    provider_due = min(due, 4800)
+                    self.assertEqual(datetime.fromisoformat(state["next_eligible_at"]), start + timedelta(seconds=provider_due))
             self.assertEqual(provider.calls, 3)
 
     def test_doctor_validates_curation_retry_policy_from_defaults(self):

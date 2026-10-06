@@ -17,9 +17,13 @@ from ei.task_scheduler import (
 )
 from ei.config import RuntimePaths, Settings
 from ei.setup_activation import activation_report, setup_result_with_guidance
+import ei.cli as ei_cli
 
 
-class SetupOnboardingTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class SetupOnboardingTests(NotificationIsolationMixin, unittest.TestCase):
     def test_explicit_no_scheduler_is_retained_in_legacy_wizard(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -49,6 +53,7 @@ class SetupOnboardingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             selection = SetupSelection(engine_root=Path.cwd(), knowledge_root=root / "knowledge", runtime_root=root / "runtime", hosts=("codex-cli",), host_homes={"codex-cli": root / "host"}, organizer_provider="subscription-cli", organizer_host="codex-cli", skip_venv=True, python_exe=Path(sys.executable), non_interactive=True, accept_plan=True)
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
             second = setup(selection)
@@ -65,7 +70,7 @@ class SetupOnboardingTests(unittest.TestCase):
     def test_user_acknowledgement_does_not_verify_hook(self):
         selection = SetupSelection(hosts=("codex-cli",), scheduler=False)
         result = SetupResult(ok=True, status="SETUP_COMPLETE", manifest_path=Path("fixture-manifest.json"))
-        with patch("builtins.input", return_value="yes"), patch("ei.setup_activation.read_hook_status", side_effect=AssertionError("no receipt requested")), contextlib.redirect_stdout(io.StringIO()):
+        with patch("builtins.input", side_effect=["no", "yes"]), patch("ei.setup_activation.read_hook_status", side_effect=AssertionError("no receipt requested")), patch("ei.setup_activation.verify_operation", side_effect=AssertionError("no test consent")), contextlib.redirect_stdout(io.StringIO()):
             value = setup_result_with_guidance(selection, result, interactive=True)
         self.assertEqual(value["activation"]["hooks"][0]["status"], "UNVERIFIED")
         self.assertEqual(value["activation"]["maintenance"]["status"], "DISABLED")
@@ -74,6 +79,7 @@ class SetupOnboardingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             selection = SetupSelection(engine_root=Path.cwd(), knowledge_root=root / "knowledge", runtime_root=root / "runtime", hosts=("codex-cli",), host_homes={"codex-cli": root / "host"}, organizer_provider="subscription-cli", organizer_host="codex-cli", skip_venv=True, python_exe=Path(sys.executable), non_interactive=True, accept_plan=True)
+            self.notification_isolation.allow_notification_helper()
             result = setup(selection)
             self.assertTrue(result.ok, result.to_dict())
             manifest_before = result.manifest_path.read_bytes()
@@ -81,7 +87,7 @@ class SetupOnboardingTests(unittest.TestCase):
             selection = replace(selection, scheduler=True)
             receipt = {"host_id": "codex-cli", "hook_status": "HOOK_VERIFIED", "static_checks": {"valid": True}, "received_events": ["session.start", "prompt.before", "turn.stop", "session.end"]}
             from types import SimpleNamespace
-            with patch("builtins.input", side_effect=["r", ""]), patch("ei.setup_activation.read_hook_status", return_value=SimpleNamespace(to_dict=lambda: receipt)), patch("ei.setup_activation.inspect_registered_task", return_value={"ok": True, "registered": True}), contextlib.redirect_stdout(io.StringIO()):
+            with patch("builtins.input", side_effect=["no", "r", ""]), patch("ei.setup_activation.read_hook_status", return_value=SimpleNamespace(to_dict=lambda: receipt)), patch("ei.setup_activation.inspect_registered_task", return_value={"ok": True, "registered": True}), contextlib.redirect_stdout(io.StringIO()):
                 value = setup_result_with_guidance(selection, result, interactive=True)
             self.assertEqual(value["activation"]["hooks"][0]["status"], "VERIFIED")
             self.assertEqual(value["activation"]["maintenance"]["status"], "ENABLED")
@@ -110,6 +116,110 @@ class SetupOnboardingTests(unittest.TestCase):
         with patch("builtins.input", side_effect=AssertionError("must not prompt")), patch("ei.setup_activation.read_hook_status", side_effect=AssertionError("must not read/write receipts")):
             value = setup_result_with_guidance(selection, result, interactive=True, check_only=True)
         self.assertNotIn("activation", value)
+
+    def test_check_only_suppresses_explicit_operation_verification_and_all_test_boundaries(self):
+        selection = SetupSelection(hosts=("codex-cli",))
+        result = SetupResult(ok=True, status="CHECK_ONLY")
+        with patch("ei.setup_activation.load_settings", side_effect=AssertionError("check-only must not load or write state")), patch(
+            "ei.setup_activation.verify_operation", side_effect=AssertionError("check-only must not verify")
+        ):
+            value = setup_result_with_guidance(
+                selection,
+                result,
+                check_only=True,
+                verify_operation_requested=True,
+                allow_model_test=True,
+                allow_notification_test=True,
+            )
+        self.assertNotIn("operation_verification", value)
+
+    def test_explicit_operation_verification_passes_only_the_selected_consents(self):
+        from types import SimpleNamespace
+
+        selection = SetupSelection(
+            engine_root=Path("engine"), knowledge_root=Path("knowledge"),
+            runtime_root=Path("runtime"), hosts=("codex-cli",),
+        )
+        result = SetupResult(ok=True, status="SETUP_COMPLETE", manifest_path=Path("manifest.json"))
+        settings = SimpleNamespace()
+        verification = {
+            "automatic_operation": "UNVERIFIED", "notification_send": "NOT_ATTEMPTED",
+            "reason_codes": ["OPERATION_TEST_CONSENT_REQUIRED"], "evidence": {},
+        }
+        with patch("ei.setup_activation.load_settings", return_value=settings) as loader, patch(
+            "ei.setup_activation.verify_operation", return_value=verification
+        ) as verify:
+            value = setup_result_with_guidance(
+                selection, result, verify_operation_requested=True,
+                allow_model_test=True, allow_notification_test=False,
+            )
+        loader.assert_called_once_with(engine_root=Path("engine"), knowledge_root=Path("knowledge"), runtime_root=Path("runtime"))
+        verify.assert_called_once_with(settings, allow_model_test=True, allow_notification_test=False)
+        self.assertEqual(value["operation_verification"], verification)
+
+    def test_installer_cli_forwards_explicit_operation_flags(self):
+        selection = SetupSelection(hosts=("codex-cli",), non_interactive=True)
+        result = SetupResult(ok=True, status="SETUP_COMPLETE")
+        output = io.StringIO()
+        with patch(
+            "sys.argv",
+            ["ei.installer", "--setup", "--non-interactive", "--verify-operation", "--allow-model-test", "--allow-notification-test", "--json"],
+        ), patch("ei.installer._interactive_selection", return_value=selection), patch(
+            "ei.installer.setup", return_value=result
+        ), patch("ei.setup_activation.setup_result_with_guidance", return_value={"ok": True}) as guidance, contextlib.redirect_stdout(output):
+            self.assertEqual(_main(), 0)
+        self.assertTrue(json.loads(output.getvalue())["ok"])
+        self.assertTrue(guidance.call_args.kwargs["verify_operation_requested"])
+        self.assertTrue(guidance.call_args.kwargs["allow_model_test"])
+        self.assertTrue(guidance.call_args.kwargs["allow_notification_test"])
+
+    def test_public_cli_forwards_explicit_operation_flags(self):
+        selection = SetupSelection(hosts=("codex-cli",), non_interactive=True)
+        result = SetupResult(ok=True, status="SETUP_COMPLETE")
+        with patch("ei.cli._interactive_selection", return_value=selection), patch(
+            "ei.cli.installer_setup", return_value=result
+        ), patch("ei.setup_activation.setup_result_with_guidance", return_value={"ok": True}) as guidance, patch(
+            "ei.cli._emit"
+        ):
+            self.assertEqual(ei_cli.main([
+                "setup", "--verify-operation", "--allow-model-test", "--allow-notification-test",
+                "--non-interactive", "--json",
+            ]), 0)
+        self.assertTrue(guidance.call_args.kwargs["verify_operation_requested"])
+        self.assertTrue(guidance.call_args.kwargs["allow_model_test"])
+        self.assertTrue(guidance.call_args.kwargs["allow_notification_test"])
+
+    def test_interactive_setup_collects_independent_model_and_notification_consents(self):
+        from types import SimpleNamespace
+
+        selection = SetupSelection(hosts=("codex-cli",))
+        result = SetupResult(ok=True, status="SETUP_COMPLETE", manifest_path=Path("manifest.json"))
+        settings = SimpleNamespace()
+        initial = {
+            "automatic_operation": "UNVERIFIED", "notification_send": "SENT",
+            "reason_codes": ["NOTIFICATION_DISPLAY_CONFIRMATION_REQUIRED"],
+            "evidence": {"notification": {"send": "SENT", "display": "UNVERIFIED"}},
+        }
+        confirmed = {
+            "automatic_operation": "UNVERIFIED", "notification_send": "NOT_ATTEMPTED",
+            "reason_codes": ["OPERATION_TEST_CONSENT_REQUIRED"],
+            "evidence": {"notification": {"send": "SENT", "display": "VERIFIED"}},
+        }
+        output = io.StringIO()
+        with patch("builtins.input", side_effect=["yes", "no", "yes", "", "yes"]), patch(
+            "ei.setup_activation.load_settings", return_value=settings
+        ), patch("ei.setup_activation.verify_operation", side_effect=[initial, confirmed]
+        ) as verify, contextlib.redirect_stdout(output):
+            value = setup_result_with_guidance(selection, result, interactive=True)
+        self.assertEqual(
+            [call.kwargs for call in verify.call_args_list],
+            [
+                {"allow_model_test": False, "allow_notification_test": True},
+                {"allow_model_test": False, "allow_notification_test": False, "confirmed_notification_seen": True},
+            ],
+        )
+        self.assertEqual(value["operation_verification"]["initial"], initial)
+        self.assertEqual(value["operation_verification"]["display_confirmation"], confirmed)
 
     def test_static_configuration_or_registration_alone_is_not_verification(self):
         report = activation_report(["codex-cli"], [{"host_id": "codex-cli", "hook_status": "HOOK_VERIFIED", "static_checks": {"valid": False}}], {"status": "REGISTERED", "registered": True}, True)
