@@ -1387,3 +1387,11 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 **追加Files（CI失敗の識別）:** `src/ei/test_runner.py`、`tests/unit/test_test_runner.py`。隔離clean-cloneの失敗時、汎用assertion failureにも既存の許可文字・長さ制限内で最初の失敗テスト名をreason codeへ付与する。生のtraceback・本文・絶対パスは診断へ追加せず、既存の明示reason codeと依存・文字コードの分類を維持する。成否・件数・skip・timeoutの扱いは変えない。公開CIのLinux失敗箇所を特定するための診断であり、未特定のテスト不具合を修正済みとは扱わない。
 
 **追加Files（複数CLIの機能fixture）:** `tests/acceptance/test_single_intelligence_multi_cli.py`。公開Windows CIの複数CLI受入試験で、整理AI停止時の候補作成が`CAPTURE_BUDGET_EXHAUSTED`となったことを確認した。この1試験専用の候補作成helperに明示20秒の有限OperationBudgetを渡す。検証目的は共有ナレッジ・整理AIの一意性と停止/再開であり、製品の既定5秒での性能保証ではない。queue・receipt・暗号化・再取得・停止時の保持という既存assertionと、製品の既定budgetやdeadline拒否試験は変更しない。
+
+**追加Files（ビルド依存の脆弱性修正）:** `pyproject.toml`、`requirements-build.in`、`requirements-build.lock`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。公開CIが検出した`GHSA-xmj3-9gf7-h52w`に対応し、`setuptools`の固定バージョンだけを84.0.0から修正版84.1.0へ更新する。pyproject・lock生成入力・lockの3箇所を一致させる。公式配布物のSHA256を確認し、隔離環境でhash付き導入・ビルド・依存監査・対象テストを実行する。他の依存・検査設定・権限は変更しない。差分レビューと固定版全体テスト後に公開ブランチへ反映する。
+
+**追加Files（CI依存監査の残件）:** `requirements-ci.lock`。全lockの監査で判明した`certifi`のPYSEC-2026-4320と`filelock`のCVE-2026-112940/112913/112907に対応し、この2つの間接依存をそれぞれ2026.10.19と4.2.1へ更新する。公式配布物のhashを実体と照合し、依存整合性・対応Python版・3つのlockの脆弱性監査を隔離環境で再確認する。無関係なpinやscanner設定は変えず、互換性問題が見つかった場合は記録して範囲を再検討する。
+
+**追加Files（通知試験の失敗段階の識別）:** `tests/integration/test_unattended_setup.py`。Linux/macOSのPython 3.13で失敗するno-effect通知解除の1ケースに、既存parserで読めるphase付きの有限理由コードを追加する。setup/uninstall結果の最初のerror_codeはprefix込み96文字以内の許可形式のみ採用し、それ以外はUNKNOWNとする。通知status・helper呼出し・receipt残存も固定コードで区別し、元の全assertionを維持する。生本文・絶対パス・tracebackを新しく公開せず、製品処理やskip条件は変更しない。これは原因確定の診断であり、不具合修正完了とは扱わない。
+
+**追加Files（CIジョブの実行時間枠）:** `.github/workflows/compatibility.yml`。Windowsジョブでclean-clone全件検証とhost contractは成功したが、後続acceptance中に35分のジョブ上限へ達したことをGitHubのannotationで確認した。compatibility matrixの上限のみ45分へ変更し、単体moduleのtimeout・製品budget・必須step・最終集約の成功条件は維持する。失敗結果を成功扱いせず、次の同一公開SHAで全step完了を確認する。

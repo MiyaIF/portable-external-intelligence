@@ -5,6 +5,7 @@ import contextlib
 import hashlib
 import io
 import json
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -512,6 +513,10 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 create=True,
             ):
                 installed = setup(selection)
+            if not installed.ok:
+                error_code = installed.errors[0].get("error_code") if installed.errors else None
+                failure_code = f"SETUP_{error_code}" if isinstance(error_code, str) else "SETUP_UNKNOWN"
+                self.fail(failure_code if re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", failure_code) else "SETUP_UNKNOWN")
 
             helper = patch("ei.installer._run_windows_notification_registration", side_effect=AssertionError("no-artifact uninstall must not invoke helper"), create=True)
             with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), helper as called:
@@ -519,6 +524,16 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     installed.manifest_path,
                     UninstallOptions(remove_skills=False, remove_scheduler=False, remove_runtime=True),
                 )
+            if not removed.ok:
+                error_code = removed.errors[0].get("error_code") if removed.errors else None
+                failure_code = f"UNINSTALL_{error_code}" if isinstance(error_code, str) else "UNINSTALL_UNKNOWN"
+                self.fail(failure_code if re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", failure_code) else "UNINSTALL_UNKNOWN")
+            if removed.notification_registration.get("status") != "NOT_OWNED":
+                self.fail("UNINSTALL_NOTIFICATION_STATUS_UNEXPECTED")
+            if called.called:
+                self.fail("UNINSTALL_HELPER_CALLED")
+            if (selection.runtime_root / "windows-notification-ownership.json").exists():
+                self.fail("UNINSTALL_RECEIPT_REMAINS")
 
             self.assertTrue(installed.ok, installed.to_dict())
             self.assertTrue(removed.ok, removed.to_dict())
