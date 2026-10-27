@@ -135,6 +135,45 @@ class ReconciliationTests(unittest.TestCase):
             result = reconcile_lifecycle(list(iter_events(event_dir)), event_dir, now_utc="2027-01-05T00:00:00+00:00")
             self.assertEqual(result.tombstone_events, 1)
 
+    def test_empty_generated_snapshot_reuses_work_and_still_persists_lifecycle(self):
+        class CheckBudget:
+            def __init__(self, max_checks):
+                self.max_checks = max_checks
+                self.checks = 0
+
+            def check(self):
+                self.checks += 1
+                if self.checks > self.max_checks:
+                    raise TimeoutError("OPERATION_BUDGET_EXHAUSTED")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            event_dir = Path(tmp) / "events"
+            claim = "検証済みの再利用可能な判断ルールを、根拠と適用範囲を付けて保存し、後続案件で同じ条件に再利用する"
+            observation = self._observation(1, claim, "source-a", "cwd-a", "2026-01-01T00:00:00+00:00")
+            cluster_id = "cluster_" + content_fingerprint(claim)[:20]
+            pattern_id = "pat_retained"
+            append_event(observation, event_dir)
+            append_event(Event.create("pattern.promoted", "2026-01-02T00:00:00+00:00", "test", "machine", {"cluster_id": cluster_id, "pattern_id": pattern_id, "rule": claim, "classification": "private-reusable"}, event_id="evt_promoted_retained"), event_dir)
+            append_event(Event.create("pattern.deprecated", "2026-01-03T00:00:00+00:00", "test", "machine", {"cluster_id": cluster_id, "pattern_id": pattern_id, "reason": "STALE"}, event_id="evt_deprecated_retained"), event_dir)
+
+            budget = CheckBudget(max_checks=70)
+            result = reconcile_lifecycle(
+                list(iter_events(event_dir)), event_dir,
+                now_utc="2027-01-05T00:00:00+00:00", budget=budget,
+            )
+
+            self.assertEqual(result.tombstone_events, 1)
+            self.assertEqual(result.created_events, 1)
+            event_types = [event.event_type for event in iter_events(event_dir)]
+            self.assertEqual(event_types.count("pattern.tombstoned"), 1)
+            before_replay = [event.event_id for event in iter_events(event_dir)]
+            replay = reconcile_lifecycle(
+                list(iter_events(event_dir)), event_dir,
+                now_utc="2027-01-05T00:00:00+00:00",
+            )
+            self.assertEqual(replay.created_events, 0)
+            self.assertEqual([event.event_id for event in iter_events(event_dir)], before_replay)
+
 
 if __name__ == "__main__":
     unittest.main()

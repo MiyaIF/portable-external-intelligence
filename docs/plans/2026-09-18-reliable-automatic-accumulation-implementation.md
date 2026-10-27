@@ -1419,6 +1419,10 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 
 ## 保守処理の重複読取り削減
 
+### 変更なしのlifecycle集計の再利用
+
+追加対象は `src/ei/reconciliation.py`、`tests/unit/test_reconciliation.py` と本計画書。実機で1件のAI判定は正常完了したが、920clusterのlifecycle処理後にprojectionが期限切れとなった。候補・revisionイベントの生成がない場合にも、同じeventsを二度cluster化してpatternイベントを適用する経路を確認した。`generated` が空の場合に限り、既に計算・適用済みのメモリ上のrecordsを再利用する。生成ありは従来どおり再構築し、lifecycle評価・append-only書込み・budget check・最終full freshness検査を変更しない。新索引・永続cacheは追加しない。期限内の実処理結果と生成あり／なしの保存結果を回帰試験し、対象module・差分レビュー・固定版全件試験後に実機を再確認する。削減秒数と5分以内の完了は実測前に保証しない。
+
 対象は `src/ei/maintainer.py`、`tests/unit/test_maintainer.py`、必要な回帰確認の `tests/integration/test_maintenance.py`、本計画書。既存journalの最初の読取りだけで約48秒を要する実測と、後段の複数回全読取りを踏まえ、reconciliationが正常終了して追加event数が0の場合だけ、検証済みの最初のeventsを再利用する。期限切れの既定値を正常完了と混同せず、追加eventあり・異常終了時は従来の再読取りを維持する。最終freshnessの全読取りと並行変更のSTALE/UNKNOWN判定・同期拒否は維持する。新索引、永続cache、強制昇格、安全検査省略は追加しない。対象回帰テスト・レビュー・固定版全件テスト後に実測し、5分での完了は実測前に保証しない。
 
 ## Windows CIの残存する再開機能試験
@@ -1430,6 +1434,14 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 **追加Files:** `tests/acceptance/test_reliable_automatic_accumulation.py`。次の公開CIで、候補中の命令文がroot・整理AI・通知設定を変更できないことを確認する1ケースが失敗した。具体的なassertionと期限原因はログからは未確定。成功が前提の候補作成にだけ有限20秒のOperationBudgetを明示し、受領・完了の結果に診断を追加する。明示30秒の保守予算、保存・プライバシー・設定不変更・通知禁止の全assertion、他ケース、製品の既定期限は維持する。対象ケース／module、レビュー、固定版全件検証、同一公開SHAのCIで再確認する。
 
 ## Windows取得・復旧の機能fixtureと期限試験の分離
+
+### 追加承認: 機能検証の予算を明示し、期限の検証と分離する
+
+追加対象は `tests/unit/test_capture_recovery.py` と本計画書。固定版の全件試験でfrontier回復のqueueが20件、SECURED receiptが19件となり、queue数だけでloopを抜ける完了判定の不足を確認した。実際の中断段階は未確定のため、実queue保存後のreceipt確定前に一度だけ故障を注入し、同じrecordの再処理が重複なしで保存確認を修復する契約を先に検証する。契約が成立する場合だけ、既存の有限page回数・各page件数・期限・最終assertionを維持し、distinct queue ID20件かつdistinct SECURED receipt20件で完了とする。安全な固定診断を付け、単なる期限延長や19件の許容、製品コードの推測修正はしない。対象試験・独立レビュー後、新しい固定版で全件試験を再実行する。
+
+対象は `tests/integration/test_capture_catchup.py`、`tests/unit/test_capture.py`、`tests/acceptance/test_single_intelligence_multi_cli.py` と本計画書。利用者は個別の秒数延長を繰り返さず、機能試験と期限試験を分ける方針を承認した。catchupのロック解放後の `SOURCE_TIME_LIMIT` は確認済み。他2件の実CIでの失敗assertionは未確定であり、再現probeは期限による先取りが可能なことのみ示す。
+
+この3ファイルでは、機能検証に使う有限20秒のtest-local予算を明示するhelper/定数を設け、成功・session上限・replay・復旧の呼出しが暗黙の製品5秒/10秒に依存しないよう統一する。既に明示されている別目的の時間枠、子プロセス/ロック保持中の制限、byte数制限、意図的期限切れ試験は維持する。製品関数は実物を呼び、時計停止・期限無効化・条件付き成功・skip・retryでの成功偽装は行わない。期限専用の既存検証で保証されない経路だけ、確定的な期限切れ試験を追加する。未知の失敗段階は許可形式の固定stage/reason/count診断で特定する。安全検査・永続化・暗号化・重複防止・再取得の全assertionを維持し、3対象module、差分レビュー、固定ソース全件試験、同一公開SHAのCIで検証する。製品性能の改善や未確定原因の解決とは扱わない。
 
 **Files:** `tests/integration/test_capture_catchup.py`、`tests/integration/test_capture_fallback.py`、`tests/integration/test_closeout_recovery.py`、`tests/integration/test_unattended_operation.py`、fixture引数を追加する `tests/unit/test_closeout_association.py`、本計画書。
 

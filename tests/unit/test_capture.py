@@ -1,3 +1,4 @@
+import re
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,8 +12,24 @@ from ei.dedup import normalize_claim
 from ei.ids import fingerprint, stable_hash
 from ei.journal import append_event, iter_events
 from ei.models import CaptureContext, Event, ObservationInput
+from ei.operation_runtime import OperationBudget
 from tests.helpers import make_hook_settings
 from tests.unattended_helpers import identity
+
+FUNCTIONAL_CAPTURE_BUDGET_MS = 20_000
+
+
+def _functional_capture_budget():
+    return OperationBudget(FUNCTIONAL_CAPTURE_BUDGET_MS)
+
+
+def _capture_diagnostic(result):
+    reason = result.reason_code
+    if not isinstance(reason, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", reason, flags=re.ASCII):
+        reason = "UNKNOWN"
+    created = "true" if result.created is True else "false" if result.created is False else "UNKNOWN"
+    event_id_present = "true" if isinstance(result.event_id, str) and bool(result.event_id) else "false" if result.event_id is None else "UNKNOWN"
+    return f"created={created}; reason={reason}; event_id_present={event_id_present}"
 
 
 class CaptureTests(unittest.TestCase):
@@ -30,10 +47,10 @@ class CaptureTests(unittest.TestCase):
         from tests.unattended_helpers import make_settings
         with tempfile.TemporaryDirectory() as tmp, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"s" * 32)):
             settings = make_settings(Path(tmp))
-            results = [record_agent_observation(*self._skill(settings, n), settings) for n in range(1, 5)]
+            results = [record_agent_observation(*self._skill(settings, n), settings, budget=_functional_capture_budget()) for n in range(1, 5)]
             self.assertEqual([result.created for result in results], [True, True, True, False])
-            self.assertEqual(results[3].reason_code, "SESSION_CAPTURE_LIMIT")
-            replay = record_agent_observation(*self._skill(settings, 1), settings)
+            self.assertEqual(results[3].reason_code, "SESSION_CAPTURE_LIMIT", msg=_capture_diagnostic(results[3]))
+            replay = record_agent_observation(*self._skill(settings, 1), settings, budget=_functional_capture_budget())
             self.assertFalse(replay.created)
             self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY")
             self.assertEqual(replay.event_id, results[0].event_id)
@@ -47,12 +64,12 @@ class CaptureTests(unittest.TestCase):
         from tests.unattended_helpers import make_settings
         with tempfile.TemporaryDirectory() as tmp, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"s" * 32)):
             settings = make_settings(Path(tmp))
-            self.assertTrue(record_agent_observation(*self._skill(settings, 1, trusted=False), settings).created)
-            self.assertTrue(record_agent_observation(*self._skill(settings, 2), settings).created)
+            self.assertTrue(record_agent_observation(*self._skill(settings, 1, trusted=False), settings, budget=_functional_capture_budget()).created)
+            self.assertTrue(record_agent_observation(*self._skill(settings, 2), settings, budget=_functional_capture_budget()).created)
             barrier = Barrier(2)
             def accept(number):
                 barrier.wait(timeout=5)
-                return record_agent_observation(*self._skill(settings, number), settings)
+                return record_agent_observation(*self._skill(settings, number), settings, budget=_functional_capture_budget())
             with ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(accept, (3, 4)))
             self.assertEqual(sum(result.created for result in results), 1)
@@ -68,20 +85,19 @@ class CaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"s" * 32)):
             settings = make_settings(Path(tmp))
             item, context = self._skill(settings, 1)
-            self.assertEqual(accept_candidate(settings, context.capture_identity, item, now=NOW).state, "SECURED")
-            blocked = record_agent_observation(*self._skill(settings, 2), settings)
+            self.assertEqual(accept_candidate(settings, context.capture_identity, item, now=NOW, budget=_functional_capture_budget()).state, "SECURED")
+            blocked = record_agent_observation(*self._skill(settings, 2), settings, budget=_functional_capture_budget())
             self.assertFalse(blocked.created)
             self.assertEqual(blocked.reason_code, "SESSION_CAPTURE_HISTORY_UNKNOWN")
-            self.assertTrue(record_agent_observation(*self._skill(settings, 2, session="unrelated"), settings).created)
+            self.assertTrue(record_agent_observation(*self._skill(settings, 2, session="unrelated"), settings, budget=_functional_capture_budget()).created)
             for n in range(3, 7):
                 item, context = self._skill(settings, n)
-                self.assertEqual(accept_candidate(settings, context.capture_identity, item, now=NOW, origin="NATIVE_SOURCE").state, "SECURED")
+                self.assertEqual(accept_candidate(settings, context.capture_identity, item, now=NOW, origin="NATIVE_SOURCE", budget=_functional_capture_budget()).state, "SECURED")
             self.assertEqual(len(list_queue_items(settings)), 6)
 
     def test_skill_terminal_expired_and_prepared_reservations_keep_session_slots(self):
         from datetime import datetime, timedelta, timezone
         from ei.key_provider import InMemoryKeyProvider
-        from ei.operation_runtime import OperationBudget
         from ei.pending_capture import reconcile_pending
         from ei.queue import QueueState, list_queue_items, transition_queue_item
         from ei.spool import SpoolError, delete_spool
@@ -92,28 +108,29 @@ class CaptureTests(unittest.TestCase):
                 for n in range(1, 4):
                     if mode == "prepared":
                         with patch("ei.pending_capture.write_spool", side_effect=SpoolError("failed")):
-                            self.assertFalse(record_agent_observation(*self._skill(settings, n), settings).created)
+                            result = record_agent_observation(*self._skill(settings, n), settings, budget=_functional_capture_budget())
+                            self.assertFalse(result.created, msg=f"stage=prepared; {_capture_diagnostic(result)}")
                     else:
-                        result = record_agent_observation(*self._skill(settings, n), settings, budget=OperationBudget(20000))
-                        self.assertTrue(result.created, repr(result))
+                        result = record_agent_observation(*self._skill(settings, n), settings, budget=_functional_capture_budget())
+                        self.assertTrue(result.created, msg=f"stage={mode}; {_capture_diagnostic(result)}")
                 if mode == "terminal":
                     for n, item in enumerate(list_queue_items(settings)):
                         if n % 2:
-                            updating = transition_queue_item(item, QueueState.YES_CURATING, settings)
-                            transition_queue_item(updating, QueueState.DONE, settings)
+                            updating = transition_queue_item(item, QueueState.YES_CURATING, settings, budget=_functional_capture_budget())
+                            transition_queue_item(updating, QueueState.DONE, settings, budget=_functional_capture_budget())
                         else:
-                            transition_queue_item(item, QueueState.NO_DISCARDED, settings)
-                        delete_spool(item.payload_ref, settings)
+                            transition_queue_item(item, QueueState.NO_DISCARDED, settings, budget=_functional_capture_budget())
+                        delete_spool(item.payload_ref, settings, budget=_functional_capture_budget())
                 elif mode == "expired":
-                    result = reconcile_pending(settings, now=datetime.now(timezone.utc) + timedelta(days=31))
+                    result = reconcile_pending(settings, now=datetime.now(timezone.utc) + timedelta(days=31), budget=_functional_capture_budget())
                     self.assertEqual(result["expired"], 3)
                 else:
                     self.assertEqual(list_queue_items(settings), ())
-                blocked = record_agent_observation(*self._skill(settings, 4), settings)
-                self.assertEqual(blocked.reason_code, "SESSION_CAPTURE_LIMIT")
-                replay = record_agent_observation(*self._skill(settings, 1), settings)
-                self.assertEqual(replay.created, mode == "prepared")
-                self.assertNotEqual(replay.reason_code, "SESSION_CAPTURE_LIMIT")
+                blocked = record_agent_observation(*self._skill(settings, 4), settings, budget=_functional_capture_budget())
+                self.assertEqual(blocked.reason_code, "SESSION_CAPTURE_LIMIT", msg=f"stage={mode}_reservation; {_capture_diagnostic(blocked)}")
+                replay = record_agent_observation(*self._skill(settings, 1), settings, budget=_functional_capture_budget())
+                self.assertEqual(replay.created, mode == "prepared", msg=f"stage={mode}_replay; {_capture_diagnostic(replay)}")
+                self.assertNotEqual(replay.reason_code, "SESSION_CAPTURE_LIMIT", msg=f"stage={mode}_replay; {_capture_diagnostic(replay)}")
 
     def test_skill_legacy_event_and_same_pending_key_are_not_counted_twice(self):
         import json
@@ -122,17 +139,16 @@ class CaptureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"s" * 32)):
             settings = make_settings(Path(tmp))
             item, context = self._skill(settings, 1)
-            self.assertTrue(record_agent_observation(item, context, settings).created)
+            self.assertTrue(record_agent_observation(item, context, settings, budget=_functional_capture_budget()).created)
             path = next((settings.paths.runtime_dir / "state" / "capture" / "intents").rglob("pending_*.json"))
             agent_key = json.loads(path.read_text(encoding="utf-8"))["admission"]["agent_key"]
             self._append_legacy_direct_event(settings, item, context, key=agent_key)
             for n in (2, 3):
-                self.assertTrue(record_agent_observation(*self._skill(settings, n), settings).created)
-            self.assertEqual(record_agent_observation(*self._skill(settings, 4), settings).reason_code, "SESSION_CAPTURE_LIMIT")
+                self.assertTrue(record_agent_observation(*self._skill(settings, n), settings, budget=_functional_capture_budget()).created)
+            self.assertEqual(record_agent_observation(*self._skill(settings, 4), settings, budget=_functional_capture_budget()).reason_code, "SESSION_CAPTURE_LIMIT")
 
     def test_duplicate_legacy_event_key_uses_one_session_slot(self):
         from ei.key_provider import InMemoryKeyProvider
-        from ei.operation_runtime import OperationBudget
         from tests.unattended_helpers import make_settings
 
         with tempfile.TemporaryDirectory() as tmp, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"s" * 32)):
@@ -141,9 +157,9 @@ class CaptureTests(unittest.TestCase):
             for _ in range(3):
                 self._append_legacy_direct_event(settings, item, context)
             for number in (2, 3):
-                result = record_agent_observation(*self._skill(settings, number), settings, budget=OperationBudget(20000))
-                self.assertTrue(result.created, repr(result))
-            self.assertEqual(record_agent_observation(*self._skill(settings, 4), settings).reason_code, "SESSION_CAPTURE_LIMIT")
+                result = record_agent_observation(*self._skill(settings, number), settings, budget=_functional_capture_budget())
+                self.assertTrue(result.created, _capture_diagnostic(result))
+            self.assertEqual(record_agent_observation(*self._skill(settings, 4), settings, budget=_functional_capture_budget()).reason_code, "SESSION_CAPTURE_LIMIT")
 
     def test_same_skill_key_reuses_original_target_without_new_body_or_coverage(self):
         from ei.key_provider import InMemoryKeyProvider
@@ -156,10 +172,10 @@ class CaptureTests(unittest.TestCase):
                 item, context = self._skill(settings, 1)
                 if state == "prepared":
                     with patch("ei.pending_capture.write_spool", side_effect=SpoolError("failed")):
-                        original = record_agent_observation(item, context, settings)
+                        original = record_agent_observation(item, context, settings, budget=_functional_capture_budget())
                 else:
-                    original = record_agent_observation(item, context, settings)
-                    self.assertTrue(original.created)
+                    original = record_agent_observation(item, context, settings, budget=_functional_capture_budget())
+                    self.assertTrue(original.created, _capture_diagnostic(original))
                     if state == "terminal":
                         transition_queue_item(list_queue_items(settings)[0], QueueState.NO_DISCARDED, settings)
                 changed_item = replace(item, title="changed title only", source_ref="other-source-ref")
@@ -167,7 +183,7 @@ class CaptureTests(unittest.TestCase):
                 intent_root = settings.paths.runtime_dir / "state" / "capture" / "intents"
                 before = {path: path.read_bytes() for path in intent_root.rglob("pending_*.json")}
                 spool_before = {path: path.read_bytes() for path in settings.paths.spool_dir.rglob("pending_*") if path.is_file()}
-                replay = record_agent_observation(changed_item, changed_context, settings)
+                replay = record_agent_observation(changed_item, changed_context, settings, budget=_functional_capture_budget())
                 self.assertFalse(replay.created)
                 self.assertEqual(len(list_queue_items(settings)), 0 if state == "prepared" else 1)
                 self.assertEqual({path: path.read_bytes() for path in intent_root.rglob("pending_*.json")}, before)
@@ -177,7 +193,7 @@ class CaptureTests(unittest.TestCase):
                     self.assertEqual(replay.event_id, original.event_id)
                     self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY")
                 else:
-                    self.assertTrue(record_agent_observation(item, context, settings).created)
+                    self.assertTrue(record_agent_observation(item, context, settings, budget=_functional_capture_budget()).created)
 
     def test_skill_partial_or_mismatched_tag_does_not_ack_and_session_identity_is_checked(self):
         import sqlite3
@@ -190,9 +206,9 @@ class CaptureTests(unittest.TestCase):
             settings = make_settings(Path(tmp))
             item, context = self._skill(settings, 1)
             mismatched = replace(context, capture_identity=replace(context.capture_identity, session_hash=fingerprint("different")))
-            self.assertEqual(record_agent_observation(item, mismatched, settings).reason_code, "CAPTURE_INPUT_INVALID")
+            self.assertEqual(record_agent_observation(item, mismatched, settings, budget=_functional_capture_budget()).reason_code, "CAPTURE_INPUT_INVALID")
             self.assertEqual(list(Path(tmp).iterdir()), [])
-            self.assertTrue(record_agent_observation(item, context, settings).created)
+            self.assertTrue(record_agent_observation(item, context, settings, budget=_functional_capture_budget()).created)
             budget = OperationBudget(5000)
             original = RuntimeCatalog.tagged_paths
             def timeout(catalog, *args, **kwargs):
@@ -207,14 +223,14 @@ class CaptureTests(unittest.TestCase):
                 connection.commit()
             # A returned index entry whose actual metadata is another session
             # cannot establish a count or grant admission.
-            denied = record_agent_observation(*self._skill(settings, 2, session="different"), settings)
+            denied = record_agent_observation(*self._skill(settings, 2, session="different"), settings, budget=_functional_capture_budget())
             self.assertFalse(denied.created)
             self.assertEqual(denied.reason_code, "SESSION_CAPTURE_HISTORY_UNKNOWN")
             with closing(sqlite3.connect(root / ".runtime-catalog.sqlite")) as connection:
                 connection.execute("UPDATE entries SET tag=''")
                 connection.commit()
             before = {path: path.read_bytes() for path in root.rglob("pending_*.json")}
-            denied = record_agent_observation(*self._skill(settings, 2), settings)
+            denied = record_agent_observation(*self._skill(settings, 2), settings, budget=_functional_capture_budget())
             self.assertEqual(denied.reason_code, "SESSION_CAPTURE_HISTORY_UNKNOWN")
             self.assertEqual(before, {path: path.read_bytes() for path in root.rglob("pending_*.json")})
 
@@ -285,8 +301,8 @@ class CaptureTests(unittest.TestCase):
             settings = make_hook_settings(Path(tmp))
             observation = ObservationInput("書込後の再読込", "外部書込後は対象範囲を再読込して数式と値を検証する", "agent_direct", "session-local", "C:/work/project-a", "spreadsheet-operations", "success", "avoided_failure", "private-reusable", source_host_id="codex-cli", source_host_family="codex-compatible")
             context = CaptureContext(session_id="s1", turn_id="t9", capture_index=1, source_host_id="codex-cli", source_host_family="codex-compatible")
-            first = record_agent_observation(observation, context, settings)
-            second = record_agent_observation(observation, context, settings)
+            first = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
+            second = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
             self.assertTrue(first.created)
             self.assertFalse(second.created)
             self.assertEqual(second.reason_code, "IDEMPOTENT_REPLAY")
@@ -301,8 +317,8 @@ class CaptureTests(unittest.TestCase):
             legacy_bytes = legacy_path.read_bytes()
 
             with patch("ei.capture.record_receipt", side_effect=OSError("disk unavailable")):
-                first = record_agent_observation(observation, context, settings)
-                retry_failed = record_agent_observation(observation, context, settings)
+                first = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
+                retry_failed = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
 
             self.assertFalse(first.created)
             self.assertEqual(first.reason_code, "CAPTURE_RECEIPT_DEFERRED")
@@ -314,7 +330,7 @@ class CaptureTests(unittest.TestCase):
             self.assertEqual(waiting.state, "WAITING")
             self.assertEqual(waiting.candidate_ids, ())
 
-            repaired = record_agent_observation(observation, context, settings)
+            repaired = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
 
             self.assertFalse(repaired.created)
             self.assertEqual(repaired.reason_code, "IDEMPOTENT_REPLAY")
@@ -338,7 +354,7 @@ class CaptureTests(unittest.TestCase):
             settings = make_hook_settings(Path(tmp))
             for index in range(1, 5):
                 observation = ObservationInput(f"title-{index}", "これは20文字以上の再利用可能な検証済み判断知識です", "agent_direct", "session-local", "C:/work", "general", "success", "reduced_rework", "private-reusable", source_host_id="codex-cli", source_host_family="codex-compatible")
-                result = record_agent_observation(observation, CaptureContext("s1", f"t{index}", min(index, 3), "codex-cli", "codex-compatible"), settings)
+                result = record_agent_observation(observation, CaptureContext("s1", f"t{index}", min(index, 3), "codex-cli", "codex-compatible"), settings, budget=_functional_capture_budget())
                 if index == 4:
                     self.assertFalse(result.created)
                     self.assertEqual(result.reason_code, "SESSION_CAPTURE_LIMIT")
@@ -346,7 +362,6 @@ class CaptureTests(unittest.TestCase):
 
     def test_same_claim_in_different_scopes_creates_distinct_observations_and_receipts(self):
         from tests.unattended_helpers import make_settings
-        from ei.operation_runtime import OperationBudget
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(Path(tmp))
             context_a = CaptureContext("s1", "t1", 1, "codex-cli", "codex-compatible", replace(identity("a"), session_hash=fingerprint("s1")))
@@ -359,10 +374,10 @@ class CaptureTests(unittest.TestCase):
             from ei.spool import read_spool
             import json
             with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("test", b"t" * 32)):
-                result_a = record_agent_observation(first, context_a, settings, budget=OperationBudget(20000))
-                self.assertTrue(result_a.created, repr(result_a))
-                result_b = record_agent_observation(second, context_b, settings, budget=OperationBudget(20000))
-                self.assertTrue(result_b.created, repr(result_b))
+                result_a = record_agent_observation(first, context_a, settings, budget=_functional_capture_budget())
+                self.assertTrue(result_a.created, _capture_diagnostic(result_a))
+                result_b = record_agent_observation(second, context_b, settings, budget=_functional_capture_budget())
+                self.assertTrue(result_b.created, _capture_diagnostic(result_b))
                 items = list_queue_items(settings)
                 self.assertEqual(len(items), 2)
                 self.assertEqual({item.capture_id for item in items}, {capture_key(context_a.capture_identity), capture_key(context_b.capture_identity)})
@@ -385,7 +400,7 @@ class CaptureTests(unittest.TestCase):
             event, path = self._append_legacy_direct_event(settings, observation, context)
             before = path.read_bytes()
 
-            result = record_agent_observation(observation, context, settings)
+            result = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
 
             self.assertFalse(result.created)
             self.assertEqual(result.event_id, event.event_id)
@@ -401,7 +416,7 @@ class CaptureTests(unittest.TestCase):
             self._append_legacy_direct_event(settings, first, context)
             second = replace(first, cwd="C:/work/b", domain="domain-b")
 
-            result = record_agent_observation(second, context, settings)
+            result = record_agent_observation(second, context, settings, budget=_functional_capture_budget())
 
             self.assertTrue(result.created)
             self.assertEqual(len(list(iter_events(settings.paths.event_dir))), 2)
@@ -413,7 +428,7 @@ class CaptureTests(unittest.TestCase):
             observation = ObservationInput("legacy", "旧キーでも同じ適用範囲の証拠があれば安全に再利用できる判断です", "agent_direct", "source-a", "C:/work/a", "domain-a", "success", "reduced_rework", "private-reusable", source_host_id="codex-cli", source_host_family="codex-compatible")
             self._append_legacy_direct_event(settings, observation, context, include_scope=False)
 
-            result = record_agent_observation(observation, context, settings)
+            result = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
 
             self.assertTrue(result.created)
             self.assertEqual(len(list(iter_events(settings.paths.event_dir))), 2)

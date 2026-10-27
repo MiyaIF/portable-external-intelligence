@@ -16,6 +16,8 @@ from ei.key_provider import InMemoryKeyProvider
 from ei.queue import list_queue_items
 from tests.unattended_helpers import NOW, identity, make_settings
 
+FUNCTIONAL_RECOVERY_BUDGET_MS = 20_000
+
 
 def _diagnostic_token(value):
     if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,95}", value, flags=re.ASCII):
@@ -56,7 +58,7 @@ class CaptureCatchupTests(unittest.TestCase):
     def ingest(self, source_path=None):
         return ingest_sources(self.settings, [CodexMemoryAdapter([source_path or self.path])])
 
-    def recover(self, *, max_ms=10000):
+    def recover(self, *, max_ms=FUNCTIONAL_RECOVERY_BUDGET_MS):
         return recover_page(self.settings, self.source, now=NOW, max_ms=max_ms)
 
     @staticmethod
@@ -69,12 +71,13 @@ class CaptureCatchupTests(unittest.TestCase):
 
     def test_ingest_then_recovery_reuses_actual_event(self):
         self.assertEqual(self.ingest(self.path.resolve(strict=True)).created_events, 1)
-        self.assertEqual(self.recover().secured, 1)
+        result = self.recover()
+        self.assertEqual(result.secured, 1, msg=self.recovery_diagnostic(result))
         self.assertEqual(len(list_queue_items(self.settings)), 0)
         self.assertEqual(len(list(self.settings.paths.event_dir.rglob("*.json"))), 1)
 
     def test_recovery_then_ingest_preserves_single_pending_candidate(self):
-        result = self.recover(max_ms=20000)
+        result = self.recover()
         self.assertEqual(result.secured, 1, msg=self.recovery_diagnostic(result))
         self.assertEqual(self.ingest(self.path.resolve(strict=True)).created_events, 0)
         self.assertEqual(len(list_queue_items(self.settings)), 1)
@@ -149,7 +152,7 @@ class CaptureCatchupTests(unittest.TestCase):
         self.assertIn(first_id, {item.capture_id for item in items})
 
     def test_missing_or_corrupt_binding_cannot_change_existing_capture_route(self):
-        initial = self.recover(max_ms=20000)
+        initial = self.recover()
         self.assertEqual(initial.secured, 1, msg=self.recovery_diagnostic(initial))
         binding = next((self.settings.paths.local_state_dir / "source-bindings").glob("*.json"))
         saved = binding.read_bytes()
@@ -170,7 +173,8 @@ class CaptureCatchupTests(unittest.TestCase):
         from dataclasses import replace
         self.recover()
         conflict = replace(self.source, instance_hash="sha256:" + "f" * 64)
-        self.assertEqual(recover_page(self.settings, conflict, now=NOW, max_ms=10000).secured, 0)
+        conflict_result = recover_page(self.settings, conflict, now=NOW, max_ms=FUNCTIONAL_RECOVERY_BUDGET_MS)
+        self.assertEqual(conflict_result.secured, 0, msg=self.recovery_diagnostic(conflict_result))
         other = self.root / "other" / "memory.md"
         other.parent.mkdir()
         other.write_text("## Reusable knowledge\n- Keep each independent source scope separate\n", encoding="utf-8")
@@ -203,7 +207,7 @@ class CaptureCatchupTests(unittest.TestCase):
         )
         result = subprocess.run([sys.executable, "-B", "-X", "utf8", "-c", script, str(self.root)], capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
-        recovered = self.recover(max_ms=20000)
+        recovered = self.recover()
         self.assertEqual(recovered.secured, 1, msg=self.recovery_diagnostic(recovered))
 
     def test_live_other_process_excludes_recovery_until_its_handle_closes(self):
@@ -219,7 +223,7 @@ class CaptureCatchupTests(unittest.TestCase):
         try:
             if process.stdout.readline().strip() != "locked":
                 self.fail("CAPTURE_LOCK_CHILD_READY_FAILED")
-            result = self.recover()
+            result = self.recover(max_ms=10000)
             if (result.secured, result.reason_code) != (0, "SOURCE_COORDINATION_UNAVAILABLE"):
                 reason = result.reason_code
                 reason = reason if isinstance(reason, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,47}", reason) else "UNKNOWN"

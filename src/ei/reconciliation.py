@@ -401,8 +401,11 @@ def reconcile_lifecycle(events: Iterable[Event], event_dir, now_utc: datetime | 
             append_event(event, event_dir, **({"budget": budget} if budget is not None else {}))
             event_ids.add(event.event_id)
     updated_events = current_events + [event for event in generated if event.event_id not in original_event_ids]
-    updated_records, _ = _cluster_observations(_ordered_events(updated_events, budget), budget)
-    _apply_pattern_events(updated_records, _ordered_events(updated_events, budget), budget)
+    if generated:
+        updated_records, _ = _cluster_observations(_ordered_events(updated_events, budget), budget)
+        _apply_pattern_events(updated_records, _ordered_events(updated_events, budget), budget)
+    else:
+        updated_records = records
     lifecycle_events: list[Event] = []
     for record in _checked(updated_records.values(), budget):
         lifecycle_events.extend(evaluate_lifecycle(record.state, selected_policy, now_utc=now_text))

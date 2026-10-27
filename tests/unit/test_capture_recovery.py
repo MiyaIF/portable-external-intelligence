@@ -417,7 +417,44 @@ class CaptureRecoveryTests(unittest.TestCase):
         page = recover_page(self.settings, source, now=NOW)
         self.assertEqual((page.coverage, page.cursor_committed), ("UNKNOWN", False))
 
+    def test_receipt_write_failure_reuses_persisted_queue_on_recovery(self):
+        from ei.capture_ledger import _record_receipt_locked
+        self.write_memory()
+        original = _record_receipt_locked
+        injected = False
+        persisted_queue_ids = []
+
+        def fail_after_queue_persistence(root, receipt, *, budget=None):
+            nonlocal injected
+            if receipt.state == "SECURED" and not injected:
+                items = list_queue_items(self.settings)
+                self.assertEqual(len(items), 1)
+                persisted_queue_ids.extend(item.queue_id for item in items)
+                self.assertEqual(receipt.candidate_ids, tuple(persisted_queue_ids))
+                injected = True
+                raise OSError("injected receipt write interruption")
+            return original(root, receipt, budget=budget)
+
+        with patch("ei.capture_ledger._record_receipt_locked", side_effect=fail_after_queue_persistence):
+            interrupted = self.recover()
+
+        self.assertTrue(injected)
+        self.assertEqual((interrupted.secured, interrupted.cursor_committed), (0, False))
+        self.assertEqual(interrupted.reason_code, "PENDING_STORAGE_UNAVAILABLE")
+        queued_before = tuple(item.queue_id for item in list_queue_items(self.settings))
+        self.assertEqual(queued_before, tuple(persisted_queue_ids))
+        self.assertEqual(list_receipts(self.settings), ())
+
+        replayed = self.recover()
+        self.assertEqual(replayed.secured, 1)
+        self.assertEqual(tuple(item.queue_id for item in list_queue_items(self.settings)), queued_before)
+        receipts = list_receipts(self.settings)
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].state, "SECURED")
+        self.assertEqual(receipts[0].candidate_ids, queued_before)
+
     def test_frontier_limit_is_explicit_and_restart_with_larger_budget_succeeds(self):
+        from ei.capture_ledger import _record_receipt_locked
         for index in range(20):
             self.write_memory(f"directory-{index:02}/memory.md")
         page = self.recover(max_bytes=100)
@@ -425,16 +462,44 @@ class CaptureRecoveryTests(unittest.TestCase):
         self.assertEqual(page.secured, 0)
         previous_count = 0
         queue_ids = set()
-        for _ in range(20):
-            page = self.recover(max_records=5)
-            self.assertLessEqual(page.scanned, 5)
-            self.assertLessEqual(page.secured, 5)
-            queue_ids = {item.queue_id for item in list_queue_items(self.settings)}
-            self.assertGreaterEqual(len(queue_ids), previous_count)
-            previous_count = len(queue_ids)
-            if len(queue_ids) == 20:
-                break
+        original = _record_receipt_locked
+        receipt_interrupted = False
+        failed_queue_ids = []
+        interrupted_page = None
 
+        def fail_last_receipt_after_queue_persistence(root, receipt, *, budget=None):
+            nonlocal receipt_interrupted
+            if receipt.state == "SECURED" and not receipt_interrupted:
+                persisted_ids = {item.queue_id for item in list_queue_items(self.settings)}
+                if len(persisted_ids) == 20:
+                    self.assertIn(receipt.candidate_ids[0], persisted_ids)
+                    failed_queue_ids.append(receipt.candidate_ids[0])
+                    receipt_interrupted = True
+                    raise OSError("injected receipt write interruption")
+            return original(root, receipt, budget=budget)
+
+        with patch("ei.capture_ledger._record_receipt_locked", side_effect=fail_last_receipt_after_queue_persistence):
+            for _ in range(20):
+                page = self.recover(max_records=5)
+                self.assertLessEqual(page.scanned, 5)
+                self.assertLessEqual(page.secured, 5)
+                if receipt_interrupted and interrupted_page is None:
+                    interrupted_page = page
+                queue_ids = {item.queue_id for item in list_queue_items(self.settings)}
+                self.assertGreaterEqual(len(queue_ids), previous_count)
+                previous_count = len(queue_ids)
+                secured_receipt_ids = {
+                    receipt.capture_id for receipt in list_receipts(self.settings)
+                    if receipt.state == "SECURED"
+                }
+                if len(queue_ids) == 20 and len(secured_receipt_ids) == 20:
+                    break
+
+        self.assertTrue(receipt_interrupted)
+        self.assertEqual(len(failed_queue_ids), 1)
+        self.assertIsNotNone(interrupted_page)
+        self.assertLess(interrupted_page.secured, interrupted_page.scanned)
+        self.assertIn(failed_queue_ids[0], queue_ids)
         self.assertEqual(len(queue_ids), 20)
         self.assertEqual(len(set(queue_ids)), 20)
         receipts = list_receipts(self.settings)
