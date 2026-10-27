@@ -35,6 +35,7 @@ from .safe_fs import assert_safe_target, safe_atomic_write, safe_ensure_director
 
 
 _ALLOWED_SYNC_POLICIES = frozenset({"disabled", "manual", "auto"})
+_MAINTENANCE_MAX_MS = 300000
 _RETRYABLE_PROVIDER_CODES = frozenset({
     "NO_PROVIDER_AVAILABLE", "PROVIDER_DISABLED", "QUOTA_EXHAUSTED",
     "RATE_LIMITED", "PROVIDER_RATE_LIMITED", "PROVIDER_TIMEOUT",
@@ -748,24 +749,34 @@ def _ingest(settings: Any, source_paths: Sequence[Path] | None, errors: list[Map
     from .adapters.gemini import GeminiAdapter
     from .adapters.qwen import QwenAdapter
     verified_types = {CodexMemoryAdapter, RolloutSummaryAdapter, ClaudeAdapter, GeminiAdapter, QwenAdapter}
+    timed_out = [False]
+    def has_time():
+        if budget.remaining_ms() <= 0:
+            timed_out[0] = True
+            return False
+        return True
     def selections():
         if adapters is not None:
             for adapter in adapters:
-                budget.check()
+                if not has_time():
+                    return
                 if type(adapter) not in verified_types:
                     yield None, adapter
                 else:
                     for path in adapter.sources:
-                        budget.check()
+                        if not has_time():
+                            return
                         yield Path(path), adapter
             return
         values = source_paths
         if values is None:
             default = Path(settings.paths.codex_home) / "memories"
-            budget.check()
+            if not has_time():
+                return
             values = (default,) if default.exists() else ()
         for raw in values:
-            budget.check()
+            if not has_time():
+                return
             path = Path(raw).expanduser().absolute()
             if path.suffix.casefold() in {".md", ".jsonl"} or path.is_file():
                 yield path, _adapter(path)
@@ -775,7 +786,8 @@ def _ingest(settings: Any, source_paths: Sequence[Path] | None, errors: list[Map
     results: list[Mapping[str, Any]] = []
     created = skipped = parse_skipped = rejected = 0
     for path, adapter in selections():
-        budget.check()
+        if not has_time():
+            break
         source_id = _hash("maintenance-" + stable_hash([getattr(adapter, "host_id", "unknown"), str(path)]))
         try:
             if path is None:
@@ -808,10 +820,13 @@ def _ingest(settings: Any, source_paths: Sequence[Path] | None, errors: list[Map
             if row["status"] == "partial":
                 errors.append({"stage": "ingest", "source_id_hash": row["source_id_hash"], "error_code": result.reason_code if result.reason_code != "SOURCE_CORRELATION_UNKNOWN" else "SOURCE_PARTIAL"})
         except TimeoutError:
-            raise
+            timed_out[0] = True
+            break
         except (OSError, UnicodeError, ValueError, TypeError) as exc:
             results.append({"source_id_hash": source_id, "status": "failed", "error_code": _safe_code(str(exc), "SOURCE_READ_UNAVAILABLE")})
             errors.append({"stage": "ingest", "source_id_hash": source_id, "error_code": _safe_code(str(exc), "SOURCE_READ_UNAVAILABLE")})
+    if timed_out[0] and not any(row.get("stage") == "source_recovery" and row.get("error_code") == "OPERATION_BUDGET_EXHAUSTED" for row in errors):
+        errors.append({"stage": "source_recovery", "error_code": "OPERATION_BUDGET_EXHAUSTED"})
     return len(results), created, skipped, parse_skipped, rejected, tuple(results)
 
 
@@ -1293,7 +1308,7 @@ def run_maintenance(
     source_paths: Sequence[Path] | None = None,
     provider: Any | None = None,
     max_queue_items: int = 100,
-    time_budget_ms: int = 30000,
+    time_budget_ms: int = _MAINTENANCE_MAX_MS,
     sync_policy: str = "disabled",
     now: datetime | None = None,
     orphan_host_id: str | None = None,
@@ -1304,39 +1319,71 @@ def run_maintenance(
     if sync_policy not in _ALLOWED_SYNC_POLICIES:
         raise ValueError("SYNC_POLICY_INVALID")
     max_queue_items = _bounded_int(max_queue_items, "MAX_QUEUE_ITEMS", 1, 10000)
-    time_budget_ms = _bounded_int(time_budget_ms, "TIME_BUDGET_MS", 0, 600000)
+    time_budget_ms = _bounded_int(time_budget_ms, "TIME_BUDGET_MS", 0, _MAINTENANCE_MAX_MS)
     started_clock = time.monotonic()
-    budget = budget if budget is not None else OperationBudget(time_budget_ms, deadline=started_clock + time_budget_ms / 1000)
+    parent_budget = budget if budget is not None else OperationBudget(
+        time_budget_ms, deadline=started_clock + time_budget_ms / 1000,
+    )
+    budget = OperationBudget(min(time_budget_ms, parent_budget.remaining_ms()), deadline=parent_budget.deadline)
+    effective_budget = budget
+    initial_budget_ms = budget.remaining_ms()
+
+    def child_budget(parent, *, cap_ms=None, reserve_ms=0):
+        allowance = max(0, parent.remaining_ms() - reserve_ms)
+        if cap_ms is not None:
+            allowance = min(allowance, max(0, cap_ms))
+        return OperationBudget(allowance, deadline=parent.deadline)
+
+    def share(fraction):
+        return int(initial_budget_ms * fraction)
+
+    # Keep early capture/recovery inside one 20% envelope.  Snapshot and pending
+    # get bounded entry windows; source recovery preserves room for closeout and
+    # GC, while unused source time flows to those later phases.
+    prequeue_budget = child_budget(effective_budget, cap_ms=share(0.20))
     maintenance_run = uuid.uuid4().hex
     moment = _utc(now)
     started_at = _iso(moment)
     errors: list[Mapping[str, Any]] = []
-    def phase(stage, operation, default):
+    def phase(stage, operation, default, *, phase_budget=None):
+        nonlocal budget
+        selected_budget = phase_budget if phase_budget is not None else budget
+        previous_budget = budget
         try:
-            budget.check()
+            parent_budget.check()
+            selected_budget.check()
+            budget = selected_budget
             return operation()
         except TimeoutError:
             if not any(row.get("error_code") == "OPERATION_BUDGET_EXHAUSTED" for row in errors):
                 errors.append({"stage": stage, "error_code": "OPERATION_BUDGET_EXHAUSTED"})
         except Exception as exc:
             errors.append({"stage": stage, "error_code": _safe_code(str(exc), stage.upper() + "_FAILED")})
+        finally:
+            budget = previous_budget
         return default
 
     from .pending_capture import reconcile_pending
     from .operation_runtime import last_maintenance_activity
-    previous_activity = phase("snapshot", lambda: last_maintenance_activity(settings, now=moment, budget=budget), {})
-    pending = phase("pending", lambda: reconcile_pending(settings, now=moment, budget=budget, max_records=64), {})
+    snapshot_budget = child_budget(prequeue_budget, cap_ms=share(0.02))
+    previous_activity = phase("snapshot", lambda: last_maintenance_activity(settings, now=moment, budget=budget), {}, phase_budget=snapshot_budget)
+    pending_budget = child_budget(prequeue_budget, cap_ms=share(0.03))
+    pending = phase("pending", lambda: reconcile_pending(settings, now=moment, budget=budget, max_records=64), {}, phase_budget=pending_budget)
     source_count = created = skipped = parse_skipped = rejected = 0
     ingest_results_list: list[Mapping[str, Any]] = []
+    closeout_reserve_ms = share(0.02)
+    gc_reserve_ms = share(0.05)
+    source_budget = child_budget(prequeue_budget, reserve_ms=closeout_reserve_ms + gc_reserve_ms)
     source_count, created, skipped, parse_skipped, rejected, rows = phase("source_recovery",
-        lambda: _ingest(settings, source_paths, errors, now=moment, budget=budget, adapters=adapters), (0, 0, 0, 0, 0, ()))
+        lambda: _ingest(settings, source_paths, errors, now=moment, budget=budget, adapters=adapters), (0, 0, 0, 0, 0, ()), phase_budget=source_budget)
     ingest_results_list.extend(rows)
 
     from .closeout_association import recover_closeout_associations
     from .incidents import closeout_recovery_loss_issue
+    closeout_budget = child_budget(prequeue_budget, reserve_ms=gc_reserve_ms)
     closeout_recovery = phase("closeout_recovery", lambda: recover_closeout_associations(
         settings, now=moment, budget=budget, max_records=64),
-        {"processed": 0, "results": [], "reason_code": "CLOSEOUT_RECOVERY_UNKNOWN"})
+        {"processed": 0, "results": [], "reason_code": "CLOSEOUT_RECOVERY_UNKNOWN"}, phase_budget=closeout_budget)
     recovery_rows = closeout_recovery.get("results") if isinstance(closeout_recovery, Mapping) else None
     terminal_closeout_losses = ()
     if (
@@ -1384,16 +1431,23 @@ def run_maintenance(
     elif terminal_closeout_losses:
         errors.append({"stage": "closeout_recovery", "error_code": "CLOSEOUT_RECOVERY_LOSS"})
 
-    expired = phase("spool_gc", lambda: gc_expired_spool(settings, now=moment, budget=budget), 0)
+    spool_gc_budget = child_budget(prequeue_budget)
+    expired = phase("spool_gc", lambda: gc_expired_spool(settings, now=moment, budget=budget), 0, phase_budget=spool_gc_budget)
 
     recovery_result = RecoveryResult(0, 0, 0, False)
     if orphan_host_id:
-        recovery_result = phase("orphan_recovery", lambda: reconcile_orphans(orphan_host_id, None, settings, budget=budget), recovery_result)
+        recovery_result = phase("orphan_recovery", lambda: reconcile_orphans(orphan_host_id, None, settings, budget=budget), recovery_result, phase_budget=prequeue_budget)
 
+    # Queue work can use all time left after pre-queue work except the 40% post-work reserve.
+    queue_budget = child_budget(budget, reserve_ms=share(0.40))
+    budget = queue_budget
     queue_result = phase("queue_drain", lambda: drain_queue(settings, provider=provider,
         max_items=max_queue_items, time_budget_ms=budget.remaining_ms(), now=moment,
         run_id=maintenance_run, budget=budget), QueueDrainResult("partial", 0, 0, 0, 0, 0, 0, -1, 0))
     errors.extend(queue_result.errors)
+    # Projection and subsequent maintenance leave 5% for health/service and CLI logging.
+    post_work_budget = child_budget(effective_budget, reserve_ms=share(0.05))
+    budget = post_work_budget
 
     lifecycle_result = ReconciliationResult(0, 0, 0, 0, 0, 0, 0, 0)
     projection: KnowledgeIndex | None = None
@@ -1489,6 +1543,9 @@ def run_maintenance(
     from .incidents import incident_id
     scheduler = phase("scheduler", lambda: inspect_scheduler_opportunities(settings, now=moment, budget=budget),
         {"requested": False, "missed_eligible_runs": None, "next_run_at": None, "reason_code": "SCHEDULER_BUDGET_EXHAUSTED"})
+    # Health/service itself leaves the final 2% for the caller's maintenance log.
+    health_budget = child_budget(effective_budget, reserve_ms=share(0.02))
+    budget = health_budget
     progress = bool(created or queue_result.completed or queue_result.discarded or lifecycle_result.created_events)
     last_progress = moment if progress else previous_activity.get("last_progress_at")
     observed = phase("operation_health", lambda: collect_operation_snapshot(settings, now=moment, budget=budget,

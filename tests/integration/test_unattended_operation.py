@@ -795,6 +795,7 @@ class UnattendedOperationTests(unittest.TestCase):
             chosen = Path(tmp) / "valid.md"
             chosen.write_text("## Reusable knowledge\n- Verify persisted results before reporting completion.\n", encoding="utf-8")
             calls, budgets, run_ids = [], [], []
+            root_budget = operation_runtime.OperationBudget(10000)
             def watch(name, original):
                 def invoke(*args, **kwargs):
                     calls.append(name)
@@ -808,9 +809,10 @@ class UnattendedOperationTests(unittest.TestCase):
                     stack.enter_context(patch(target, side_effect=watch(name, original)))
                 stack.enter_context(patch("builtins.input", side_effect=AssertionError("daily prompt")))
                 stack.enter_context(patch("ei.inference.router.ProviderRouter.generate", side_effect=AssertionError("empty probe")))
-                result = maintainer.run_maintenance(settings, source_paths=(chosen,), now=NOW, time_budget_ms=10000)
+                result = maintainer.run_maintenance(settings, source_paths=(chosen,), now=NOW, time_budget_ms=10000, budget=root_budget)
             self.assertEqual(calls, ["pending", "source", "queue", "projection", "health", "service"])
-            self.assertTrue(all(value is budgets[0] and value is not None for value in budgets))
+            self.assertTrue(all(value is not None and value is not root_budget for value in budgets))
+            self.assertTrue(all(value.deadline <= root_budget.deadline for value in budgets))
             self.assertEqual(run_ids, [result.to_dict()["operation"]["run_id"]])
             self.assertEqual(result.projection["freshness"], "CURRENT")
             self.assertEqual(result.ingest_created_events, 1)
@@ -823,17 +825,59 @@ class UnattendedOperationTests(unittest.TestCase):
         from ei import maintainer, pending_capture
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(Path(tmp))
+            from ei.operation_runtime import OperationBudget
+            parent_budget = OperationBudget(5000)
+            expired_at_pending = []
+            queue_parent_deadlines = []
             original = pending_capture.reconcile_pending
             def expire_after_pending(*args, **kwargs):
                 result = original(*args, **kwargs)
-                kwargs["budget"].deadline = 0
+                parent_budget.deadline = 0
+                self.assertEqual(parent_budget.remaining_ms(), 0)
+                expired_at_pending.append(parent_budget.deadline)
                 return result
-            with patch("ei.pending_capture.reconcile_pending", side_effect=expire_after_pending), patch("ei.maintainer.drain_queue", side_effect=AssertionError("late queue")), patch("ei.metrics.collect_local_metrics", side_effect=AssertionError("late metric")):
-                result = maintainer.run_maintenance(settings, source_paths=(), now=NOW, time_budget_ms=5000)
+            def late_queue(*_args, **_kwargs):
+                queue_parent_deadlines.append(parent_budget.deadline)
+                raise AssertionError("late queue")
+            with patch("ei.pending_capture.reconcile_pending", side_effect=expire_after_pending), \
+                    patch("ei.maintainer.drain_queue", side_effect=late_queue) as queue, \
+                    patch("ei.maintainer._events", side_effect=AssertionError("late journal")) as events, \
+                    patch("ei.metrics.collect_local_metrics", side_effect=AssertionError("late metric")), \
+                    patch("ei.maintainer.project_events", side_effect=AssertionError("late projection")) as projection:
+                result = maintainer.run_maintenance(settings, source_paths=(), now=NOW, time_budget_ms=5000, budget=parent_budget)
             self.assertEqual(result.status, "partial")
             self.assertEqual(result.blocked_reason, "OPERATION_BUDGET_EXHAUSTED")
-            self.assertFalse(settings.paths.knowledge_dir.exists())
+            self.assertEqual(expired_at_pending, [0])
+            self.assertEqual(parent_budget.deadline, 0)
+            self.assertEqual(queue_parent_deadlines, [])
+            queue.assert_not_called()
+            events.assert_not_called()
+            projection.assert_not_called()
             self.assertFalse((settings.paths.runtime_root / "health.json").exists())
+
+    def test_cli_maintenance_uses_five_minute_default_and_rejects_over_max_before_lock(self):
+        from ei import cli
+        from ei.cli import EXIT_INPUT, main
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            parser = cli._build_parser()
+            args = parser.parse_args([
+                "maintain", "--engine-root", str(settings.paths.engine_root),
+                "--knowledge-root", str(settings.paths.knowledge_root),
+                "--runtime-root", str(settings.paths.runtime_root),
+            ])
+            self.assertEqual(args.time_budget_ms, 300000)
+            with patch("ei.cli._settings", return_value=settings), \
+                    patch("ei.cli.FileLock", side_effect=AssertionError("lock entered before budget validation")), \
+                    patch("ei.cli._emit") as emit:
+                result = main([
+                    "maintain", "--engine-root", str(settings.paths.engine_root),
+                    "--knowledge-root", str(settings.paths.knowledge_root),
+                    "--runtime-root", str(settings.paths.runtime_root),
+                    "--time-budget-ms", "300001", "--json",
+                ])
+            self.assertEqual(result, EXIT_INPUT)
+            emit.assert_called_once_with({"ok": False, "error_code": "TIME_BUDGET_MS_INVALID"}, True)
 
     def test_maintenance_keeps_provider_fault_with_unknown_custody_and_resolves_only_actual_success(self):
         from ei.maintainer import run_maintenance

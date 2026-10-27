@@ -1,6 +1,7 @@
 import tempfile
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -182,14 +183,38 @@ class CaptureCatchupTests(unittest.TestCase):
             "print('locked',flush=True); sys.stdin.readline(); lock.__exit__(None,None,None)"
         )
         process = subprocess.Popen([sys.executable, "-B", "-X", "utf8", "-c", script, str(self.root)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        primary_failure = False
         try:
-            self.assertEqual(process.stdout.readline().strip(), "locked")
+            if process.stdout.readline().strip() != "locked":
+                self.fail("CAPTURE_LOCK_CHILD_READY_FAILED")
             result = self.recover()
-            self.assertEqual((result.secured, result.reason_code), (0, "SOURCE_COORDINATION_UNAVAILABLE"))
-            process.communicate("release\n", timeout=10)
-            self.assertEqual(process.returncode, 0)
-            self.assertEqual(self.recover().secured, 1)
+            if (result.secured, result.reason_code) != (0, "SOURCE_COORDINATION_UNAVAILABLE"):
+                reason = result.reason_code
+                reason = reason if isinstance(reason, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,47}", reason) else "UNKNOWN"
+                secured = result.secured
+                secured = str(secured) if type(secured) is int and 0 <= secured <= 999999 else "UNKNOWN"
+                self.fail(f"CAPTURE_LOCK_RECOVERY_WHILE_HELD_FAILED_{reason}_{secured}")
+            try:
+                process.communicate("release\n", timeout=10)
+            except subprocess.TimeoutExpired:
+                self.fail("CAPTURE_LOCK_CHILD_RELEASE_TIMEOUT")
+            if process.returncode != 0:
+                self.fail("CAPTURE_LOCK_CHILD_EXIT_NONZERO")
+            result = self.recover()
+            if result.secured != 1:
+                reason = result.reason_code
+                reason = reason if isinstance(reason, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,47}", reason) else "UNKNOWN"
+                secured = result.secured
+                secured = str(secured) if type(secured) is int and 0 <= secured <= 999999 else "UNKNOWN"
+                self.fail(f"CAPTURE_LOCK_RECOVERY_AFTER_RELEASE_FAILED_{reason}_{secured}")
+        except BaseException:
+            primary_failure = True
+            raise
         finally:
-            if process.poll() is None:
-                process.kill()
-                process.communicate(timeout=10)
+            try:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate(timeout=10)
+            except Exception:
+                if not primary_failure:
+                    self.fail("CAPTURE_LOCK_CHILD_CLEANUP_FAILED")

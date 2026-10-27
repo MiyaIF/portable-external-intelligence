@@ -5,6 +5,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from ei.config import load_settings
@@ -92,6 +93,84 @@ def source_hash(label):
 
 
 class MaintainerTests(unittest.TestCase):
+    def test_maintenance_default_budget_is_five_minutes_and_rejects_larger_values(self):
+        import inspect
+        from ei.operation_runtime import OperationBudget
+
+        self.assertEqual(inspect.signature(run_maintenance).parameters["time_budget_ms"].default, 300000)
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            with self.assertRaisesRegex(ValueError, "TIME_BUDGET_MS_INVALID"):
+                run_maintenance(settings, time_budget_ms=300001, budget=OperationBudget(300001))
+
+    def test_ingest_keeps_completed_source_results_when_a_later_selection_hits_deadline(self):
+        from ei.maintainer import _ingest
+        from ei.operation_runtime import OperationBudget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            first = Path(tmp) / "first.md"
+            second = Path(tmp) / "second.md"
+            first.write_text("first", encoding="utf-8")
+            second.write_text("second", encoding="utf-8")
+            fake_clock = [10.0]
+            budget = OperationBudget(10000)
+            adapter = SimpleNamespace(host_id="codex-cli", capture_path="codex-memory", parse_skipped=0)
+            errors = []
+
+            def recover_page(*_args, **_kwargs):
+                fake_clock[0] = budget.deadline
+                return SimpleNamespace(
+                    created_events=2, rejected=0, scanned=2, secured=2,
+                    coverage="COMPLETE", reason_code="SOURCE_CORRELATION_UNKNOWN",
+                )
+
+            with patch("ei.maintainer.time.monotonic", side_effect=lambda: fake_clock[0]), \
+                    patch("ei.maintainer._adapter", return_value=adapter), \
+                    patch("ei.operation_runtime.capture_namespace", return_value=("sha256:" + "a" * 64, "store")), \
+                    patch("ei.capture_recovery.recover_page", side_effect=recover_page):
+                result = _ingest(settings, (first, second), errors, now=datetime(2026, 1, 1, tzinfo=timezone.utc), budget=budget)
+
+            self.assertEqual(result[0:2], (1, 2))
+            self.assertEqual(len(result[5]), 1)
+            self.assertEqual(result[5][0]["created_events"], 2)
+            self.assertEqual(errors[-1]["error_code"], "OPERATION_BUDGET_EXHAUSTED")
+
+    def test_source_child_deadline_leaves_queue_projection_and_sync_gate_opportunity(self):
+        from ei.operation_runtime import OperationBudget
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            item = self._enqueue_candidate(settings, label="backlog-fairness")
+            fake_clock = [100.0]
+            key_provider = InMemoryKeyProvider("fairness-test-key", b"f" * 32)
+            root_budget = None
+            observed = {}
+
+            def exhaust_source(_settings, _paths, errors, *, budget, **_kwargs):
+                observed["source_deadline"] = budget.deadline
+                fake_clock[0] = budget.deadline
+                errors.append({"stage": "ingest", "error_code": "SOURCE_TIME_LIMIT"})
+                row = {"status": "partial", "created_events": 2, "reason_code": "SOURCE_TIME_LIMIT"}
+                return 1, 2, 0, 0, 0, (row,)
+
+            with patch("ei.maintainer.time.monotonic", side_effect=lambda: fake_clock[0]), \
+                    patch("ei.maintainer._ingest", side_effect=exhaust_source), \
+                    patch("ei.spool.default_key_provider", return_value=key_provider):
+                root_budget = OperationBudget(300000)
+                result = run_maintenance(
+                    settings, source_paths=(), provider=YesProvider(), time_budget_ms=300000,
+                    sync_policy="auto", now=datetime(2026, 8, 26, tzinfo=timezone.utc), budget=root_budget,
+                )
+
+            self.assertLess(observed["source_deadline"], root_budget.deadline)
+            self.assertEqual(result.queue["completed"], 1)
+            self.assertIn(item.queue_id, result.queue["completed_queue_ids"])
+            self.assertEqual(result.projection.get("freshness"), "CURRENT")
+            self.assertIn("SOURCE_TIME_LIMIT", [row["error_code"] for row in result.errors])
+            self.assertEqual(result.sync["status"], "blocked")
+            self.assertEqual(result.sync["reason_code"], "PRE_SYNC_CHECKS_FAILED")
+
     def test_projection_still_updates_when_queue_processing_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(tmp)

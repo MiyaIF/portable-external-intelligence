@@ -4,7 +4,7 @@
   "required": ["decision", "reason_code", "candidate_title", "candidate_claim", "evidence_refs", "benefit", "classification", "confidence"],
   "properties": {
     "decision": {"type": "string", "enum": ["YES", "NO"]},
-    "reason_code": {"type": "string", "minLength": 1},
+    "reason_code": {"type": "string", "enum": ["evidence_verified", "evidence_repeated", "novel_structure", "project_specific", "one_off_fact", "no_evidence", "no_future_benefit", "duplicate_without_new_evidence", "secret_or_confidential", "transient_state", "already_encoded"]},
     "candidate_title": {"type": "string", "minLength": 1},
     "candidate_claim": {"type": "string", "minLength": 20},
     "evidence_refs": {"type": "array", "items": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}},
@@ -25,6 +25,7 @@
       "if": {"properties": {"decision": {"const": "YES"}}},
       "then": {
         "required": ["applicability_scope", "applicable_host_ids", "applicable_host_families"],
+        "properties": {"benefit": {"enum": ["avoided_failure", "reduced_rework", "faster_completion", "quality_improvement", "discovered_structure"]}},
         "allOf": [
           {"if": {"properties": {"applicability_scope": {"const": "universal"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"maxItems": 0}}}},
           {"if": {"properties": {"applicability_scope": {"const": "family"}}}, "then": {"properties": {"applicable_host_ids": {"maxItems": 0}, "applicable_host_families": {"minItems": 1}}}},

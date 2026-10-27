@@ -1022,6 +1022,8 @@ def _drain(args: argparse.Namespace) -> int:
 
 
 def _maintain(args: argparse.Namespace) -> int:
+    if type(args.time_budget_ms) is not int or not 0 <= args.time_budget_ms <= 300000:
+        raise InputError("TIME_BUDGET_MS_INVALID")
     if args.dry_run:
         try:
             queue = queue_health(args.settings).to_dict()
@@ -1766,7 +1768,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     maintain = common("maintain", source=True)
     maintain.add_argument("--max-items", type=int, default=100)
-    maintain.add_argument("--time-budget-ms", type=int, default=30000)
+    maintain.add_argument("--time-budget-ms", type=int, default=300000)
     maintain.add_argument("--sync-policy", choices=("disabled", "manual", "auto"))
     maintain.add_argument("--sync", action="store_true")
     maintain.add_argument("--log-file")

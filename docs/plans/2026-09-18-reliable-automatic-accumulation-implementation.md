@@ -1397,3 +1397,16 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 **追加Files（CIジョブの実行時間枠）:** `.github/workflows/compatibility.yml`。Windowsジョブでclean-clone全件検証とhost contractは成功したが、後続acceptance中に35分のジョブ上限へ達したことをGitHubのannotationで確認した。compatibility matrixの上限のみ45分へ変更し、単体moduleのtimeout・製品budget・必須step・最終集約の成功条件は維持する。失敗結果を成功扱いせず、次の同一公開SHAで全step完了を確認する。
 
 **追加Files（通知fixtureのOS設定隔離）:** `tests/integration/test_unattended_setup.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。共有`sys.platform`のWindows化がPOSIX Python 3.13の`shutil.which`へ漏れ、setupのdoctor経由で`AttributeError`となる経路を限定probeで再現した。このmoduleのOS模擬は`ei.installer.sys`参照だけの差し替えに限定し、stdlibや他moduleの実platformを変更しない。回帰試験で隔離と既存setup/uninstallの結果を確認する。製品の例外捕捉・安全境界・assertion・skip条件は変更しない。対象試験と差分レビュー、固定版全件試験後、同一公開SHAのLinux/macOS/Windows CIで確認する。
+## 実運用確認での保守処理の予算配分修正
+
+対象は `src/ei/maintainer.py`、`src/ei/cli.py`、`tests/unit/test_maintainer.py`、`tests/integration/test_maintenance.py`、`tests/integration/test_unattended_operation.py`、`docs/unattended-operation.md`、本計画書。既定・最大保守予算を300,000msとし、既存の親deadline内で回収・AI整理・索引更新・health・ログに実行機会を残す。短い明示予算、Hook期限、30分の実行間隔、OS側の10分上限、安全検査、append-onlyの記録、既存の失敗分類は維持する。新しい索引・キャッシュ・強制昇格・source除外は追加しない。回収済み進捗を保持し、backlog時の後段処理と期限超過を回帰テストする。
+
+## 実CLI確認でのSkill入力契約修正
+
+対象は `skills/external-intelligence/workflows/closeout.md`、`skills/external-intelligence/prompts/inheritance-gate.md`、`skills/external-intelligence/schemas/gate-decision.schema.json`、整理AIが使用する `schemas/gate-decision.schema.json`、必要な実行契約テストを追加する `tests/integration/test_skill_runtime_boundary.py`、本計画書。実際の呼出し元情報を持つ `candidate` と判断結果の `gate_decision` を分けた入力形式を明示し、YESのbenefitは既存runtimeの5つの非空列挙値にそろえる。入力の自動補完・自由文への検証緩和・新しい保存経路は追加しない。提案生成と適用を区別し、修正後の実CLIで再検証する。
+
+同じschemaを受け取る整理AIへ、既存runtimeが許容する11種類の `reason_code` も明示する。YES/NOの共通集合を維持し、新しい理由区分や判定別の追加制約は作らない。
+
+## Windows CIのプロセス排他試験の失敗段階識別
+
+対象は `tests/integration/test_capture_catchup.py` と本計画書。実プロセスがsource lockを保持する試験の、子プロセス準備・保持中の拒否・解放と終了・解放後の回収を、既存parserで読める有限理由コードで区別する。既存assertion、10秒の期限、製品ロックと安全検査は変更しない。生本文・絶対パス・stderrを公開診断へ追加しない。現時点では実assertionと原因は不明であり、この診断追加を製品不具合の修正完了とは扱わない。

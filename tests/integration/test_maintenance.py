@@ -19,7 +19,7 @@ from tests.helpers import make_hook_settings
 
 
 class MaintenanceTests(unittest.TestCase):
-    def test_closeout_recovery_precedes_spool_gc_and_uses_the_shared_budget(self):
+    def test_closeout_recovery_precedes_spool_gc_and_uses_bounded_child_budgets(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_hook_settings(Path(tmp))
             now = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
@@ -54,9 +54,11 @@ class MaintenanceTests(unittest.TestCase):
             self.assertEqual([call[0] for call in calls], ["closeout_recovery", "spool_gc"])
             self.assertIs(calls[0][1], settings)
             self.assertIs(calls[0][2], now)
-            self.assertIs(calls[0][3], budget)
+            self.assertIsNot(calls[0][3], budget)
+            self.assertLessEqual(calls[0][3].deadline, budget.deadline)
             self.assertEqual(calls[0][4], 64)
-            self.assertIs(calls[1][3], budget)
+            self.assertIsNot(calls[1][3], budget)
+            self.assertLessEqual(calls[1][3].deadline, budget.deadline)
 
     def test_recovery_traversal_complete_does_not_resolve_pending_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
