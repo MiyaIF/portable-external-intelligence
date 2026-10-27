@@ -171,6 +171,94 @@ class MaintainerTests(unittest.TestCase):
             self.assertEqual(result.sync["status"], "blocked")
             self.assertEqual(result.sync["reason_code"], "PRE_SYNC_CHECKS_FAILED")
 
+    def test_successful_noop_reconciliation_reuses_the_initial_journal_snapshot(self):
+        from ei.maintainer import _events
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            append_event(Event.create(
+                "observation.recorded", "2026-08-26T00:00:00+00:00", "test", "test",
+                {"observation_id": "obs_single", "claim": "A single observation is not yet a repeated rule.",
+                 "classification": "private-reusable"},
+                event_id="evt_single",
+            ), settings.paths.event_dir)
+
+            with patch("ei.maintainer._events", wraps=_events) as journal_reads:
+                result = run_maintenance(settings, sync_policy="disabled")
+
+            # Initial snapshot plus final freshness read; no post-reconcile reread on a successful no-op.
+            self.assertEqual(journal_reads.call_count, 2)
+            self.assertEqual(result.projection.get("freshness"), "CURRENT")
+
+    def test_reconciliation_created_events_are_visible_to_projection(self):
+        from ei.maintainer import _events
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+            projected_event_ids = []
+
+            def capture_projected_events(events, knowledge_dir, *, budget=None):
+                event_list = list(events)
+                projected_event_ids.extend(event.event_id for event in event_list)
+                return project_events(event_list, knowledge_dir, budget=budget)
+
+            for index in range(2):
+                append_event(Event.create(
+                    "observation.recorded", f"2026-08-26T00:00:0{index}+00:00", "test", "test",
+                    {
+                        "observation_id": f"obs_repeat_{index}",
+                        "claim": "Repeated evidence supports a reusable operational rule.",
+                        "source_kind": "test",
+                        "source_hash": source_hash(f"source-{index}"),
+                        "source_ref_hash": source_hash(f"reference-{index}"),
+                        "provenance_key": f"source:{index}",
+                        "outcome_status": "success",
+                        "benefit": "reduced_rework",
+                        "classification": "private-reusable",
+                    },
+                    event_id=f"evt_repeat_{index}",
+                ), settings.paths.event_dir)
+
+            with patch("ei.maintainer._events", wraps=_events) as journal_reads, \
+                    patch("ei.maintainer.project_events", side_effect=capture_projected_events):
+                result = run_maintenance(settings, sync_policy="disabled")
+
+            self.assertGreaterEqual(result.lifecycle["created_events"], 1)
+            self.assertGreaterEqual(journal_reads.call_count, 3)
+            persisted_candidates = {
+                event.event_id for event in iter_events(settings.paths.event_dir)
+                if event.event_type == "pattern.candidate_created"
+            }
+            self.assertTrue(persisted_candidates)
+            self.assertTrue(persisted_candidates.issubset(set(projected_event_ids)))
+            self.assertEqual(result.projection.get("freshness"), "CURRENT")
+
+    def test_failed_or_timed_out_reconciliation_rereads_instead_of_trusting_zero_default(self):
+        from ei.maintainer import _events
+
+        failures = (
+            ("timeout", TimeoutError("RECONCILIATION_TIMEOUT"), "OPERATION_BUDGET_EXHAUSTED"),
+            ("exception", RuntimeError("RECONCILIATION_FAILED"), "RECONCILIATION_FAILED"),
+        )
+        for label, failure, expected_code in failures:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                settings = make_settings(tmp)
+                append_event(Event.create(
+                    "observation.recorded", "2026-08-26T00:00:00+00:00", "test", "test",
+                    {"observation_id": f"obs_{label}", "claim": "One observation remains available after reconciliation failure.",
+                     "classification": "private-reusable"},
+                    event_id=f"evt_{label}",
+                ), settings.paths.event_dir)
+
+                with patch("ei.maintainer._events", wraps=_events) as journal_reads, \
+                        patch("ei.maintainer.reconcile_lifecycle", side_effect=failure):
+                    result = run_maintenance(settings, sync_policy="disabled")
+
+                # phase() returns a zero-valued fallback; failure must still force a refresh.
+                self.assertEqual(journal_reads.call_count, 3)
+                self.assertIn(expected_code, [row["error_code"] for row in result.errors])
+                self.assertEqual(result.projection.get("freshness"), "CURRENT")
+
     def test_projection_still_updates_when_queue_processing_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_settings(tmp)

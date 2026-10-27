@@ -26,6 +26,10 @@ from tests.unit import test_maintainer as fixtures
 
 
 class OrganizerRestartTests(unittest.TestCase):
+    # These are functional restart tests, not five-second performance tests.
+    # Keep explicit shorter budgets below; allow bounded CI filesystem latency.
+    functional_budget_ms = 30_000
+
     def test_empty_queue_does_not_consume_pending_resume_or_call_provider(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = fixtures.make_settings(tmp)
@@ -45,7 +49,7 @@ class OrganizerRestartTests(unittest.TestCase):
                 config_fingerprint=fingerprint)["status"], "RETRY_REQUESTED")
             before = recovery.snapshot()
             with patch.object(provider, "generate", wraps=provider.generate) as generate:
-                result = drain_queue(settings, provider=adapter, now=datetime(2026, 9, 26, tzinfo=timezone.utc))
+                result = drain_queue(settings, provider=adapter, now=datetime(2026, 9, 26, tzinfo=timezone.utc), time_budget_ms=self.functional_budget_ms)
                 generate.assert_not_called()
             self.assertEqual(result.attempted, 0)
             self.assertEqual(OrganizerRecovery(path, "ollama").snapshot(), before)
@@ -193,9 +197,9 @@ class OrganizerRestartTests(unittest.TestCase):
                 now = datetime.now(timezone.utc)
                 fault = patch.object(ledger, "settle", side_effect=OSError("disk full")) if failure == "settlement-failure" else nullcontext()
                 with patch.object(provider, "generate", return_value=result) as generate, fault:
-                    self.assertEqual(drain_queue(settings, provider=adapter, now=now).deferred, 1)
+                    self.assertEqual(drain_queue(settings, provider=adapter, now=now, time_budget_ms=self.functional_budget_ms).deferred, 1)
                     fixtures.MaintainerTests()._enqueue_candidate(settings, label="second")
-                    self.assertEqual(drain_queue(settings, provider=adapter, now=now).deferred, 1)
+                    self.assertEqual(drain_queue(settings, provider=adapter, now=now, time_budget_ms=self.functional_budget_ms).deferred, 1)
                     self.assertEqual(generate.call_count, 1)
                 state = OrganizerRecovery(settings.paths.runtime_dir / ("organizer-" + stable_hash("ollama") + ".json"), "ollama").snapshot()
                 self.assertEqual(state["attempts"], 1)
@@ -219,7 +223,7 @@ class OrganizerRestartTests(unittest.TestCase):
             # A gate can stop without generate; adapter evidence from another
             # operation must not turn an unknown failure into a proven refusal.
             with patch("ei.maintainer.decide_inheritance", return_value=GateDecision("FAILED", "VALIDATION_FAILED")):
-                drain_queue(settings, provider=adapter)
+                drain_queue(settings, provider=adapter, time_budget_ms=self.functional_budget_ms)
             state = OrganizerRecovery(settings.paths.runtime_dir / ("organizer-" + stable_hash("ollama") + ".json"), "ollama").snapshot()
             self.assertEqual(state["attempts"], 1)
             self.assertEqual(state["reason_code"], "VALIDATION_FAILED")
@@ -244,7 +248,7 @@ class OrganizerRestartTests(unittest.TestCase):
                 before = recovery.snapshot()
                 with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider()), patch.object(provider, "generate", wraps=provider.generate) as generate, patch("ei.inference.router.datetime", wraps=datetime) as clock:
                     clock.now.return_value = now
-                    refused = drain_queue(settings, provider=_RouterAdapter(router), now=now, run_id="blocked-run")
+                    refused = drain_queue(settings, provider=_RouterAdapter(router), now=now, run_id="blocked-run", time_budget_ms=self.functional_budget_ms)
                     self.assertEqual(refused.deferred, 1)
                     self.assertEqual(generate.call_count, 0)
                     saved = read_queue_item(first.queue_id, settings)
@@ -257,8 +261,8 @@ class OrganizerRestartTests(unittest.TestCase):
                     self.assertEqual({**after, "config_fingerprint": before["config_fingerprint"]}, before)
                     second = fixtures.MaintainerTests()._enqueue_candidate(settings, label="second")
                     allowed = drain_queue(settings, provider=_RouterAdapter(router), now=now,
-                        run_id="fresh-run" if scope == "run-token" else "blocked-run")
-                    self.assertEqual(allowed.completed, 1)
+                        run_id="fresh-run" if scope == "run-token" else "blocked-run", time_budget_ms=self.functional_budget_ms)
+                    self.assertEqual(allowed.completed, 1, repr(allowed))
                     self.assertEqual(read_queue_item(second.queue_id, settings).state, QueueState.DONE)
                     self.assertEqual(read_queue_item(first.queue_id, settings).state, QueueState.DEFERRED)
                     self.assertEqual(generate.call_count, 1)
@@ -274,9 +278,9 @@ class OrganizerRestartTests(unittest.TestCase):
             with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider()), patch.object(provider, "generate", wraps=provider.generate) as generate:
                 with patch("ei.changeset.append_event", side_effect=OSError("disk full")):
                     for day in range(5):
-                        drain_queue(settings, provider=provider, now=now + timedelta(days=day))
+                        drain_queue(settings, provider=provider, now=now + timedelta(days=day), time_budget_ms=self.functional_budget_ms)
                 self.assertEqual(read_queue_item(item.queue_id, settings).state, QueueState.DEFERRED)
-                result = drain_queue(settings, provider=provider, now=now + timedelta(days=5))
+                result = drain_queue(settings, provider=provider, now=now + timedelta(days=5), time_budget_ms=self.functional_budget_ms)
                 self.assertEqual(result.completed, 1)
                 self.assertEqual(generate.call_count, 1)
 
@@ -328,13 +332,13 @@ class OrganizerRestartTests(unittest.TestCase):
                 return append_event(event, event_dir, budget=budget)
             with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider()), patch.object(provider, "generate", wraps=provider.generate) as generate:
                 with patch("ei.changeset.append_event", side_effect=interrupt):
-                    drain_queue(settings, provider=provider, now=now)
+                    drain_queue(settings, provider=provider, now=now, time_budget_ms=self.functional_budget_ms)
                 self.assertEqual(calls, 2)
                 partial = [event for event in iter_events(settings.paths.event_dir, include_uncommitted=True) if event.event_id not in original_ids]
                 self.assertEqual(len(partial), 1)
                 self.assertNotEqual(partial[0].event_type, "curation.changeset.applied")
                 self.assertEqual({event.event_id for event in iter_events(settings.paths.event_dir)}, original_ids)
-                result = drain_queue(settings, provider=provider, now=now + timedelta(hours=1))
+                result = drain_queue(settings, provider=provider, now=now + timedelta(hours=1), time_budget_ms=self.functional_budget_ms)
                 self.assertEqual(result.completed, 1)
                 self.assertEqual(generate.call_count, 1)
                 self.assertEqual(sum(event.event_type == "curation.changeset.applied" for event in iter_events(settings.paths.event_dir)), 1)
@@ -348,10 +352,10 @@ class OrganizerRestartTests(unittest.TestCase):
             provider = fixtures.YesProvider()
             with patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider()), patch.object(provider, "generate", wraps=provider.generate) as generate:
                 with patch("ei.maintainer.project_events", side_effect=OSError("SIMULATED_RESTART")):
-                    drain_queue(settings, provider=provider, now=now)
+                    drain_queue(settings, provider=provider, now=now, time_budget_ms=self.functional_budget_ms)
                 before = [event.event_id for event in iter_events(settings.paths.event_dir)]
-                result = drain_queue(settings, provider=provider, now=now + timedelta(hours=1))
-                self.assertEqual(result.completed, 1)
+                result = drain_queue(settings, provider=provider, now=now + timedelta(hours=1), time_budget_ms=self.functional_budget_ms)
+                self.assertEqual(result.completed, 1, repr(result))
                 self.assertEqual(generate.call_count, 1)
                 self.assertEqual([event.event_id for event in iter_events(settings.paths.event_dir)], before)
                 self.assertTrue((settings.paths.knowledge_dir / "index.json").exists())
@@ -364,7 +368,7 @@ class OrganizerRestartTests(unittest.TestCase):
                 source = write_spool({"title": "candidate", "claim": "同じ構造を別案件でも検証し再利用可能な判断ルールとして記録する"}, "private-reusable", settings, now=now, ttl_seconds=600)
                 item = fixtures.MaintainerTests()._enqueue_candidate(settings, payload_ref=source)
                 with patch("ei.maintainer.apply_changeset", side_effect=OSError("SIMULATED_RESTART")):
-                    drain_queue(settings, provider=fixtures.YesProvider(), now=now)
+                    drain_queue(settings, provider=fixtures.YesProvider(), now=now, time_budget_ms=self.functional_budget_ms)
                 saved = read_queue_item(item.queue_id, settings)
                 self.assertLessEqual(datetime.fromisoformat(saved.validated_result_ref.expires_at), datetime.fromisoformat(source.expires_at))
                 candidate = _candidate_for(saved, settings, now)
@@ -388,11 +392,11 @@ class OrganizerRestartTests(unittest.TestCase):
             provider = fixtures.YesProvider()
             with patch("ei.spool.default_key_provider", return_value=key), patch.object(provider, "generate", wraps=provider.generate) as generate:
                 with patch("ei.maintainer.apply_changeset", side_effect=OSError("SIMULATED_RESTART")):
-                    drain_queue(settings, provider=provider, now=now)
+                    drain_queue(settings, provider=provider, now=now, time_budget_ms=self.functional_budget_ms)
                 saved = read_queue_item(item.queue_id, settings)
                 self.assertIsNotNone(saved.validated_result_ref)
                 self.assertEqual(saved.validated_result_ref.purpose, "validated-result")
-                result = drain_queue(settings, provider=provider, now=now + timedelta(hours=1))
+                result = drain_queue(settings, provider=provider, now=now + timedelta(hours=1), time_budget_ms=self.functional_budget_ms)
                 self.assertEqual(result.completed, 1)
                 self.assertEqual(generate.call_count, 1)
                 self.assertEqual(read_queue_item(item.queue_id, settings).state, QueueState.DONE)

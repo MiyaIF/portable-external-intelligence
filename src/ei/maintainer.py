@@ -1454,8 +1454,17 @@ def run_maintenance(
     events: list[Event] = []
     events = phase("journal", lambda: _events(settings, budget=budget), None)
     if events is not None:
-        lifecycle_result = phase("lifecycle", lambda: reconcile_lifecycle(events, settings.paths.event_dir, now_utc=moment, budget=budget), lifecycle_result)
-        events = phase("journal", lambda: _events(settings, budget=budget), None)
+        reconciliation_succeeded = False
+
+        def reconcile_current_snapshot():
+            nonlocal reconciliation_succeeded
+            result = reconcile_lifecycle(events, settings.paths.event_dir, now_utc=moment, budget=budget)
+            reconciliation_succeeded = True
+            return result
+
+        lifecycle_result = phase("lifecycle", reconcile_current_snapshot, lifecycle_result)
+        if not (reconciliation_succeeded and lifecycle_result.created_events == 0):
+            events = phase("journal", lambda: _events(settings, budget=budget), None)
     if events is not None:
         projection = phase("projection", lambda: project_events(events, settings.paths.knowledge_dir, budget=budget), None)
     from .changeset import _policy

@@ -50,19 +50,26 @@ class HookCanaryIntegrationTests(unittest.TestCase):
     def test_real_event_set_is_instance_bound_and_stop_is_durable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            settings = portable_settings(root)
+            settings = replace(
+                portable_settings(root),
+                session_start_budget_ms=30000,
+                prompt_budget_ms=30000,
+                stop_budget_ms=30000,
+            )
+            results = []
             for index, event in enumerate(("SessionStart", "UserPromptSubmit", "Stop")):
                 payload = {"hook_event_name": event, "session_id": "s1", "turn_id": f"t{index}", "cwd": "C:/work", "prompt": "safe"} if event == "UserPromptSubmit" else {"hook_event_name": event, "session_id": "s1", "turn_id": f"t{index}", "cwd": "C:/work"}
-                run_hook("codex-cli", json.dumps(payload).encode("utf-8"), 1000, settings)
-            self.assertEqual(len(_read_receipts(settings)), 3)
-            self.assertEqual(read_hook_status("codex-cli", "codex-cli", settings).received_events, ("prompt.before", "session.start", "turn.stop"))
+                results.append(run_hook("codex-cli", json.dumps(payload).encode("utf-8"), 30000, settings))
+            diagnostic = f"hook_statuses={[result.status for result in results]!r}; hook_result_count={len(results)}"
+            self.assertEqual(len(_read_receipts(settings)), 3, msg=diagnostic)
+            self.assertEqual(read_hook_status("codex-cli", "codex-cli", settings).received_events, ("prompt.before", "session.start", "turn.stop"), msg=diagnostic)
             from ei.capture_ledger import list_receipts
             targets = list_receipts(settings)
-            self.assertEqual(len(targets), 1)
-            self.assertEqual(targets[0].state, "UNKNOWN")
-            self.assertEqual(targets[0].candidate_ids, ())
-            self.assertFalse((settings.paths.runtime_dir / "state" / "capture" / "target-bindings").exists())
-            self.assertFalse(any(runtime_inventory(settings.paths.queue_dir, prefix="queue_")))
+            self.assertEqual(len(targets), 1, msg=diagnostic)
+            self.assertEqual(targets[0].state, "UNKNOWN", msg=diagnostic)
+            self.assertEqual(targets[0].candidate_ids, (), msg=diagnostic)
+            self.assertFalse((settings.paths.runtime_dir / "state" / "capture" / "target-bindings").exists(), msg=diagnostic)
+            self.assertFalse(any(runtime_inventory(settings.paths.queue_dir, prefix="queue_")), msg=diagnostic)
 
     def test_malformed_and_unknown_host_fail_open_without_echo(self):
         with tempfile.TemporaryDirectory() as tmp:

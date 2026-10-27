@@ -1410,3 +1410,19 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 ## Windows CIのプロセス排他試験の失敗段階識別
 
 対象は `tests/integration/test_capture_catchup.py` と本計画書。実プロセスがsource lockを保持する試験の、子プロセス準備・保持中の拒否・解放と終了・解放後の回収を、既存parserで読める有限理由コードで区別する。既存assertion、10秒の期限、製品ロックと安全検査は変更しない。生本文・絶対パス・stderrを公開診断へ追加しない。現時点では実assertionと原因は不明であり、この診断追加を製品不具合の修正完了とは扱わない。
+
+## 実Codex整理AIの構造化出力契約修正
+
+対象は `src/ei/inference/cli_subscription.py`、`tests/unit/test_inference_router.py`、必要なCodex送信用schema `schemas/codex-gate-decision.schema.json`、本計画書。公開コード由来の非機密候補を実Codex CLIへ渡した結果、保存検証用schemaのroot `allOf` が構造化出力APIに拒否されることを確認した。Codexへ送るschemaだけを対応する部分集合へ分離し、全properties必須・追加property禁止を満たす。元の完全schemaによる指示と保存時の意味検証、信頼済みsource情報、他CLIの契約、認証・予算・sandboxを維持する。新しい汎用schema変換基盤や検証緩和は追加しない。対象テスト・レビュー・固定版全件テストに加え、公開情報のみの実provider呼出しを再確認する。
+
+**追加Files:** `skills/external-intelligence/workflows/closeout.md`。実CLIで確認された出所不足とversion制約の長さ超過に対し、現在セッションと一致する信頼済みメタデータの照合方法、および既存の保存フィールド名・文字数上限だけを明記する。別セッションの流用、出所の推測、保存時検証の緩和はしない。
+
+## 保守処理の重複読取り削減
+
+対象は `src/ei/maintainer.py`、`tests/unit/test_maintainer.py`、必要な回帰確認の `tests/integration/test_maintenance.py`、本計画書。既存journalの最初の読取りだけで約48秒を要する実測と、後段の複数回全読取りを踏まえ、reconciliationが正常終了して追加event数が0の場合だけ、検証済みの最初のeventsを再利用する。期限切れの既定値を正常完了と混同せず、追加eventあり・異常終了時は従来の再読取りを維持する。最終freshnessの全読取りと並行変更のSTALE/UNKNOWN判定・同期拒否は維持する。新索引、永続cache、強制昇格、安全検査省略は追加しない。対象回帰テスト・レビュー・固定版全件テスト後に実測し、5分での完了は実測前に保証しない。
+
+## Windows CIの残存する再開機能試験
+
+対象は `tests/integration/test_organizer_restart.py` と本計画書。同じ公開SHAでjournal再開とbudget admission分離の機能試験が完了件数の不一致で失敗した。既定5秒を暗黙使用していた15呼出しだけにtest-localの有限30秒を明示し、明示10秒／30秒の既存6呼出し、token・試行回数制限、provider呼出数、保存・復旧の全assertionを維持する。失敗した2ケースには結果reprの診断を追加する。これはCI実行速度への機能fixture依存を限定する変更であり、元の失敗原因が期限切れと確定したとは扱わず、5秒性能や製品不具合の解決を保証しない。対象moduleと固定版全件試験、レビュー、同一公開SHAの必須CIで確認する。
+
+**追加Files:** `tests/integration/test_hook_canary.py`。別のWindows jobで失敗した3イベントのinstance分離とStop台帳耐久性の1ケースだけ、test-localの設定予算と呼出し予算を有限30秒にそろえる。製品の300ms Stop予算・他Hook予算、共通fixture、独立したdeadline試験、既存の全保存／分離assertionは変更しない。結果status・件数の限定診断を追加し、元のCI失敗の期限原因は未確定のまま扱う。Hookの実機速度や自動取得成功は別に検証する。
