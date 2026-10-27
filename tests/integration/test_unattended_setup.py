@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
 
+import ei.installer as installer_module
 from ei.installer import (
     SetupSelection,
     WINDOWS_NOTIFICATION_MAX_RECORD_BYTES,
@@ -35,10 +36,23 @@ from ei.installer import (
 REPOSITORY = Path(__file__).resolve().parents[2]
 
 
+def _patch_installer_platform(platform: str):
+    return patch("ei.installer.sys", SimpleNamespace(**{**vars(sys), "platform": platform}))
+
+
 from tests.support.sitecustomize import NotificationIsolationMixin, is_powershell_execution_policy_refusal
 
 
 class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestCase):
+    def _assert_installer_platform_isolated(self, host_platform: str) -> None:
+        if (
+            sys.platform != host_platform
+            or shutil.sys.platform != host_platform
+            or installer_module.sys is sys
+            or installer_module.sys.platform != "win32"
+        ):
+            self.fail("INSTALLER_PLATFORM_PATCH_LEAKED")
+
     def _fake_notification_helper(self, action: str, target: Path, *, expected_shortcut_sha256: str | None = None, expected_registration_sha256: str | None = None) -> dict[str, object]:
         shortcut = Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "External Intelligence.lnk"
         registration = Path(os.environ["LOCALAPPDATA"]) / "MiyaIF" / "ExternalIntelligence" / "notification-registration.json"
@@ -124,7 +138,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 calls.append(action)
                 return self._fake_notification_helper(action, target, **kwargs)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=helper, create=True
             ):
                 first = setup(selection)
@@ -201,7 +215,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             shortcut = Path(env["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "External Intelligence.lnk"
             shortcut.parent.mkdir(parents=True)
             shortcut.write_bytes(b"user-owned")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=self._fake_notification_helper, create=True
             ) as helper:
                 result = setup(selection)
@@ -217,7 +231,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=self._fake_notification_helper, create=True
             ):
                 installed = setup(selection)
@@ -249,7 +263,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             env = {"SystemRoot": str(root / "Windows")}
             target = Path(env["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
             response = {"status": "CURRENT", "verified": True, "target": str(target)}
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer.subprocess.run",
                 return_value=SimpleNamespace(returncode=0, stdout=json.dumps(response), stderr=""),
             ) as process:
@@ -271,7 +285,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
             helper = self._fake_notification_helper
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=helper, create=True
             ):
                 installed = setup(selection)
@@ -292,7 +306,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=self._fake_notification_helper, create=True
             ):
                 installed = setup(selection)
@@ -315,7 +329,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     raise ValueError("OWNERSHIP_RECEIPT_WRITE_FAILED")
                 return original(self, target, raw, details=details)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=self._fake_notification_helper, create=True
             ) as helper, patch.object(_Transaction, "mutate_file", new=fail_sidecar):
                 result = setup(selection)
@@ -346,7 +360,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     raise OSError("simulated notification rollback failure")
                 return original_rollback(self)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=self._fake_notification_helper, create=True
             ) as helper, patch.object(_Transaction, "mutate_file", new=write_then_fail), patch.object(
                 _Transaction, "rollback", new=fail_notification_rollback
@@ -378,7 +392,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     raise OSError("simulated journal finalization failure")
                 original_commit(self)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration",
                 return_value={"status": "FAILED", "verified": False, "reason_code": "OS_RESPONSE_UNVERIFIED"},
                 create=True,
@@ -403,7 +417,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 side_effect=AssertionError("journal without committed no-effect evidence must not retry"),
                 create=True,
             )
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), no_retry as helper:
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), no_retry as helper:
                 retried = setup(selection)
             self.assertTrue(retried.ok, retried.to_dict())
             self.assertEqual(retried.notification_registration["reason_code"], "OWNERSHIP_RECOVERY_REQUIRED")
@@ -416,7 +430,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration",
                 return_value={"status": "UNAVAILABLE", "verified": False, "reason_code": "OS_HELPER_START_FAILED"},
                 create=True,
@@ -433,7 +447,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 side_effect=AssertionError("journal without committed no-effect evidence must not retry"),
                 create=True,
             )
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), no_retry as helper:
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), no_retry as helper:
                 retried = setup(selection)
 
             self.assertTrue(installed.ok, installed.to_dict())
@@ -447,7 +461,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             target = Path(env["SystemRoot"]) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer.subprocess.run", side_effect=FileNotFoundError("executable start refused")
             ):
                 response = _run_windows_notification_registration("register", target)
@@ -463,7 +477,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration",
                 return_value={"status": "UNAVAILABLE", "verified": False, "reason_code": "OS_HELPER_START_FAILED"},
                 create=True,
@@ -484,7 +498,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 calls.append(action)
                 return self._fake_notification_helper(action, target, **kwargs)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=helper, create=True
             ):
                 retried = setup(selection)
@@ -507,11 +521,13 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            host_platform = sys.platform
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration",
                 return_value={"status": "DENIED", "verified": False, "reason_code": "EXECUTION_POLICY_BLOCKED"},
                 create=True,
             ):
+                self._assert_installer_platform_isolated(host_platform)
                 installed = setup(selection)
             if not installed.ok:
                 error_code = installed.errors[0].get("error_code") if installed.errors else None
@@ -519,7 +535,8 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 self.fail(failure_code if re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", failure_code) else "SETUP_UNKNOWN")
 
             helper = patch("ei.installer._run_windows_notification_registration", side_effect=AssertionError("no-artifact uninstall must not invoke helper"), create=True)
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), helper as called:
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), helper as called:
+                self._assert_installer_platform_isolated(host_platform)
                 removed = _uninstall_from_manifest(
                     installed.manifest_path,
                     UninstallOptions(remove_skills=False, remove_scheduler=False, remove_runtime=True),
@@ -554,7 +571,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     shortcut.write_bytes(b"partial helper-created artifact")
                 return {"status": "UNVERIFIED", "verified": False, "reason_code": "OS_RESPONSE_UNVERIFIED"}
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=partial_response, create=True
             ):
                 installed = setup(selection)
@@ -563,7 +580,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             receipt_before = receipt_path.read_bytes()
             artifact_before = shortcut.read_bytes()
             unexpected = patch("ei.installer._run_windows_notification_registration", side_effect=AssertionError("ambiguous artifact must not be retried or removed"), create=True)
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), unexpected as called:
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), unexpected as called:
                 retried = setup(selection)
                 removed = _uninstall_from_manifest(
                     installed.manifest_path,
@@ -598,7 +615,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     raise ValueError("OWNERSHIP_RECEIPT_SAVE_FAILED")
                 return original(self, target, raw, details=details)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=helper, create=True
             ), patch.object(_Transaction, "mutate_file", new=fail_registered_receipt):
                 result = setup(selection)
@@ -632,7 +649,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     raise OSError("simulated setup journal commit failure")
                 original(self)
 
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=helper, create=True
             ), patch.object(_Transaction, "commit", new=fail_main_commit):
                 result = setup(selection)
@@ -649,7 +666,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             root = Path(temporary)
             env = self._windows_notification_environment(root)
             selection = self._selection_for_runtime(root / "runtime")
-            with patch.dict(os.environ, env, clear=False), patch("ei.installer.sys.platform", "win32"), patch(
+            with patch.dict(os.environ, env, clear=False), _patch_installer_platform("win32"), patch(
                 "ei.installer._run_windows_notification_registration", side_effect=self._fake_notification_helper, create=True
             ):
                 installed = setup(selection)

@@ -1395,3 +1395,5 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 **追加Files（通知試験の失敗段階の識別）:** `tests/integration/test_unattended_setup.py`。Linux/macOSのPython 3.13で失敗するno-effect通知解除の1ケースに、既存parserで読めるphase付きの有限理由コードを追加する。setup/uninstall結果の最初のerror_codeはprefix込み96文字以内の許可形式のみ採用し、それ以外はUNKNOWNとする。通知status・helper呼出し・receipt残存も固定コードで区別し、元の全assertionを維持する。生本文・絶対パス・tracebackを新しく公開せず、製品処理やskip条件は変更しない。これは原因確定の診断であり、不具合修正完了とは扱わない。
 
 **追加Files（CIジョブの実行時間枠）:** `.github/workflows/compatibility.yml`。Windowsジョブでclean-clone全件検証とhost contractは成功したが、後続acceptance中に35分のジョブ上限へ達したことをGitHubのannotationで確認した。compatibility matrixの上限のみ45分へ変更し、単体moduleのtimeout・製品budget・必須step・最終集約の成功条件は維持する。失敗結果を成功扱いせず、次の同一公開SHAで全step完了を確認する。
+
+**追加Files（通知fixtureのOS設定隔離）:** `tests/integration/test_unattended_setup.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。共有`sys.platform`のWindows化がPOSIX Python 3.13の`shutil.which`へ漏れ、setupのdoctor経由で`AttributeError`となる経路を限定probeで再現した。このmoduleのOS模擬は`ei.installer.sys`参照だけの差し替えに限定し、stdlibや他moduleの実platformを変更しない。回帰試験で隔離と既存setup/uninstallの結果を確認する。製品の例外捕捉・安全境界・assertion・skip条件は変更しない。対象試験と差分レビュー、固定版全件試験後、同一公開SHAのLinux/macOS/Windows CIで確認する。
