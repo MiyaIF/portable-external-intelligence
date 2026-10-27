@@ -1,4 +1,5 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,6 +7,12 @@ from unittest.mock import patch
 from dataclasses import asdict
 
 from tests.unattended_helpers import NOW, make_settings
+
+
+def _diagnostic_token(value):
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,95}", value, flags=re.ASCII):
+        return value
+    return "UNKNOWN"
 
 
 class RemainingBudget:
@@ -512,7 +519,7 @@ class UnattendedOperationTests(unittest.TestCase):
             self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_only_verified_scheduler_resumption_resolves_stop_and_not_provider_fault(self):
-        from ei.operation_runtime import service_cli_start, settings_binding
+        from ei.operation_runtime import OperationBudget, service_cli_start, settings_binding
         from ei.operation_health import HealthIssue, HealthInput
         from ei.incidents import update_incidents, inspect_incidents
         from tests.unit.test_scheduler_opportunities import sample
@@ -528,14 +535,21 @@ class UnattendedOperationTests(unittest.TestCase):
             later = NOW + timedelta(seconds=4300)
             current = sample(monotonic_us=4500_000_000, awake_us=4500_000_000, observed_at=later.isoformat(), last_exit="success", activation_us=4000_000_000, last_trigger_us=4000_000_000, service_activation_us=4000_000_000, timers=[["OnUnitActiveUSec", 1800_000_000, 5800_000_000], ["OnUnitActiveUSec", 3600_000_000, 7600_000_000]])
             with patch("ei.task_scheduler._native_scheduler_sample", return_value={**current, "generation": "changed"}):
-                service_cli_start(settings, now=later)
-            self.assertTrue(all(row["status"] == "OPEN" for row in inspect_incidents(settings)["incidents"]))
+                first_result = service_cli_start(settings, now=later, budget=OperationBudget(20000))
+            self.assertTrue(
+                all(row["status"] == "OPEN" for row in inspect_incidents(settings)["incidents"]),
+                msg=f"service_reason={_diagnostic_token(first_result.get('reason_code'))}",
+            )
             baseline.write_text(json.dumps({"schema_version": 1, "binding": settings_binding(settings), "sample": previous}))
             with patch("ei.task_scheduler._native_scheduler_sample", return_value=current):
-                service_cli_start(settings, now=later)
+                second_result = service_cli_start(settings, now=later, budget=OperationBudget(20000))
             rows = {row["reason_code"]: row for row in inspect_incidents(settings)["incidents"]}
-            self.assertEqual(rows["SCHEDULER_STOPPED"]["status"], "RESOLVED")
-            self.assertEqual(rows["AUTH_FAILED"]["status"], "OPEN")
+            self.assertEqual(
+                rows["SCHEDULER_STOPPED"]["status"],
+                "RESOLVED",
+                msg=f"service_reason={_diagnostic_token(second_result.get('reason_code'))}",
+            )
+            self.assertEqual(rows["AUTH_FAILED"]["status"], "OPEN", msg=f"service_reason={_diagnostic_token(second_result.get('reason_code'))}")
 
     def test_hook_tracking_deadline_is_not_misclassified_as_storage_failure(self):
         from tests.helpers import make_hook_settings

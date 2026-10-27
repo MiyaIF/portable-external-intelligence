@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import re
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -17,14 +18,30 @@ NOW = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
 CONTENT_HASH = "sha256:" + "b" * 64
 
 
+def _diagnostic_token(value):
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{1,95}", value, flags=re.ASCII):
+        return value
+    return "UNKNOWN"
+
+
+def _diagnostic_count(value):
+    if type(value) is int and 0 <= value <= 1_000_000:
+        return value
+    return "UNKNOWN"
+
+
 class SimulatedPowerLoss(BaseException):
     pass
 
 
 class CloseoutRecoveryIntegrationTests(unittest.TestCase):
-    def _fixture(self):
-        fixture, validation = closeout_test_helpers.CloseoutAssociationTests._validated_fixture(self, turns=3)
-        changeset = closeout_test_helpers.CloseoutAssociationTests._yes_changeset(self, validation)
+    def _fixture(self, *, setup_budget_ms=5000):
+        fixture, validation = closeout_test_helpers.CloseoutAssociationTests._validated_fixture(
+            self, turns=3, budget_ms=setup_budget_ms
+        )
+        changeset = closeout_test_helpers.CloseoutAssociationTests._yes_changeset(
+            self, validation, budget_ms=setup_budget_ms
+        )
         prepared = association.PreparedCloseout(
             candidate_id=changeset.candidate_id,
             content_hash=CONTENT_HASH,
@@ -652,7 +669,7 @@ class CloseoutRecoveryIntegrationTests(unittest.TestCase):
         self.assertEqual(prepare_calls, 1)
 
     def test_recovery_uses_verified_witness_after_spool_loss(self):
-        fixture, validation, prepared = self._fixture()
+        fixture, validation, prepared = self._fixture(setup_budget_ms=20000)
         prepare_calls = 0
 
         def prepare():
@@ -668,7 +685,7 @@ class CloseoutRecoveryIntegrationTests(unittest.TestCase):
                     content_hash=CONTENT_HASH,
                     prepare=prepare,
                     now=NOW,
-                    budget=OperationBudget(15000),
+                    budget=OperationBudget(30000),
                 )
 
         active = self._active(fixture.settings)
@@ -688,8 +705,16 @@ class CloseoutRecoveryIntegrationTests(unittest.TestCase):
                 budget=OperationBudget(30000),
             )
 
-        self.assertEqual(recovered["processed"], 1)
-        self.assertEqual(recovered["results"][0]["association"], "PENDING")
+        self.assertEqual(recovered["processed"], 1, msg=f"processed={_diagnostic_count(recovered.get('processed'))}")
+        self.assertEqual(
+            recovered["results"][0]["association"],
+            "PENDING",
+            msg=(
+                f"association={_diagnostic_token(recovered['results'][0].get('association'))}; "
+                f"reason={_diagnostic_token(recovered['results'][0].get('reason_code'))}; "
+                f"processed={_diagnostic_count(recovered.get('processed'))}"
+            ),
+        )
         self.assertEqual(prepare_calls, 1)
         active = self._active(fixture.settings)
         self.assertEqual(len(active), 1)

@@ -1426,3 +1426,13 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 対象は `tests/integration/test_organizer_restart.py` と本計画書。同じ公開SHAでjournal再開とbudget admission分離の機能試験が完了件数の不一致で失敗した。既定5秒を暗黙使用していた15呼出しだけにtest-localの有限30秒を明示し、明示10秒／30秒の既存6呼出し、token・試行回数制限、provider呼出数、保存・復旧の全assertionを維持する。失敗した2ケースには結果reprの診断を追加する。これはCI実行速度への機能fixture依存を限定する変更であり、元の失敗原因が期限切れと確定したとは扱わず、5秒性能や製品不具合の解決を保証しない。対象moduleと固定版全件試験、レビュー、同一公開SHAの必須CIで確認する。
 
 **追加Files:** `tests/integration/test_hook_canary.py`。別のWindows jobで失敗した3イベントのinstance分離とStop台帳耐久性の1ケースだけ、test-localの設定予算と呼出し予算を有限30秒にそろえる。製品の300ms Stop予算・他Hook予算、共通fixture、独立したdeadline試験、既存の全保存／分離assertionは変更しない。結果status・件数の限定診断を追加し、元のCI失敗の期限原因は未確定のまま扱う。Hookの実機速度や自動取得成功は別に検証する。
+
+**追加Files:** `tests/acceptance/test_reliable_automatic_accumulation.py`。次の公開CIで、候補中の命令文がroot・整理AI・通知設定を変更できないことを確認する1ケースが失敗した。具体的なassertionと期限原因はログからは未確定。成功が前提の候補作成にだけ有限20秒のOperationBudgetを明示し、受領・完了の結果に診断を追加する。明示30秒の保守予算、保存・プライバシー・設定不変更・通知禁止の全assertion、他ケース、製品の既定期限は維持する。対象ケース／module、レビュー、固定版全件検証、同一公開SHAのCIで再確認する。
+
+## Windows取得・復旧の機能fixtureと期限試験の分離
+
+**Files:** `tests/integration/test_capture_catchup.py`、`tests/integration/test_capture_fallback.py`、`tests/integration/test_closeout_recovery.py`、`tests/integration/test_unattended_operation.py`、fixture引数を追加する `tests/unit/test_closeout_association.py`、本計画書。
+
+公開CIの詳細ログで、fallbackの故障分類が既定300msのStop期限に先取りされること、直接取得の準備が5秒で期限切れになるケースを確認した。fallback内の機能Hook試験と直接取得に有限20秒を明示する。catchupで失敗した3つの成功回収経路だけoptional引数で20秒にし、初回の回収成功と理由を検査する。共通10秒、ロック保持中の拒否、byte上限500の試験は維持する。
+
+closeoutの保存証跡からの復旧1ケースは、共通fixtureの既定5秒を変えずoptional引数で準備だけ20秒、適用だけ30秒とする。削除10秒、復旧30秒と既存の保存・証跡・再試行回数のassertionは維持する。scheduler復旧とprovider故障の分離1ケースの `service_cli_start` 2呼出しだけ20秒を明示する。原因不明のケースは安定化仮説として扱い、有限の状態・理由・件数を診断へ追加する。製品期限、意図的な期限切れ試験、安全検査、成功条件、認証・送信許可は変更しない。影響対象の全moduleと固定版全件試験、レビュー、同一公開SHAのCIで確認する。

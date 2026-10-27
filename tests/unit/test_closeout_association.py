@@ -84,21 +84,21 @@ class CloseoutAssociationTests(unittest.TestCase):
         self.assertTrue(hasattr(module, "PreparedCloseout"))
         return module
 
-    def _validated_fixture(self, *, turns: int = 2):
+    def _validated_fixture(self, *, turns: int = 2, budget_ms: int = 5000):
         from ei.closeout_context import validate_adapter_context
 
         fixture = InstalledAdapterFixture(self, turns=turns)
         with patch.dict(registry._ADAPTERS, {fixture.host_id: fixture.adapter}):
             for event in fixture.events:
                 result = handle_normalized_hook(
-                    event, fixture.settings, budget=OperationBudget(5000)
+                    event, fixture.settings, budget=OperationBudget(budget_ms)
                 )
                 self.assertTrue(result.continue_work)
             validation = validate_adapter_context(
                 fixture.settings,
                 fixture.host_id,
                 fixture.control_for(fixture.events[:2]),
-                budget=OperationBudget(5000),
+                budget=OperationBudget(budget_ms),
             )
         previous_adapter = registry._ADAPTERS.get(fixture.host_id)
         registry._ADAPTERS[fixture.host_id] = fixture.adapter
@@ -113,7 +113,7 @@ class CloseoutAssociationTests(unittest.TestCase):
         self.assertTrue(validation.valid, validation.reason_code)
         return fixture, validation
 
-    def _yes_changeset(self, validation):
+    def _yes_changeset(self, validation, *, budget_ms: int = 5000):
         from ei.curator import curate_candidate
 
         context = validation.context
@@ -142,7 +142,7 @@ class CloseoutAssociationTests(unittest.TestCase):
             candidate,
             [],
             None,
-            operation_budget=OperationBudget(5000),
+            operation_budget=OperationBudget(budget_ms),
         )
 
     def test_two_target_commit_requires_real_marker(self):

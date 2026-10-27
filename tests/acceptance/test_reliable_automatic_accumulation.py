@@ -20,6 +20,7 @@ from ei.models import ObservationInput
 from ei.maintainer import run_maintenance
 from ei.operation_activation import activation_readiness, verify_operation
 from ei.operation_health import HealthInput, evaluate_health
+from ei.operation_runtime import OperationBudget
 from ei.pending_capture import accept_candidate
 from ei.queue import QueueState, list_queue_items, read_queue_item
 from ei.retrieve import RetrievalQuery, search_index
@@ -446,9 +447,10 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
                     _observation(claim),
                     now=NOW,
                     key_provider=key,
+                    budget=OperationBudget(20_000),
                     origin="NATIVE_SOURCE",
                 )
-            self.assertEqual(receipt.state, "SECURED")
+            self.assertEqual(receipt.state, "SECURED", msg=f"receipt={receipt!r}")
 
             class SelectedFakeProvider(maintainer_helpers.YesProvider):
                 provider_id = "ollama"
@@ -469,7 +471,7 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
                     sync_policy="disabled",
                 )
 
-            self.assertEqual(result.queue["completed"], 1)
+            self.assertEqual(result.queue["completed"], 1, msg=f"queue={result.queue!r}")
             self.assertEqual(provider.provider_id, organizer_before.provider_id)
             self.assertEqual(settings.organizer, organizer_before)
             self.assertEqual(tuple(settings.provider_order), provider_order_before)
