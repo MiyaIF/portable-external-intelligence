@@ -14,7 +14,11 @@
 
 ## クイックスタート
 
-GitとPython 3.11以降を用意し、リポジトリを取得してから対象OSのラッパーを実行します。
+リポジトリを取得して、対象OSのsetupを実行します。setupはGitとPython 3.11以降（venvを含む）を確認し、不足していれば導入方法を表示して承認を求めます。承認後の導入・動作確認に成功すると、続けて外部知能を構築します。
+
+追加のパッケージ管理アプリは要求しません。Windowsは既存のWinGet、Linuxは既存のapt-get・dnf、macOSはAppleのCommand Line ToolsとPython公式インストーラーを使います。既に使えるGit・Pythonは導入元を問わず再利用します。macOSでは利用者がインストーラーの画面を操作する必要があります。利用できない導入経路では公式の手動手順を案内します。詳しくは [セットアップ](docs/setup.md) を参照してください。
+
+GitがまだないPCでは、GitHubの **Code → Download ZIP** で取得し、展開したフォルダからsetupを実行してください。利用するAIのCLIの導入・ログインは別途必要です。
 
 ```text
 git clone https://github.com/MiyaIF/portable-external-intelligence.git
@@ -40,8 +44,11 @@ sh scripts/setup.sh
 1. 作業・記憶取得CLIを1件以上選ぶ（`1` または `1,2`）。
 2. 整理AIを1件だけ選ぶ。`subscription-cli` を選ぶ場合だけ整理用Hostも選ぶ。
 3. `local`、`github-new`、`github-existing` の知識モードと個人ナレッジの保存先を選ぶ。
-4. 必要ならチーム保存先、同期、スケジュール、Skillの配置方法を選ぶ。
-5. `--check-only` で計画を確認し、適用時は `--accept-plan` を付ける。
+4. 必要ならチーム保存先を指定し、Git同期と定期的な記憶整理を別々に選ぶ。定期整理はAIの利用枠を消費する場合があります。
+5. 内容を確認して適用する。非対話では `--check-only` で計画を確認し、適用時は `--accept-plan` を付ける。
+6. 表示された手順で、利用者が各CLIのHook内容を確認・承認する。短い依頼を使った新規セッションを終了した後、setupで `r` を入力すると実際の受信状態を再確認できる。
+
+定期整理は同意して有効化した場合だけ動きます。初回の質問でEnterだけを押した場合は無効です。Hook未承認・定期処理停止を「自動運用完了」とは表示しません。後で承認する場合はEnterで終了でき、setupを再実行しても既存ナレッジは保持されます。依存ソフトの導入に使える方法と、導入を断った場合の扱いは[セットアップ手順](docs/setup.md)を参照してください。
 
 作業CLIと整理用Hostは別にできます。たとえば作業CLIを `codex-cli` と
 `test-compatible-cli`、整理用Hostを `gemini-cli` とする構成です。
@@ -90,6 +97,8 @@ profileは実行時の機械ローカル領域へ複製し、元ファイルの�
 
 ## 保存先とチームナレッジ
 
+自分のナレッジを見るときは、個人保存先の `knowledge/index.md` を開いてください。記録・候補・有効化済み知識へのリンクと件数があります。[ナレッジの見方と状態の確認](docs/knowledge-guide.md)で各フォルダの役割、候補の不足条件、索引の更新待ちを説明しています。
+
 保存先は互いに重ならない4つの役割に分かれます。
 
 | 役割 | 内容 |
@@ -114,6 +123,10 @@ profileは実行時の機械ローカル領域へ複製し、元ファイルの�
 Hookは候補をsanitized envelopeとしてappend-only eventへ渡します。整理AIは1件の選択済みproviderだけを呼び、候補を `YES`、`NO`、または `DEFERRED` に分類します。別providerへ自動切替しません。`DEFERRED` の候補はqueueとpayload参照を保持して、次のmaintenanceで再試行します。
 
 取得は整理AIを必要としません。個人projectionと、設定時だけ使うteam projectionを同じ上限で統合します。整理AIが利用不能でも、すでにactiveなpatternは取得できます。
+
+無操作運用でのreceipt・未整理spool・保存済みknowledgeの違い、通知時の対応、保持期限と実証範囲は[無操作運用ガイド](docs/unattended-operation.md)を参照してください。隔離fixtureやCIは実HostでのHook受信、scheduler実行、OS通知表示の証明にはなりません。
+
+登録Host adapterからのcloseout関連付けは、明示されたtrusted対象と構造化評価がある場合だけ動作します。既存のpublic adaptersはnative closeout coverage metadataを提供せず、contextが不足する対象の関連付けは`UNKNOWN`です。fake adapterの受入テストはpublic Host対応の宣言ではありません。
 
 ## 状態の意味
 

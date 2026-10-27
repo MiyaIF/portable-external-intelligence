@@ -446,27 +446,37 @@ def _rank_patterns(
     *,
     result_limit: int | None,
     knowledge_scope: str = "personal",
+    budget=None,
 ) -> list[RetrievalHit]:
+    def checked(values):
+        if budget is not None:
+            budget.check()
+        for value in values:
+            if budget is not None:
+                budget.check()
+            yield value
+        if budget is not None:
+            budget.check()
     policy = policy or RetrievalPolicy.defaults()
     if isinstance(patterns, KnowledgeIndex):
-        return search_index(patterns, query, policy)
+        return search_index(patterns, query, policy, budget=budget)
     eligible: list[Mapping[str, Any]] = []
-    for raw_pattern in patterns:
+    for raw_pattern in checked(patterns):
         pattern = _pattern_mapping(raw_pattern)
         if _eligible(query, pattern, policy):
             eligible.append(pattern)
     if not eligible:
         return []
     tokenized = []
-    for pattern in eligible:
+    for pattern in checked(eligible):
         text = " ".join(str(pattern.get(name, "")) for name in ("rule", "title", "claim", "domain"))
         tokenized.append((pattern, _as_tokens(text)))
-    average_length = sum(len(tokens) for _, tokens in tokenized) / max(1, len(tokenized))
+    average_length = sum(len(tokens) for _, tokens in checked(tokenized)) / max(1, len(tokenized))
     query_tokens = _as_tokens(query.text)
-    dates = [parsed for pattern in eligible if (parsed := _parse_date(pattern.get("updated_at"))) is not None]
-    latest = max(dates, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+    dates = [parsed for pattern in checked(eligible) if (parsed := _parse_date(pattern.get("updated_at"))) is not None]
+    latest = max(checked(dates), default=datetime(1970, 1, 1, tzinfo=timezone.utc))
     scored: list[tuple[float, Mapping[str, Any]]] = []
-    for pattern, document_tokens in tokenized:
+    for pattern, document_tokens in checked(tokenized):
         lexical_raw = _bm25(query_tokens, document_tokens, average_length)
         lexical = lexical_raw / (lexical_raw + 1.0) if lexical_raw else 0.0
         scope = _scope_score(query, pattern)
@@ -494,21 +504,22 @@ def _rank_patterns(
             scored.append((score, pattern))
 
     best_by_cluster: dict[str, tuple[float, Mapping[str, Any]]] = {}
-    for score, pattern in scored:
+    for score, pattern in checked(scored):
         cluster_id = str(pattern.get("cluster_id") or pattern.get("pattern_id"))
         current = best_by_cluster.get(cluster_id)
         pattern_id = str(pattern.get("pattern_id"))
         if current is None or score > current[0] or (math.isclose(score, current[0], abs_tol=1e-12) and pattern_id < str(current[1].get("pattern_id"))):
             best_by_cluster[cluster_id] = (score, pattern)
 
-    ranked = sorted(
-        best_by_cluster.values(),
-        key=lambda item: (-round(item[0], 12), str(item[1].get("pattern_id", "")), str(item[1].get("cluster_id", ""))),
-    )
+    def sort_key(item):
+        if budget is not None:
+            budget.check()
+        return (-round(item[0], 12), str(item[1].get("pattern_id", "")), str(item[1].get("cluster_id", "")))
+    ranked = sorted(checked(best_by_cluster.values()), key=sort_key)
     if result_limit is not None:
         ranked = ranked[:result_limit]
     result: list[RetrievalHit] = []
-    for score, pattern in ranked:
+    for score, pattern in checked(ranked):
         applicability = _values(pattern, "applicability", "scope_tags", "domains")
         evidence_count = int(max(0, _numeric(pattern, "evidence_count", default=len(_values(pattern, "provenances", "evidence_ids")))))
         result.append(
@@ -534,21 +545,22 @@ def rank_patterns(
     query: RetrievalQuery,
     patterns: Iterable[PatternState | Mapping[str, Any]] | KnowledgeIndex,
     policy: RetrievalPolicy | None = None,
+    *, budget=None,
 ) -> list[RetrievalHit]:
     """Rank patterns using the policy's result limit (legacy API)."""
 
     policy = policy or RetrievalPolicy.defaults()
-    return _rank_patterns(query, patterns, policy, result_limit=policy.max_results)
+    return _rank_patterns(query, patterns, policy, result_limit=policy.max_results, budget=budget)
 
 
-def search_index(index: KnowledgeIndex, query: RetrievalQuery, policy: RetrievalPolicy | None = None) -> list[RetrievalHit]:
+def search_index(index: KnowledgeIndex, query: RetrievalQuery, policy: RetrievalPolicy | None = None, *, budget=None) -> list[RetrievalHit]:
     if not isinstance(index, KnowledgeIndex):
         raise TypeError("KNOWLEDGE_INDEX_REQUIRED")
     from .index import read_index_items
 
-    patterns = read_index_items(index, list(index.active_pattern_ids) or None)
+    patterns = read_index_items(index, list(index.active_pattern_ids) or None, budget=budget)
     selected_policy = policy or RetrievalPolicy.defaults()
-    return _rank_patterns(query, patterns, selected_policy, result_limit=selected_policy.max_results)
+    return _rank_patterns(query, patterns, selected_policy, result_limit=selected_policy.max_results, budget=budget)
 
 
 def search_index_candidates(
@@ -782,11 +794,17 @@ def _exposure_dict(exposure: ExposureRecord | Mapping[str, Any]) -> dict[str, An
     return {key: result[key] for key in sorted(result)}
 
 
-def record_retrieval_exposure(exposure: ExposureRecord | Mapping[str, Any], path: Path) -> None:
+def record_retrieval_exposure(exposure: ExposureRecord | Mapping[str, Any], path: Path, *, budget=None) -> None:
+    if budget is not None:
+        budget.check()
     payload = _exposure_dict(exposure)
 
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
     target = Path(path)
+    if budget is not None:
+        from .measurement_events import _append_log_line
+        _append_log_line(target, line, budget=budget)
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
     if hasattr(os, "O_BINARY"):

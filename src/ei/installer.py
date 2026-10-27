@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -99,6 +100,13 @@ CODEX_SETTINGS_HOST_IDS = frozenset({"codex-cli", "codex-app"})
 RUNTIME_DIRECTORY_NAMES = ("queue", "spool", "emergency-spool", "cursor", "locks", "cache", "logs", "backups", "state", "transactions")
 TEAM_RUNTIME_DIRECTORY_NAMES = ("team-cache", "team-outbox", "team-identities")
 SKILL_BINDING_NAME = ".external-intelligence-binding.json"
+WINDOWS_NOTIFICATION_APP_ID = "MiyaIF.ExternalIntelligence"
+WINDOWS_NOTIFICATION_SHORTCUT_NAME = "External Intelligence.lnk"
+WINDOWS_NOTIFICATION_RECORD_NAME = "notification-registration.json"
+WINDOWS_NOTIFICATION_OWNERSHIP_NAME = "windows-notification-ownership.json"
+WINDOWS_NOTIFICATION_MAX_SHORTCUT_BYTES = 65536
+WINDOWS_NOTIFICATION_MAX_RECORD_BYTES = 8192
+WINDOWS_NOTIFICATION_MAX_JOURNAL_BYTES = 1_048_576
 PRIVACY_PROFILES = frozenset({"public", "private-reusable", "client-confidential", "machine-local"})
 _TEAM_MEMBER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,63}$")
 
@@ -123,6 +131,369 @@ def _hash_path(path: Path) -> str | None:
         return _sha256(path.read_bytes()) if path.is_file() else None
     except OSError:
         return None
+
+
+def _strict_json_object(raw: bytes) -> dict[str, Any]:
+    def object_from_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("JSON_DUPLICATE_KEY")
+            value[key] = item
+        return value
+
+    value = json.loads(raw.decode("utf-8"), object_pairs_hook=object_from_pairs)
+    if not isinstance(value, dict):
+        raise ValueError("JSON_OBJECT_REQUIRED")
+    return value
+
+
+def _windows_notification_locations(runtime: Path) -> dict[str, Path] | None:
+    if sys.platform != "win32":
+        return None
+    system_root = os.environ.get("SystemRoot")
+    roaming = os.environ.get("APPDATA")
+    local = os.environ.get("LOCALAPPDATA")
+    if not all(isinstance(item, str) and item for item in (system_root, roaming, local)):
+        return None
+    target = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    script = Path(__file__).resolve().parents[2] / "scripts" / "notifications" / "register-windows-notification.ps1"
+    shortcut = Path(roaming) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / WINDOWS_NOTIFICATION_SHORTCUT_NAME
+    registration = Path(local) / "MiyaIF" / "ExternalIntelligence" / WINDOWS_NOTIFICATION_RECORD_NAME
+    receipt = runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME
+    try:
+        for candidate in (target, script, shortcut, registration, receipt):
+            assert_no_reparse_components(candidate)
+        assert_safe_target(target.parent, target, allow_missing=False, expected_type="file")
+        assert_safe_target(script.parent, script, allow_missing=False, expected_type="file")
+        assert_safe_target(runtime, receipt, allow_missing=True, expected_type="file")
+    except (OSError, SafeFilesystemError, ValueError):
+        return None
+    return {
+        "target": absolute_path(target),
+        "script": absolute_path(script),
+        "shortcut": absolute_path(shortcut),
+        "registration": absolute_path(registration),
+        "receipt": absolute_path(receipt),
+    }
+
+
+def _read_bounded_notification_file(path: Path, *, max_bytes: int) -> bytes | None:
+    """Read a fixed notification artifact without allocating beyond its limit."""
+    try:
+        assert_no_reparse_components(path)
+        assert_safe_target(path.parent, path, allow_missing=False, expected_type="file")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or before.st_size > max_bytes:
+                return None
+            raw = stream.read(max_bytes + 1)
+            after = os.fstat(stream.fileno())
+        current = path.stat(follow_symlinks=False)
+        identity = lambda item: (item.st_dev, item.st_ino, item.st_size, item.st_mtime_ns)
+        if len(raw) > max_bytes or identity(before) != identity(after) or identity(after) != identity(current):
+            return None
+        return raw
+    except (OSError, ValueError, SafeFilesystemError):
+        return None
+
+
+def _notification_receipt_bytes(
+    status: str,
+    transaction_id: str,
+    target: Path,
+    shortcut_sha256: str | None,
+    registration_sha256: str | None,
+) -> bytes:
+    return _json_bytes({
+        "schema_version": 1,
+        "status": status,
+        "transaction_id": transaction_id,
+        "app_id": WINDOWS_NOTIFICATION_APP_ID,
+        "target": str(target),
+        "shortcut_sha256": shortcut_sha256,
+        "registration_sha256": registration_sha256,
+    })
+
+
+def _read_notification_receipt(path: Path, expected_target: Path) -> dict[str, Any] | None:
+    try:
+        assert_no_reparse_components(path)
+        assert_safe_target(path.parent, path, allow_missing=True, expected_type="file")
+        if not path.is_file():
+            return None
+        raw = _read_bounded_notification_file(path, max_bytes=WINDOWS_NOTIFICATION_MAX_RECORD_BYTES)
+        if raw is None:
+            return {"status": "INVALID"}
+        value = _strict_json_object(raw)
+    except (OSError, UnicodeError, ValueError, SafeFilesystemError, json.JSONDecodeError):
+        return {"status": "INVALID"}
+    keys = {
+        "schema_version", "status", "transaction_id", "app_id", "target",
+        "shortcut_sha256", "registration_sha256",
+    }
+    if set(value) != keys or type(value.get("schema_version")) is not int or value.get("schema_version") != 1:
+        return {"status": "INVALID"}
+    status = value.get("status")
+    transaction_id = value.get("transaction_id")
+    target = value.get("target")
+    if (
+        status not in {"PREPARED", "REGISTERED", "REMOVAL_PREPARED", "ROLLBACK_REQUIRED"}
+        or not isinstance(transaction_id, str)
+        or re.fullmatch(r"tx_[0-9a-f]{32}", transaction_id) is None
+        or value.get("app_id") != WINDOWS_NOTIFICATION_APP_ID
+        or not isinstance(target, str)
+        or os.path.normcase(target) != os.path.normcase(str(expected_target))
+    ):
+        return {"status": "INVALID"}
+    shortcut_hash = value.get("shortcut_sha256")
+    registration_hash = value.get("registration_sha256")
+    if status == "PREPARED":
+        if shortcut_hash is not None or registration_hash is not None:
+            return {"status": "INVALID"}
+    elif not all(isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) for digest in (shortcut_hash, registration_hash)):
+        return {"status": "INVALID"}
+    return value
+
+
+def _prepared_notification_journal_resolution(
+    runtime: Path,
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+    *,
+    expected_status: str,
+) -> str | None:
+    """Validate the fixed, single-file journal proving a PREPARED receipt."""
+    transaction_id = receipt.get("transaction_id")
+    if not isinstance(transaction_id, str) or re.fullmatch(r"tx_[0-9a-f]{32}", transaction_id) is None:
+        return None
+    try:
+        if absolute_path(receipt_path) != absolute_path(runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME):
+            return None
+        receipt_raw = _read_bounded_notification_file(receipt_path, max_bytes=WINDOWS_NOTIFICATION_MAX_RECORD_BYTES)
+        if receipt_raw is None or _strict_json_object(receipt_raw) != dict(receipt):
+            return None
+        directory = runtime / "transactions"
+        journal_path = directory / (transaction_id + ".json")
+        assert_safe_target(runtime, directory, allow_missing=False, expected_type="dir")
+        assert_safe_target(directory, journal_path, allow_missing=False, expected_type="file")
+        journal_raw = _read_bounded_notification_file(journal_path, max_bytes=WINDOWS_NOTIFICATION_MAX_JOURNAL_BYTES)
+        if journal_raw is None:
+            return None
+        journal = _strict_json_object(journal_raw)
+    except (OSError, UnicodeError, ValueError, SafeFilesystemError, json.JSONDecodeError):
+        return None
+    if (
+        set(journal) != {"schema_version", "transaction_id", "status", "started_at", "entries"}
+        or type(journal.get("schema_version")) is not int
+        or journal.get("schema_version") != 1
+        or journal.get("transaction_id") != transaction_id
+        or journal.get("status") != expected_status
+        or not isinstance(journal.get("started_at"), str)
+    ):
+        return None
+    entries = journal.get("entries")
+    if not isinstance(entries, list) or len(entries) != 1 or not isinstance(entries[0], Mapping):
+        return None
+    entry = entries[0]
+    expected_digest = _sha256(receipt_raw)
+    expected_entry_keys = {"kind", "target", "existed", "before_hash", "after_hash", "backup_path", "ownership", "details"}
+    owner = entry.get("ownership")
+    details = entry.get("details")
+    if (
+        set(entry) != expected_entry_keys
+        or entry.get("kind") != "file"
+        or entry.get("target") != str(absolute_path(receipt_path))
+        or entry.get("existed") is not False
+        or entry.get("before_hash") is not None
+        or entry.get("after_hash") != expected_digest
+        or entry.get("backup_path") is not None
+        or not isinstance(owner, Mapping)
+        or set(owner) != {"schema_version", "token", "kind", "root", "target", "created_at", "expected_digest"}
+        or owner.get("expected_digest") != expected_digest
+        or not isinstance(details, Mapping)
+        or details.get("kind") != "windows-notification-ownership"
+        or details.get("phase") != "prepared"
+    ):
+        return None
+    resolution = details.get("resolution")
+    if expected_status == "IN_PROGRESS":
+        if set(details) != {"kind", "phase"}:
+            return None
+        resolution = "PENDING"
+    elif (
+        set(details) != {"kind", "phase", "resolution"}
+        or resolution not in {"NO_EFFECT_EXECUTION_POLICY_BLOCKED", "NO_EFFECT_OS_HELPER_START_FAILED"}
+    ):
+        return None
+    try:
+        validated_owner = _validate_transaction_owner(entry, receipt_path)
+    except (OSError, ValueError, SafeFilesystemError):
+        return None
+    if validated_owner.get("expected_digest") != expected_digest:
+        return None
+    return str(resolution)
+
+
+def _prepared_notification_no_effect_resolution(
+    runtime: Path,
+    locations: Mapping[str, Path],
+    receipt: Mapping[str, Any],
+) -> str | None:
+    if receipt.get("status") != "PREPARED":
+        return None
+    resolution = _prepared_notification_journal_resolution(
+        runtime,
+        locations["receipt"],
+        receipt,
+        expected_status="COMMITTED",
+    )
+    if resolution is None or not _notification_artifacts_match(locations, receipt, allow_missing=True):
+        return None
+    return resolution
+
+
+def _clear_no_effect_notification_receipt(
+    runtime: Path,
+    receipt_path: Path,
+    receipt: Mapping[str, Any],
+) -> bool:
+    try:
+        raw = _read_bounded_notification_file(receipt_path, max_bytes=WINDOWS_NOTIFICATION_MAX_RECORD_BYTES)
+        if raw is None or _strict_json_object(raw) != dict(receipt):
+            return False
+        safe_unlink(runtime, receipt_path, expected_digest=_sha256(raw), allow_missing=False)
+        return True
+    except (OSError, ValueError, SafeFilesystemError, json.JSONDecodeError):
+        return False
+
+
+def _notification_artifacts_match(
+    locations: Mapping[str, Path],
+    receipt: Mapping[str, Any],
+    *,
+    allow_missing: bool = False,
+) -> bool:
+    shortcut = locations["shortcut"]
+    registration = locations["registration"]
+    try:
+        for path in (shortcut, registration):
+            assert_no_reparse_components(path)
+            if path.exists() or path.is_symlink():
+                assert_safe_target(path.parent, path, allow_missing=False, expected_type="file")
+        shortcut_exists = shortcut.is_file()
+        registration_exists = registration.is_file()
+        if allow_missing:
+            if not shortcut_exists and not registration_exists:
+                return True
+        elif not shortcut_exists or not registration_exists:
+            return False
+        if shortcut_exists:
+            raw_shortcut = _read_bounded_notification_file(shortcut, max_bytes=WINDOWS_NOTIFICATION_MAX_SHORTCUT_BYTES)
+            if raw_shortcut is None or hashlib.sha256(raw_shortcut).hexdigest() != receipt.get("shortcut_sha256"):
+                return False
+        if registration_exists:
+            raw_record = _read_bounded_notification_file(registration, max_bytes=WINDOWS_NOTIFICATION_MAX_RECORD_BYTES)
+            if raw_record is None or hashlib.sha256(raw_record).hexdigest() != receipt.get("registration_sha256"):
+                return False
+            record = _strict_json_object(raw_record)
+            if (
+                set(record) != {"schema_version", "app_id", "shortcut_sha256", "target"}
+                or type(record.get("schema_version")) is not int
+                or record.get("schema_version") != 1
+                or record.get("app_id") != WINDOWS_NOTIFICATION_APP_ID
+                or record.get("shortcut_sha256") != receipt.get("shortcut_sha256")
+                or not isinstance(record.get("target"), str)
+                or os.path.normcase(record["target"]) != os.path.normcase(str(locations["target"]))
+            ):
+                return False
+        return True
+    except (OSError, UnicodeError, ValueError, SafeFilesystemError, json.JSONDecodeError):
+        return False
+
+
+def _run_windows_notification_registration(
+    action: str,
+    target: Path,
+    *,
+    expected_shortcut_sha256: str | None = None,
+    expected_registration_sha256: str | None = None,
+) -> dict[str, Any]:
+    if action not in {"register", "verify", "unregister"}:
+        return {"status": "UNVERIFIED", "reason_code": "OS_ACTION_INVALID"}
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        return {"status": "UNAVAILABLE", "reason_code": "OS_UNAVAILABLE"}
+    executable = Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    script = Path(__file__).resolve().parents[2] / "scripts" / "notifications" / "register-windows-notification.ps1"
+    verb = {"register": "Register", "verify": "Verify", "unregister": "Unregister"}[action]
+    command = [str(executable), "-NoLogo", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-File", str(script), "-Action", verb, "-Target", str(target)]
+    if expected_shortcut_sha256 is not None:
+        command.extend(("-ExpectedShortcutSha256", expected_shortcut_sha256))
+    if expected_registration_sha256 is not None:
+        command.extend(("-ExpectedRegistrationSha256", expected_registration_sha256))
+    try:
+        assert_no_reparse_components(executable)
+        assert_no_reparse_components(script)
+    except (OSError, SafeFilesystemError):
+        return {"status": "UNVERIFIED", "reason_code": "OS_HELPER_BOUNDARY_UNVERIFIED"}
+    try:
+        result = subprocess.run(
+            command,
+            shell=False,
+            creationflags=0x08000000 if os.name == "nt" else 0,
+            timeout=15,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "UNVERIFIED", "reason_code": "OS_HELPER_OUTCOME_UNKNOWN"}
+    except OSError:
+        return {"status": "UNAVAILABLE", "verified": False, "reason_code": "OS_HELPER_START_FAILED"}
+    except subprocess.SubprocessError:
+        return {"status": "UNVERIFIED", "reason_code": "OS_HELPER_OUTCOME_UNKNOWN"}
+    if result.returncode != 0:
+        stderr = result.stderr.casefold()
+        if "pssecurityexception" in stderr or "execution policy" in stderr:
+            return {"status": "DENIED", "verified": False, "reason_code": "EXECUTION_POLICY_BLOCKED"}
+        return {"status": "UNVERIFIED", "reason_code": "OS_RESPONSE_INVALID"}
+    if len(result.stdout.encode("utf-8", errors="replace")) > WINDOWS_NOTIFICATION_MAX_RECORD_BYTES:
+        return {"status": "UNVERIFIED", "reason_code": "OS_RESPONSE_INVALID"}
+    try:
+        value = _strict_json_object(result.stdout.encode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        return {"status": "UNVERIFIED", "reason_code": "OS_RESPONSE_INVALID"}
+    allowed = {"status", "verified", "target", "shortcut_sha256", "registration_sha256", "reason_code"}
+    if set(value) - allowed or value.get("status") not in {"REGISTERED", "CURRENT", "REMOVED", "CONFLICT", "UNAVAILABLE", "DENIED", "FAILED"} or type(value.get("verified")) is not bool:
+        return {"status": "UNVERIFIED", "reason_code": "OS_RESPONSE_INVALID"}
+    for name in ("target", "shortcut_sha256", "registration_sha256", "reason_code"):
+        item = value.get(name)
+        if item is not None and not isinstance(item, str):
+            return {"status": "UNVERIFIED", "reason_code": "OS_RESPONSE_INVALID"}
+    return value
+
+
+def _notification_status(status: str, reason_code: str, target: Path | None = None) -> dict[str, Any]:
+    result: dict[str, Any] = {"status": status, "reason_code": reason_code}
+    if target is not None:
+        result["target"] = str(target)
+    return result
+
+
+def _persist_notification_receipt(runtime: Path, raw: bytes, *, details: Mapping[str, Any]) -> None:
+    tx = _Transaction(runtime)
+    try:
+        tx.mutate_file(runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME, raw, details=details)
+        tx.commit()
+    except Exception:
+        if tx.status != "COMMITTED":
+            tx.rollback()
+        raise
 
 
 def _dir_hash(path: Path) -> str | None:
@@ -596,6 +967,8 @@ class SetupResult:
     knowledge_stores: Mapping[str, Any] = field(default_factory=dict)
     actions_required: tuple[Mapping[str, Any], ...] = ()
     compatibility_notices: tuple[str, ...] = ()
+    operation_state: Mapping[str, Any] = field(default_factory=dict)
+    notification_registration: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -621,6 +994,8 @@ class SetupResult:
             "knowledge_stores": dict(self.knowledge_stores),
             "actions_required": [dict(item) for item in self.actions_required],
             "compatibility_notices": list(self.compatibility_notices),
+            "operation_state": dict(self.operation_state),
+            "notification_registration": dict(self.notification_registration),
         }
 
 def _validate_transaction_owner(entry: Mapping[str, Any], target: Path) -> Mapping[str, Any]:
@@ -823,6 +1198,375 @@ class _Transaction:
         return {"status": self.status, "restored": restored, "conflicts": conflicts, "journal": str(self.journal_path)}
 
 
+def _notification_receipt_matches(left: Mapping[str, Any] | None, right: Mapping[str, Any]) -> bool:
+    if not isinstance(left, Mapping):
+        return False
+    return all(left.get(key) == right.get(key) for key in (
+        "schema_version", "status", "transaction_id", "app_id", "target",
+        "shortcut_sha256", "registration_sha256",
+    ))
+
+
+def _rollback_notification_journal(tx: _Transaction, target: Path, reason: str) -> dict[str, Any] | None:
+    try:
+        outcome = tx.rollback()
+    except Exception as exc:
+        return _notification_status("UNVERIFIED", f"{reason}_ROLLBACK_FAILED_{type(exc).__name__}", target)
+    rollback_status = outcome.get("status")
+    if rollback_status != "ROLLED_BACK":
+        safe_status = str(rollback_status) if isinstance(rollback_status, str) else "UNKNOWN"
+        return _notification_status("UNVERIFIED", f"{reason}_ROLLBACK_{safe_status}", target)
+    return None
+
+
+def _commit_notification_journal(
+    tx: _Transaction,
+    target: Path,
+    reason: str,
+    *,
+    no_effect_resolution: str | None = None,
+) -> dict[str, Any] | None:
+    prior_status = tx.status
+    prior_details: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    if no_effect_resolution is not None:
+        if no_effect_resolution not in {"NO_EFFECT_EXECUTION_POLICY_BLOCKED", "NO_EFFECT_OS_HELPER_START_FAILED"}:
+            return _notification_status("UNVERIFIED", f"{reason}_NO_EFFECT_RESOLUTION_INVALID", target)
+        for entry in tx.entries:
+            details = entry.get("details")
+            if (
+                entry.get("kind") == "file"
+                and entry.get("target") == str(absolute_path(tx.runtime_root / WINDOWS_NOTIFICATION_OWNERSHIP_NAME))
+                and isinstance(details, dict)
+                and details.get("kind") == "windows-notification-ownership"
+                and details.get("phase") == "prepared"
+            ):
+                prior_details.append((details, dict(details)))
+                details["resolution"] = no_effect_resolution
+        if len(prior_details) != 1:
+            return _notification_status("UNVERIFIED", f"{reason}_NO_EFFECT_JOURNAL_ENTRY_INVALID", target)
+    try:
+        tx.commit()
+    except Exception as exc:
+        tx.status = prior_status
+        for details, previous in prior_details:
+            details.clear()
+            details.update(previous)
+        return _notification_status("UNVERIFIED", f"{reason}_JOURNAL_FINALIZE_FAILED_{type(exc).__name__}", target)
+    return None
+
+
+def _finalize_notification_journal(tx: _Transaction, target: Path, reason: str) -> dict[str, Any] | None:
+    prior_status = tx.status
+    tx.status = "COMMITTED"
+    try:
+        tx._persist()
+    except Exception as exc:
+        tx.status = prior_status
+        return _notification_status("UNVERIFIED", f"{reason}_JOURNAL_FINALIZE_FAILED_{type(exc).__name__}", target)
+    return None
+
+
+def _ensure_windows_notification_registration(runtime: Path) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    locations = _windows_notification_locations(runtime)
+    if locations is None:
+        return _notification_status("UNAVAILABLE", "OS_UNAVAILABLE"), None
+    receipt_path = locations["receipt"]
+    target = locations["target"]
+    receipt = _read_notification_receipt(receipt_path, target)
+    if receipt is not None:
+        if receipt.get("status") == "INVALID":
+            return _notification_status("UNVERIFIED", "OWNERSHIP_RECEIPT_INVALID", target), None
+        if receipt.get("status") == "PREPARED":
+            no_effect = _prepared_notification_no_effect_resolution(runtime, locations, receipt)
+            if no_effect is None:
+                return _notification_status("UNVERIFIED", "OWNERSHIP_RECOVERY_REQUIRED", target), None
+            if not _clear_no_effect_notification_receipt(runtime, receipt_path, receipt):
+                return _notification_status("UNVERIFIED", "OWNERSHIP_NO_EFFECT_RECEIPT_CLEAR_FAILED", target), None
+            receipt = None
+        if receipt is not None and receipt.get("status") in {"REMOVAL_PREPARED", "ROLLBACK_REQUIRED"}:
+            cleanup = _remove_windows_notification_registration(runtime, locations, receipt, rollback=True)
+            if cleanup.get("status") != "REMOVED":
+                return cleanup, None
+            receipt = None
+        elif receipt is not None and receipt.get("status") != "REGISTERED":
+            return _notification_status("UNVERIFIED", "OWNERSHIP_RECEIPT_STATE_INVALID", target), None
+    if receipt is not None:
+        if not _notification_artifacts_match(locations, receipt):
+            return _notification_status("CONFLICT", "OWNED_TARGET_CHANGED", target), None
+        response = _run_windows_notification_registration(
+            "verify", target,
+            expected_shortcut_sha256=str(receipt["shortcut_sha256"]),
+            expected_registration_sha256=str(receipt["registration_sha256"]),
+        )
+        if (
+            response.get("status") == "CURRENT"
+            and response.get("verified") is True
+            and response.get("target") == str(target)
+            and response.get("shortcut_sha256") == receipt.get("shortcut_sha256")
+            and response.get("registration_sha256") == receipt.get("registration_sha256")
+        ):
+            return _notification_status("CURRENT", "OWNERSHIP_VERIFIED", target), None
+        return _notification_status("UNVERIFIED", str(response.get("reason_code") or "OWNERSHIP_VERIFICATION_FAILED"), target), None
+
+    shortcut = locations["shortcut"]
+    registration = locations["registration"]
+    try:
+        for path in (shortcut, registration):
+            assert_no_reparse_components(path)
+        if any(path.exists() or path.is_symlink() for path in (shortcut, registration)):
+            return _notification_status("CONFLICT", "PREEXISTING_UNOWNED_TARGET", target), None
+    except (OSError, SafeFilesystemError):
+        return _notification_status("UNVERIFIED", "TARGET_PATH_UNSAFE", target), None
+
+    tx = _Transaction(runtime)
+    prepared_raw = _notification_receipt_bytes("PREPARED", tx.transaction_id, target, None, None)
+    try:
+        tx.mutate_file(receipt_path, prepared_raw, details={"kind": "windows-notification-ownership", "phase": "prepared"})
+    except Exception as journal_error:
+        if tx.status != "COMMITTED":
+            rollback_failure = _rollback_notification_journal(tx, target, "OWNERSHIP_JOURNAL")
+            if rollback_failure is not None:
+                return rollback_failure, None
+        try:
+            current_receipt_hash = _hash_path(receipt_path)
+            if current_receipt_hash == _sha256(prepared_raw):
+                safe_unlink(runtime, receipt_path, expected_digest=current_receipt_hash, allow_missing=True)
+            elif current_receipt_hash is not None:
+                return _notification_status("UNVERIFIED", "OWNERSHIP_JOURNAL_RECEIPT_CHANGED", target), None
+        except (OSError, SafeFilesystemError) as exc:
+            return _notification_status(
+                "UNVERIFIED", f"OWNERSHIP_JOURNAL_RECEIPT_CLEANUP_FAILED_{type(exc).__name__}", target
+            ), None
+        return _notification_status("UNVERIFIED", f"OWNERSHIP_JOURNAL_FAILED_{type(journal_error).__name__}", target), None
+
+    response = _run_windows_notification_registration("register", target)
+    if response.get("status") == "CONFLICT" and response.get("verified") is False:
+        rollback_failure = _rollback_notification_journal(tx, target, "PREEXISTING_UNOWNED_TARGET")
+        if rollback_failure is not None:
+            return rollback_failure, None
+        return _notification_status("CONFLICT", "PREEXISTING_UNOWNED_TARGET", target), None
+    shortcut_hash = response.get("shortcut_sha256")
+    registration_hash = response.get("registration_sha256")
+    if (
+        response.get("status") != "REGISTERED"
+        or response.get("verified") is not True
+        or response.get("target") != str(target)
+        or not isinstance(shortcut_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", shortcut_hash) is None
+        or not isinstance(registration_hash, str)
+        or re.fullmatch(r"[0-9a-f]{64}", registration_hash) is None
+    ):
+        # The pre-effect journal remains as an explicit uncertain receipt.  A
+        # process interruption or malformed helper response cannot prove that
+        # no shortcut was created, so never erase this recovery marker.
+        no_effect_resolution = None
+        if response.get("status") == "DENIED" and response.get("reason_code") == "EXECUTION_POLICY_BLOCKED":
+            no_effect_resolution = "NO_EFFECT_EXECUTION_POLICY_BLOCKED"
+        elif response.get("status") == "UNAVAILABLE" and response.get("reason_code") == "OS_HELPER_START_FAILED":
+            no_effect_resolution = "NO_EFFECT_OS_HELPER_START_FAILED"
+        journal_failure = _commit_notification_journal(
+            tx,
+            target,
+            "OS_RESPONSE_UNVERIFIED",
+            no_effect_resolution=no_effect_resolution,
+        )
+        if journal_failure is not None:
+            return journal_failure, None
+        return _notification_status("UNVERIFIED", str(response.get("reason_code") or "OS_RESPONSE_UNVERIFIED"), target), None
+
+    registered_raw = _notification_receipt_bytes("REGISTERED", tx.transaction_id, target, shortcut_hash, registration_hash)
+    receipt_value = _strict_json_object(registered_raw)
+    if not _notification_artifacts_match(locations, receipt_value):
+        rollback = _remove_windows_notification_registration(runtime, locations, receipt_value, rollback=True)
+        journal_failure = _finalize_notification_journal(tx, target, "REGISTERED_TARGETS_UNVERIFIED")
+        if journal_failure is not None:
+            return journal_failure, None
+        if rollback.get("status") != "REMOVED":
+            reason = str(rollback.get("reason_code") or "ROLLBACK_UNVERIFIED")
+            return _notification_status("UNVERIFIED", f"REGISTERED_TARGETS_UNVERIFIED_{reason}", target), None
+        return _notification_status("UNVERIFIED", "REGISTERED_TARGETS_UNVERIFIED_ROLLED_BACK", target), None
+    try:
+        tx.mutate_file(receipt_path, registered_raw, details={"kind": "windows-notification-ownership", "phase": "registered"})
+        tx.commit()
+    except Exception as receipt_error:
+        rollback = _remove_windows_notification_registration(runtime, locations, receipt_value, rollback=True)
+        recovery_receipt_saved = True
+        if rollback.get("status") != "REMOVED":
+            recovery_receipt_saved = _persist_indeterminate_notification_receipt(
+                runtime, target, shortcut_hash, registration_hash, tx.transaction_id
+            )
+        journal_failure = _finalize_notification_journal(tx, target, "OWNERSHIP_RECEIPT_SAVE_FAILED")
+        if journal_failure is not None:
+            return journal_failure, None
+        if rollback.get("status") != "REMOVED":
+            rollback_reason = str(rollback.get("reason_code") or "ROLLBACK_UNVERIFIED")
+            if not recovery_receipt_saved:
+                rollback_reason += "_RECOVERY_RECEIPT_UNAVAILABLE"
+            return _notification_status("UNVERIFIED", f"OWNERSHIP_RECEIPT_SAVE_FAILED_{rollback_reason}", target), None
+        return _notification_status(
+            "UNVERIFIED", f"OWNERSHIP_RECEIPT_SAVE_FAILED_{type(receipt_error).__name__}_ROLLED_BACK", target
+        ), None
+    return _notification_status("REGISTERED", "OWNERSHIP_RECEIPT_SAVED", target), receipt_value
+
+
+def _persist_indeterminate_notification_receipt(
+    runtime: Path,
+    target: Path,
+    shortcut_hash: str,
+    registration_hash: str,
+    original_transaction_id: str,
+) -> bool:
+    raw = _notification_receipt_bytes("ROLLBACK_REQUIRED", original_transaction_id, target, shortcut_hash, registration_hash)
+    try:
+        _persist_notification_receipt(runtime, raw, details={"kind": "windows-notification-ownership", "phase": "rollback-required"})
+        return True
+    except Exception:
+        # Best-effort same-root repair; the prepared receipt/journal is still
+        # retained if this final write also fails.
+        try:
+            path = runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME
+            assert_safe_target(runtime, path, allow_missing=False, expected_type="file")
+            safe_atomic_write(runtime, path, raw)
+            return True
+        except (OSError, SafeFilesystemError, ValueError):
+            return False
+
+
+def _remove_windows_notification_registration(
+    runtime: Path,
+    locations: Mapping[str, Path],
+    receipt: Mapping[str, Any],
+    *,
+    rollback: bool = False,
+) -> dict[str, Any]:
+    receipt_path = locations["receipt"]
+    target = locations["target"]
+    current = _read_notification_receipt(receipt_path, target)
+    if not _notification_receipt_matches(current, receipt) and not (
+        isinstance(current, Mapping)
+        and current.get("status") == "PREPARED"
+        and current.get("transaction_id") == receipt.get("transaction_id")
+        and current.get("target") == str(target)
+    ):
+        return _notification_status("UNVERIFIED", "OWNERSHIP_RECEIPT_CHANGED", target)
+    if not _notification_artifacts_match(locations, receipt, allow_missing=True):
+        return _notification_status("CONFLICT", "OWNED_TARGET_CHANGED", target)
+    tx = _Transaction(runtime)
+    try:
+        removal_raw = _notification_receipt_bytes(
+            "REMOVAL_PREPARED", str(receipt["transaction_id"]), target,
+            str(receipt["shortcut_sha256"]), str(receipt["registration_sha256"]),
+        )
+        tx.mutate_file(receipt_path, removal_raw, details={"kind": "windows-notification-ownership", "phase": "removal-prepared"})
+        tx.commit()
+    except Exception as journal_error:
+        if tx.status != "COMMITTED":
+            rollback_failure = _rollback_notification_journal(tx, target, "OWNERSHIP_JOURNAL")
+            if rollback_failure is not None:
+                return rollback_failure
+        return _notification_status(
+            "UNVERIFIED", f"OWNERSHIP_JOURNAL_FINALIZE_FAILED_{type(journal_error).__name__}", target
+        )
+    response = _run_windows_notification_registration(
+        "unregister", target,
+        expected_shortcut_sha256=str(receipt["shortcut_sha256"]),
+        expected_registration_sha256=str(receipt["registration_sha256"]),
+    )
+    if response.get("status") == "REMOVED" and response.get("verified") is True:
+        remains = any(path.exists() or path.is_symlink() for path in (locations["shortcut"], locations["registration"]))
+        if not remains:
+            try:
+                cleanup_tx = _Transaction(runtime)
+                cleanup_tx.remove_file(receipt_path, expected_hash=_hash_path(receipt_path), details={"kind": "windows-notification-ownership", "phase": "removed"})
+                cleanup_tx.commit()
+                return _notification_status("REMOVED", "OWNED_TARGETS_REMOVED", target)
+            except Exception as exc:
+                failure_kind = type(exc).__name__
+                if isinstance(exc, ValueError):
+                    failure_kind = str(exc)
+                return _notification_status("UNVERIFIED", f"OWNERSHIP_RECEIPT_REMOVE_FAILED_{failure_kind}", target)
+    if response.get("status") == "CONFLICT" and response.get("verified") is False:
+        next_status = "REGISTERED"
+        reason = "OWNED_TARGET_CHANGED"
+        status = "CONFLICT"
+    else:
+        next_status = "ROLLBACK_REQUIRED" if rollback or response.get("status") not in {"CONFLICT"} else "REGISTERED"
+        reason = str(response.get("reason_code") or "OS_UNREGISTER_UNVERIFIED")
+        status = "UNVERIFIED"
+    try:
+        _persist_notification_receipt(
+            runtime,
+            _notification_receipt_bytes(
+                next_status, str(receipt["transaction_id"]), target,
+                str(receipt["shortcut_sha256"]), str(receipt["registration_sha256"]),
+            ),
+            details={"kind": "windows-notification-ownership", "phase": next_status.casefold()},
+        )
+    except Exception:
+        _persist_indeterminate_notification_receipt(
+            runtime, target, str(receipt["shortcut_sha256"]), str(receipt["registration_sha256"]), str(receipt["transaction_id"]),
+        )
+        return _notification_status("UNVERIFIED", "OWNERSHIP_RECEIPT_SAVE_FAILED", target)
+    return _notification_status(status, reason, target)
+
+
+def _uninstall_windows_notification_registration(runtime: Path) -> dict[str, Any]:
+    locations = _windows_notification_locations(runtime)
+    if locations is None:
+        receipt_path = runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME
+        if receipt_path.exists() or receipt_path.is_symlink():
+            return _notification_status("UNVERIFIED", "CURRENT_OS_PATHS_UNAVAILABLE")
+        return _notification_status("NOT_OWNED", "NO_OWNERSHIP_RECEIPT")
+    target = locations["target"]
+    receipt = _read_notification_receipt(locations["receipt"], target)
+    if receipt is None:
+        return _notification_status("NOT_OWNED", "NO_OWNERSHIP_RECEIPT", target)
+    if receipt.get("status") == "INVALID":
+        return _notification_status("UNVERIFIED", "OWNERSHIP_RECEIPT_INVALID", target)
+    if receipt.get("status") == "PREPARED":
+        if _prepared_notification_no_effect_resolution(runtime, locations, receipt) is None:
+            return _notification_status("UNVERIFIED", "OWNERSHIP_RECOVERY_REQUIRED", target)
+        if not _clear_no_effect_notification_receipt(runtime, locations["receipt"], receipt):
+            return _notification_status("UNVERIFIED", "OWNERSHIP_NO_EFFECT_RECEIPT_CLEAR_FAILED", target)
+        return _notification_status("NOT_OWNED", "NO_EFFECT_OWNERSHIP_CLEARED", target)
+    if not _notification_artifacts_match(locations, receipt, allow_missing=True):
+        return _notification_status("CONFLICT", "OWNED_TARGET_CHANGED", target)
+    return _remove_windows_notification_registration(runtime, locations, receipt)
+
+
+def _is_pending_notification_prepared_journal(runtime: Path, path: Path, journal: Mapping[str, Any]) -> bool:
+    transaction_id = journal.get("transaction_id")
+    if (
+        journal.get("status") != "IN_PROGRESS"
+        or not isinstance(transaction_id, str)
+        or re.fullmatch(r"tx_[0-9a-f]{32}", transaction_id) is None
+        or absolute_path(path) != absolute_path(runtime / "transactions" / (transaction_id + ".json"))
+    ):
+        return False
+    receipt_path = runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME
+    raw = _read_bounded_notification_file(receipt_path, max_bytes=WINDOWS_NOTIFICATION_MAX_RECORD_BYTES)
+    if raw is None:
+        return False
+    try:
+        value = _strict_json_object(raw)
+        target = value.get("target")
+        if value.get("status") != "PREPARED" or value.get("transaction_id") != transaction_id or not isinstance(target, str):
+            return False
+        receipt = _read_notification_receipt(receipt_path, Path(target))
+    except (OSError, ValueError, SafeFilesystemError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(receipt, Mapping)
+        and receipt.get("status") == "PREPARED"
+        and _prepared_notification_journal_resolution(
+            runtime,
+            receipt_path,
+            receipt,
+            expected_status="IN_PROGRESS",
+        ) == "PENDING"
+    )
+
+
 def _recover_pending_transactions(runtime_root: Path) -> list[dict[str, Any]]:
     runtime_root = absolute_path(runtime_root)
     directory = runtime_root / "transactions"
@@ -839,6 +1583,14 @@ def _recover_pending_transactions(runtime_root: Path) -> list[dict[str, Any]]:
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(value, dict) or value.get("status") != "IN_PROGRESS" or not isinstance(value.get("entries"), list):
+            continue
+        if _is_pending_notification_prepared_journal(runtime_root, path, value):
+            results.append({
+                "journal": str(path),
+                "status": "PRESERVED_UNVERIFIED",
+                "restored": [],
+                "conflicts": [],
+            })
             continue
         restored, conflicts = _restore_transaction_entries(value["entries"])
         value["status"] = "RECOVERED" if not conflicts else "RECOVERY_CONFLICT"
@@ -3372,6 +4124,17 @@ def rollback_scheduler_transition(receipt: Mapping[str, Any] | None, settings: S
     except (OSError, TypeError, ValueError) as exc:
         return {"ok": False, "status": "ROLLBACK_FAILED", "reason_code": str(exc)}
 
+
+def _ensure_operation_runtime_state(settings: Settings) -> tuple[dict[str, Any], bool]:
+    from .operation_activation import ensure_operation_state
+
+    target = settings.paths.runtime_root / "automatic-operation.json"
+    existed = target.exists() or target.is_symlink()
+    document, reason = ensure_operation_state(settings)
+    if document is None:
+        return {"status": "UNVERIFIED", "reason_code": reason or "OPERATION_STATE_UNAVAILABLE"}, False
+    return {"status": "READY", "readiness": "UNVERIFIED"}, not existed
+
 def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only: bool = False) -> SetupResult:
     selected = _normalise_selection(selection)
     repo = _resolve(selected.engine_root or selected.repo_root)
@@ -3437,13 +4200,51 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
     if check_only:
         return replace(check_only_setup_result(reconciliation, manifest_path=manifest_path, knowledge_stores=planned_stores), plan=result_plan, host_migrations=tuple(selected.legacy_host_migrations), knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=planned_scheduler, team=team_view, compatibility_notices=tuple(selected.compatibility_notices))
     if reconciliation.status == "ALREADY_CURRENT":
+        # Setup/update is also the explicit repair path for an owned legacy
+        # scheduler definition.  The reconciliation receipt may be current
+        # while the OS timer itself is stale; re-inspect and safely reconcile
+        # the requested scheduler without replaying host/knowledge mutations.
+        scheduler = apply_scheduler_transition(settings, python, selected.scheduler, previous)
+        operation_state, operation_state_created = _ensure_operation_runtime_state(settings)
         append_setup_receipt(runtime, reconciliation, status="ALREADY_CURRENT")
+        try:
+            notification_registration, new_notification_receipt = _ensure_windows_notification_registration(runtime)
+        except Exception as exc:
+            notification_registration = _notification_status("UNVERIFIED", type(exc).__name__)
+            new_notification_receipt = None
         completed_stores = _knowledge_stores_result(
             current_personal,
             current_team,
             team_status="DEFERRED" if selected.team_knowledge is not False and selected.defer_team_validation and current_team and current_team.get("enabled") is True and isinstance(current_team.get("root"), str) and not Path(str(current_team["root"])).exists() and not Path(str(current_team["root"])).is_symlink() else ("READY" if current_team and current_team.get("enabled") is True else "DISABLED"),
         )
-        return replace(already_current_setup_result(previous, reconciliation, manifest_path=manifest_path, knowledge_stores=completed_stores), plan=result_plan, knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler={"requested": selected.scheduler, "status": "ALREADY_CURRENT", "registered": selected.scheduler}, team=team_view, compatibility_notices=tuple(selected.compatibility_notices))
+        scheduler_ok = scheduler.get("ok") is True
+        changed_items = [Path(str(scheduler["state_path"]))] if scheduler.get("status") == "REGISTERED" and isinstance(scheduler.get("state_path"), str) else []
+        if operation_state_created:
+            changed_items.append(settings.paths.runtime_root / "automatic-operation.json")
+        if new_notification_receipt is not None:
+            changed_items.extend((
+                runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME,
+                Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / WINDOWS_NOTIFICATION_SHORTCUT_NAME,
+                Path(os.environ["LOCALAPPDATA"]) / "MiyaIF" / "ExternalIntelligence" / WINDOWS_NOTIFICATION_RECORD_NAME,
+            ))
+        changed = tuple(changed_items)
+        errors = () if scheduler_ok else ({"error_code": str(scheduler.get("reason_code") or "SCHEDULER_REGISTRATION_FAILED"), "stage": "scheduler", "retryable": scheduler.get("retryable") is True},)
+        return replace(
+            already_current_setup_result(previous, reconciliation, manifest_path=manifest_path, knowledge_stores=completed_stores),
+            ok=scheduler_ok,
+            status="SETUP_COMPLETE" if scheduler_ok else "SCHEDULER_SETUP_BLOCKED",
+            plan=result_plan,
+            changed_paths=changed,
+            errors=errors,
+            message="Setup is already current; scheduler state was reconciled" if scheduler_ok else "Setup is current, but the selected scheduler must be retried",
+            knowledge=knowledge_view,
+            sync=_sync_view(selected, knowledge_view),
+            scheduler=scheduler,
+            team=team_view,
+            compatibility_notices=tuple(selected.compatibility_notices),
+            operation_state=operation_state,
+            notification_registration=notification_registration,
+        )
 
     # Re-read every planner input immediately before any personal/team or host
     # mutation.  A concurrent edit therefore fails closed as a stale plan and
@@ -3492,6 +4293,8 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
     backups: list[Path] = []
     result_plans: list[InstallPlanItem] = []
     scheduler: dict[str, Any] = planned_scheduler
+    notification_registration: dict[str, Any] = _notification_status("UNAVAILABLE", "OS_UNAVAILABLE")
+    new_notification_receipt: dict[str, Any] | None = None
     manifest_target = manifest_path
     try:
         python, created_venv = _ensure_venv(selected, python)
@@ -3530,7 +4333,17 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
             changed.append(manifest_target)
         if manifest_backup:
             backups.append(manifest_backup)
+        notification_registration, new_notification_receipt = _ensure_windows_notification_registration(runtime)
+        if new_notification_receipt is not None:
+            changed.extend((
+                runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME,
+                Path(os.environ["APPDATA"]) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / WINDOWS_NOTIFICATION_SHORTCUT_NAME,
+                Path(os.environ["LOCALAPPDATA"]) / "MiyaIF" / "ExternalIntelligence" / WINDOWS_NOTIFICATION_RECORD_NAME,
+            ))
         tx.commit()
+        operation_state, operation_state_created = _ensure_operation_runtime_state(settings)
+        if operation_state_created:
+            changed.append(settings.paths.runtime_root / "automatic-operation.json")
         append_setup_receipt(runtime, reconciliation, status="UPDATED" if previous else "CREATED")
         effective_settings = _settings_for_selection(selected)
         doctor = run_doctor(effective_settings, strict=False)
@@ -3549,14 +4362,26 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
         scheduler_ok = bool(scheduler.get("ok", not selected.scheduler))
         manifest_stores = manifest.get("knowledge_stores") if isinstance(manifest.get("knowledge_stores"), Mapping) else {}
         completed_stores = _knowledge_stores_result(manifest_stores.get("personal") if isinstance(manifest_stores.get("personal"), Mapping) else None, team_store, team_status="DEFERRED" if team_validation_deferred else ("READY" if team_store and team_store.get("enabled") is True else "DISABLED"))
-        return SetupResult(scheduler_ok, "SETUP_COMPLETE" if scheduler_ok else "SCHEDULER_SETUP_BLOCKED", manifest_target, plan=tuple(result_plans), changed_paths=tuple(dict.fromkeys(changed)), backups=tuple(dict.fromkeys(backups)), hosts=tuple(capabilities), doctor=doctor.to_dict(), errors=() if scheduler_ok else ({"error_code": str(scheduler.get("reason_code") or "SCHEDULER_REGISTRATION_FAILED"), "stage": "scheduler", "retryable": scheduler.get("retryable") is True},), rollback={"transaction": tx.transaction_id, "recovered_transactions": recovery, "scheduler": scheduler} if scheduler_ok else {"status": "INSTALLATION_RETAINED", "transaction": tx.transaction_id, "recovered_transactions": recovery, "reason_codes": ["SCHEDULER_RETRY_REQUIRED"]}, message="Setup completed; Hook verification remains receipt-based and Skill activation is reported independently" if scheduler_ok else "Knowledge and host installation completed, but the selected scheduler must be retried", host_migrations=tuple(selected.legacy_host_migrations), knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=scheduler, team=team_view, reconciliation=_reconciliation_view(reconciliation), knowledge_stores=completed_stores, actions_required=actions_required, compatibility_notices=tuple(selected.compatibility_notices))
+        if notification_registration.get("status") in {"UNVERIFIED", "CONFLICT"}:
+            actions_required = (*actions_required, {"code": "WINDOWS_NOTIFICATION_REGISTRATION_UNVERIFIED", "reason_code": notification_registration.get("reason_code")})
+        return SetupResult(scheduler_ok, "SETUP_COMPLETE" if scheduler_ok else "SCHEDULER_SETUP_BLOCKED", manifest_target, plan=tuple(result_plans), changed_paths=tuple(dict.fromkeys(changed)), backups=tuple(dict.fromkeys(backups)), hosts=tuple(capabilities), doctor=doctor.to_dict(), errors=() if scheduler_ok else ({"error_code": str(scheduler.get("reason_code") or "SCHEDULER_REGISTRATION_FAILED"), "stage": "scheduler", "retryable": scheduler.get("retryable") is True},), rollback={"transaction": tx.transaction_id, "recovered_transactions": recovery, "scheduler": scheduler} if scheduler_ok else {"status": "INSTALLATION_RETAINED", "transaction": tx.transaction_id, "recovered_transactions": recovery, "reason_codes": ["SCHEDULER_RETRY_REQUIRED"]}, message="Setup completed; Hook verification remains receipt-based and Skill activation is reported independently" if scheduler_ok else "Knowledge and host installation completed, but the selected scheduler must be retried", host_migrations=tuple(selected.legacy_host_migrations), knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=scheduler, team=team_view, reconciliation=_reconciliation_view(reconciliation), knowledge_stores=completed_stores, actions_required=actions_required, compatibility_notices=tuple(selected.compatibility_notices), operation_state=operation_state, notification_registration=notification_registration)
     except Exception as exc:
         if tx.status == "COMMITTED":
             code = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-            return SetupResult(False, "DIAGNOSTICS_BLOCKED", manifest_target, plan=tuple(result_plans), changed_paths=tuple(dict.fromkeys(changed)), backups=tuple(dict.fromkeys(backups)), errors=({"error_code": code, "stage": "diagnostics", "retryable": True},), rollback={"status": "INSTALLATION_RETAINED", "rolled_back": False, "transaction": tx.transaction_id, "recovered_transactions": recovery, "reason_codes": ["DIAGNOSTICS_BLOCKED", "INSTALLATION_RETAINED"]}, message="Installation was committed, but post-commit diagnostics are blocked; rerun diagnostics without reinstalling", knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=scheduler, team=team_view, reconciliation=_reconciliation_view(reconciliation), knowledge_stores=_knowledge_stores_result(current_personal, team_store, team_status="DEFERRED" if team_validation_deferred else None), compatibility_notices=tuple(selected.compatibility_notices))
+            return SetupResult(False, "DIAGNOSTICS_BLOCKED", manifest_target, plan=tuple(result_plans), changed_paths=tuple(dict.fromkeys(changed)), backups=tuple(dict.fromkeys(backups)), errors=({"error_code": code, "stage": "diagnostics", "retryable": True},), rollback={"status": "INSTALLATION_RETAINED", "rolled_back": False, "transaction": tx.transaction_id, "recovered_transactions": recovery, "reason_codes": ["DIAGNOSTICS_BLOCKED", "INSTALLATION_RETAINED"]}, message="Installation was committed, but post-commit diagnostics are blocked; rerun diagnostics without reinstalling", knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=scheduler, team=team_view, reconciliation=_reconciliation_view(reconciliation), knowledge_stores=_knowledge_stores_result(current_personal, team_store, team_status="DEFERRED" if team_validation_deferred else None), compatibility_notices=tuple(selected.compatibility_notices), notification_registration=notification_registration)
+        if new_notification_receipt is not None:
+            locations = _windows_notification_locations(runtime)
+            if locations is not None:
+                cleanup = _remove_windows_notification_registration(runtime, locations, new_notification_receipt, rollback=True)
+                if cleanup.get("status") == "REMOVED":
+                    notification_registration = _notification_status("ROLLED_BACK", "SETUP_TRANSACTION_ROLLED_BACK", locations["target"])
+                else:
+                    notification_registration = _notification_status("UNVERIFIED", str(cleanup.get("reason_code") or "NOTIFICATION_ROLLBACK_UNVERIFIED"), locations["target"])
+        elif (runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME).exists():
+            notification_registration = _notification_status("UNVERIFIED", "OWNERSHIP_RECOVERY_REQUIRED")
         rollback = tx.rollback()
         code = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-        return SetupResult(False, str(rollback["status"]), manifest_target, plan=tuple(result_plans), changed_paths=tuple(changed), backups=tuple(backups), errors=({"error_code": code, "stage": "setup"},), rollback={**rollback, "reason_codes": list(dict.fromkeys([*rollback.get("reason_codes", []), "KNOWLEDGE_RETAINED_FOR_RETRY"]))}, message="Host setup failed; this invocation's host changes were rolled back and valid knowledge was retained", knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=planned_scheduler, team=team_view, reconciliation=_reconciliation_view(reconciliation), knowledge_stores=_knowledge_stores_result(current_personal, team_store), compatibility_notices=tuple(selected.compatibility_notices))
+        return SetupResult(False, str(rollback["status"]), manifest_target, plan=tuple(result_plans), changed_paths=tuple(changed), backups=tuple(backups), errors=({"error_code": code, "stage": "setup"},), rollback={**rollback, "reason_codes": list(dict.fromkeys([*rollback.get("reason_codes", []), "KNOWLEDGE_RETAINED_FOR_RETRY"]))}, message="Host setup failed; this invocation's host changes were rolled back and valid knowledge was retained", knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=planned_scheduler, team=team_view, reconciliation=_reconciliation_view(reconciliation), knowledge_stores=_knowledge_stores_result(current_personal, team_store), compatibility_notices=tuple(selected.compatibility_notices), notification_registration=notification_registration)
 
 
 def setup(selection: SetupSelection | Mapping[str, Any], check_only: bool = False) -> SetupResult:
@@ -4054,6 +4879,7 @@ def _uninstall_from_manifest(manifest_path: Path, options: UninstallOptions) -> 
     if options.check_only:
         plans = tuple(InstallPlanItem(path, "remove-or-restore", _hash_path(path), _sha256(raw), None, details) for path, (raw, details) in sorted(targets.items(), key=lambda item: str(item[0])))
         scheduler_ok = bool(scheduler_result.get("ok"))
+        notification_preview = _notification_status("PLANNED", "NO_OS_ACTION_IN_CHECK_ONLY")
         return SetupResult(
             scheduler_ok,
             "CHECK_ONLY" if scheduler_ok else "SCHEDULER_UNINSTALL_BLOCKED",
@@ -4065,6 +4891,7 @@ def _uninstall_from_manifest(manifest_path: Path, options: UninstallOptions) -> 
             scheduler=scheduler_result,
             team=retained_team,
             knowledge_stores=retained_stores,
+            notification_registration=notification_preview,
         )
     tx = _Transaction(runtime)
     changed: list[Path] = []
@@ -4146,18 +4973,28 @@ def _uninstall_from_manifest(manifest_path: Path, options: UninstallOptions) -> 
                 changed.append(Path(str(scheduler_result["state_path"])))
             changed.extend(Path(str(path)) for path in scheduler_result.get("removed_artifacts", ()) if isinstance(path, str))
         tx.commit()
+        notification_registration = _uninstall_windows_notification_registration(runtime)
+        if notification_registration.get("status") == "REMOVED":
+            changed.append(runtime / WINDOWS_NOTIFICATION_OWNERSHIP_NAME)
+            locations = _windows_notification_locations(runtime)
+            if locations is not None:
+                changed.extend((locations["shortcut"], locations["registration"]))
+        elif notification_registration.get("status") in {"CONFLICT", "UNVERIFIED"}:
+            errors.append({"error_code": str(notification_registration.get("reason_code") or "NOTIFICATION_UNINSTALL_UNVERIFIED"), "stage": "notification_registration"})
         if options.remove_runtime_cache:
             for name in ("cache", "team-cache"):
                 cache = runtime / name
                 if cache.is_dir():
                     safe_remove_tree(runtime, cache)
                     changed.append(cache)
-        if options.remove_runtime:
+        if options.remove_runtime and notification_registration.get("status") not in {"CONFLICT", "UNVERIFIED"}:
             for name in (*RUNTIME_DIRECTORY_NAMES, *TEAM_RUNTIME_DIRECTORY_NAMES):
                 child = runtime / name
                 if child.exists():
                     safe_remove_tree(runtime, child)
                     changed.append(child)
+        elif options.remove_runtime:
+            errors.append({"error_code": "RUNTIME_RETAINED_FOR_NOTIFICATION_OWNERSHIP", "stage": "runtime_remove"})
         if options.remove_venv:
             venv = repo / ".venv"
             if manifest.get("venv_created") and _within(repo, venv) and venv.is_dir():
@@ -4169,10 +5006,10 @@ def _uninstall_from_manifest(manifest_path: Path, options: UninstallOptions) -> 
         updated["knowledge_retained"] = True
         _atomic_write(manifest_path, _json_bytes(updated))
         ok = not errors
-        return SetupResult(ok, "UNINSTALLED" if ok else "UNINSTALL_CONFLICT", manifest_path, changed_paths=tuple(dict.fromkeys(changed)), backups=tuple(dict.fromkeys(backups)), errors=tuple(errors), rollback={"transaction": tx.transaction_id, "skills": skill_results}, message="Managed Hook/context/Skill targets were processed; the personal and team knowledge stores were retained", knowledge=knowledge_retention, scheduler=scheduler_result, team=retained_team, knowledge_stores=retained_stores)
+        return SetupResult(ok, "UNINSTALLED" if ok else "UNINSTALL_CONFLICT", manifest_path, changed_paths=tuple(dict.fromkeys(changed)), backups=tuple(dict.fromkeys(backups)), errors=tuple(errors), rollback={"transaction": tx.transaction_id, "skills": skill_results}, message="Managed Hook/context/Skill targets were processed; the personal and team knowledge stores were retained", knowledge=knowledge_retention, scheduler=scheduler_result, team=retained_team, knowledge_stores=retained_stores, notification_registration=notification_registration)
     except Exception as exc:
         rollback = tx.rollback()
-        return SetupResult(False, "ROLLED_BACK", manifest_path, errors=({"error_code": str(exc) if isinstance(exc, ValueError) else type(exc).__name__},), rollback=rollback, knowledge=knowledge_retention, team=retained_team, knowledge_stores=retained_stores)
+        return SetupResult(False, "ROLLED_BACK", manifest_path, errors=({"error_code": str(exc) if isinstance(exc, ValueError) else type(exc).__name__},), rollback=rollback, knowledge=knowledge_retention, team=retained_team, knowledge_stores=retained_stores, notification_registration=locals().get("notification_registration", {}))
 
 
 def uninstall(settings_or_manifest: Settings | Path | str, options: UninstallOptions | bool = UninstallOptions(), remove_runtime_cache: bool = False) -> SetupResult | dict[str, Any]:
@@ -4839,7 +5676,8 @@ def _guided_interactive_selection(args: argparse.Namespace) -> SetupSelection:
         sync_selection = getattr(args, "sync", None)
         sync = bool(sync_selection) if sync_selection is not None else prompt_bool("Git同期を有効にしますか", knowledge_mode in {"github-new", "github-existing"})
         experiment = bool(getattr(args, "experiment", False)) or prompt_bool("A/B測定を有効にしますか", False)
-        scheduler = bool(getattr(args, "scheduler", False)) or prompt_bool("任意の保守schedulerを有効にしますか", False)
+        scheduler_arg = getattr(args, "scheduler", None)
+        scheduler = bool(scheduler_arg) if scheduler_arg is not None else prompt_bool("任意の保守schedulerを有効にしますか", False)
         skill_mode = getattr(args, "skill_mode", "copy")
         if skill_mode == "copy":
             skill_mode = prompt_text("Skillの導入方法（copy/link）", skill_mode)
@@ -4848,9 +5686,18 @@ def _guided_interactive_selection(args: argparse.Namespace) -> SetupSelection:
         providers = _parse_values(getattr(args, "providers", ()), deduplicate=False)
         privacy_profile = getattr(args, "privacy_profile", "private-reusable")
         sync_arg = getattr(args, "sync", None)
-        sync = bool(sync_arg) if sync_arg is not None else (previous_knowledge_record.get("sync_enabled") is True if previous else knowledge_mode in {"github-new", "github-existing"})
+        sync = bool(sync_arg) if sync_arg is not None else prompt_bool(
+            "個人ナレッジをGitリモートにも同期しますか（ローカルの自動蓄積とは別）",
+            previous_knowledge_record.get("sync_enabled") is True if previous else False,
+        )
         experiment = bool(getattr(args, "experiment", False)) or (previous.get("experiment_enabled") is True if previous else False)
-        scheduler = bool(getattr(args, "scheduler", False)) or (previous.get("scheduler_requested") is True if previous else False)
+        write_utf8("定期処理は記憶の候補を整理・再試行します。整理AIの利用枠を消費する場合があります。")
+        write_utf8("実行間隔は既定で30分です。再実行では既存の間隔と有効・無効の選択を引き継ぎます。")
+        scheduler_arg = getattr(args, "scheduler", None)
+        scheduler = bool(scheduler_arg) if scheduler_arg is not None else prompt_bool(
+            "記憶の整理を定期的に実行しますか（自動蓄積には有効化を推奨）",
+            previous.get("scheduler_requested") is True if previous else False,
+        )
         if previous and privacy_profile == "private-reusable" and isinstance(previous.get("privacy_profile"), str):
             privacy_profile = str(previous["privacy_profile"])
         skill_mode = getattr(args, "skill_mode", "copy")
@@ -5151,11 +5998,17 @@ def _main() -> int:
     sync_group.add_argument("--no-sync", dest="sync", action="store_false")
     parser.set_defaults(sync=None)
     parser.add_argument("--experiment", action="store_true")
-    parser.add_argument("--scheduler", action="store_true")
+    scheduler_group = parser.add_mutually_exclusive_group()
+    scheduler_group.add_argument("--scheduler", dest="scheduler", action="store_true")
+    scheduler_group.add_argument("--no-scheduler", dest="scheduler", action="store_false")
+    parser.set_defaults(scheduler=None)
     parser.add_argument("--skill-mode", choices=("copy", "link"), default="copy")
     parser.add_argument("--skip-venv", action="store_true")
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--non-interactive", action="store_true")
+    parser.add_argument("--verify-operation", action="store_true")
+    parser.add_argument("--allow-model-test", action="store_true")
+    parser.add_argument("--allow-notification-test", action="store_true")
     parser.add_argument("--json", action="store_true", dest="json_mode")
     parser.add_argument("--manifest")
     parser.add_argument("--confirm-manifest-sha256")
@@ -5220,8 +6073,19 @@ def _main() -> int:
             _print(result.to_dict(), args.json_mode)
             return 0 if result.ok else 1
         if args.setup or (not args.repo and not args.codex_home):
-            result = setup(_interactive_selection(args), args.check_only)
-            _print(result.to_dict(), args.json_mode)
+            from .setup_activation import setup_result_with_guidance
+            selection = _interactive_selection(args)
+            result = setup(selection, args.check_only)
+            value = setup_result_with_guidance(
+                selection,
+                result,
+                interactive=not args.json_mode and not args.non_interactive and sys.stdin.isatty(),
+                check_only=args.check_only,
+                verify_operation_requested=args.verify_operation,
+                allow_model_test=args.allow_model_test,
+                allow_notification_test=args.allow_notification_test,
+            )
+            _print(value, args.json_mode)
             return 0 if result.ok else 1
         if not args.repo or not args.codex_home:
             raise ValueError("INSTALL_PATHS_REQUIRED")

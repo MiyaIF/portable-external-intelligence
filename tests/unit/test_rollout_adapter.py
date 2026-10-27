@@ -2,11 +2,21 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ei.adapters.rollout_summary import RolloutSummaryAdapter
 
 
 class RolloutAdapterTests(unittest.TestCase):
+    def test_verified_bytes_reuse_parser_without_reopening_source(self):
+        path = Path("tests/fixtures/memories/sample_rollout.jsonl").resolve()
+        raw, metadata = path.read_bytes(), path.stat()
+        expected = list(RolloutSummaryAdapter([]).read(path))
+        with patch.object(Path, "read_bytes", side_effect=AssertionError("reopened")), patch.object(Path, "stat", side_effect=AssertionError("restat")):
+            actual = list(RolloutSummaryAdapter([]).read_verified(path, raw, metadata))
+        self.assertEqual(actual, expected)
+        self.assertNotEqual(actual[0].stable_record_id, actual[1].stable_record_id)
+
     def test_extracts_reusable_knowledge_failure_and_task_outcome(self):
         fixture = Path("tests/fixtures/memories/sample_rollout.jsonl")
         records = list(RolloutSummaryAdapter([fixture]).iter_records({}))

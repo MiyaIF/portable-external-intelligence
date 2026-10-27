@@ -16,6 +16,38 @@ from ei.retrieve import (
 
 
 class RetrievalTests(unittest.TestCase):
+    def test_shared_deadline_covers_iteration_scoring_and_exposure_append(self):
+        from ei.operation_runtime import OperationBudget
+        from tests.integration.test_unattended_operation import RemainingBudget
+        from unittest.mock import patch
+        import ei.retrieve as retrieve
+        query = RetrievalQuery(prompt="reuse rule", host_id="codex-cli")
+        rows = [self._host_pattern(pattern_id="pat_a"), self._host_pattern(pattern_id="pat_b", cluster_id="cluster_b")]
+        expected = rank_patterns(query, rows)
+        self.assertEqual(rank_patterns(query, rows, budget=OperationBudget(5000)), expected)
+        with self.assertRaises(TimeoutError):
+            rank_patterns(query, [], budget=OperationBudget(0))
+        budget = RemainingBudget()
+        def partial():
+            yield rows[0]
+            budget.remaining = 0
+            yield rows[1]
+        with self.assertRaises(TimeoutError):
+            rank_patterns(query, partial(), budget=budget)
+        budget = RemainingBudget()
+        score = retrieve._bm25
+        def expire(*args):
+            value = score(*args)
+            budget.remaining = 0
+            return value
+        with patch("ei.retrieve._bm25", side_effect=expire), self.assertRaises(TimeoutError):
+            rank_patterns(query, rows, budget=budget)
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "new" / "exposures.jsonl"
+            with self.assertRaises(TimeoutError):
+                record_retrieval_exposure(ExposureRecord("exp_deadline"), target, budget=OperationBudget(0))
+            self.assertFalse(target.parent.exists())
+
     def setUp(self):
         self.policy = RetrievalPolicy.defaults()
 

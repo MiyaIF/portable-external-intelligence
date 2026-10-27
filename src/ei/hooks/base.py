@@ -8,13 +8,18 @@ import shlex
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from ..capture_contract import CaptureIdentity
 from ..command_quote import build_hook_argv, quote_command, quote_posix_command, quote_windows_command
 from ..config import HostSpec
 from ..host_profiles import canonical_host_id, is_custom_host_id
 from ..ids import stable_hash
+from ..notifications.base import NotificationMessage
 from ..privacy import inspect_text
+
+if TYPE_CHECKING:
+    from ..closeout_context import CloseoutContext, CloseoutScope
 
 
 MAX_HOOK_INPUT_BYTES = 64 * 1024
@@ -336,10 +341,12 @@ class NormalizedHookEvent:
     transient_input: str | None = None
     source_host_id: str = ""
     source_host_family: str = ""
+    capture_identity: CaptureIdentity | None = None
+    work_domain_hash: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize only the sanitized envelope; transient input is never serialized."""
-        return {
+        result = {
             "event_id": self.event_id,
             "idempotency_key": self.idempotency_key,
             "host_id": self.host_id,
@@ -357,6 +364,16 @@ class NormalizedHookEvent:
             "source_host_id": self.source_host_id,
             "source_host_family": self.source_host_family,
         }
+        if self.capture_identity is not None:
+            result["capture_identity"] = {
+                "host_id": self.capture_identity.host_id,
+                "instance_hash": self.capture_identity.instance_hash,
+                "store_id": self.capture_identity.store_id,
+                "session_hash": self.capture_identity.session_hash,
+                "turn_hash": self.capture_identity.turn_hash,
+                "record_hash": self.capture_identity.record_hash,
+            }
+        return result
 
 
 @dataclass(frozen=True)
@@ -366,6 +383,7 @@ class HookResult:
     receipt_id: str | None = None
     status: str = "ok"
     host_event_name: str = ""
+    user_notice: NotificationMessage | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -381,10 +399,15 @@ class HookResult:
 class HookAdapter(Protocol):
     host_id: str
     adapter_id: str
+    supports_closeout_context: bool
 
     def supported_events(self) -> Sequence[str]: ...
 
     def normalize(self, payload: Mapping[str, Any], spec: HostSpec) -> NormalizedHookEvent: ...
+
+    def capture_work_scope(self, event: NormalizedHookEvent, spec: HostSpec) -> CloseoutScope | None: ...
+
+    def closeout_context(self, control: Mapping[str, Any], spec: HostSpec) -> CloseoutContext | None: ...
 
     def encode(self, result: HookResult) -> Mapping[str, Any]: ...
 
@@ -400,12 +423,19 @@ class HookAdapter(Protocol):
 class BaseHookAdapter:
     host_id = ""
     adapter_id = ""
+    supports_closeout_context = False
     event_names: tuple[str, ...] = ()
     command_field = "command"
     windows_command_field: str | None = None
 
     def supported_events(self) -> Sequence[str]:
         return self.event_names
+
+    def capture_work_scope(self, event: NormalizedHookEvent, spec: HostSpec) -> CloseoutScope | None:
+        return None
+
+    def closeout_context(self, control: Mapping[str, Any], spec: HostSpec) -> CloseoutContext | None:
+        return None
 
     def _host_event_name(self, payload: Mapping[str, Any]) -> str:
         for key in ("hook_event_name", "event_name", "event"):

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ei.certification import (
     REQUIRED_HOST_IDS,
@@ -62,6 +64,26 @@ class ReceiptContractTests(unittest.TestCase):
         self.assertEqual(result.receipt["mode"], "real")
         self.assertEqual(result.receipt["activation_state"], "real-missing")
         validate_receipt_artifact(result.receipt)
+
+    def test_unknown_version_remains_unknown_without_an_opted_in_process_probe(self) -> None:
+        with patch("ei.certification.subprocess.run", side_effect=AssertionError("host process must not run")):
+            result = certify_host(
+                "codex-cli", "real-codex-cli", "real", self.settings,
+                allow_version_probe=False,
+            )
+        self.assertEqual(result.status, "MISSING")
+        self.assertEqual(result.receipt["host_version"], "unknown")
+        self.assertIn("HOST_VERSION_MISSING", result.reason_codes)
+
+    def test_version_probe_flag_requires_an_exact_boolean(self) -> None:
+        with self.assertRaisesRegex(TypeError, "CERTIFICATION_VERSION_PROBE_BOOLEAN_REQUIRED"):
+            certify_host("codex-cli", "real-codex-cli", "real", self.settings, allow_version_probe=1)
+
+    def test_default_version_probe_keeps_the_existing_version_fallback(self) -> None:
+        with patch("ei.certification._official_host_version", return_value="7.8.9") as probe:
+            result = certify_host("codex-cli", "real-codex-cli", "real", self.settings)
+        self.assertEqual(result.receipt["host_version"], "7.8.9")
+        probe.assert_called_once_with("codex-cli", self.settings)
 
     def test_artifact_round_trip_validates_content_hash(self) -> None:
         result = certify_host("claude-code", "fixture-claude", "fixture", self.settings)

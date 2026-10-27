@@ -154,11 +154,12 @@ class LocalOpenAICompatibleProvider:
         current_budget = InferenceBudget.from_value(budget)
         validate_input(schema_name, input_json)
         estimated_input = estimate_tokens(input_json)
-        if estimated_input > current_budget.max_input_tokens:
+        if estimated_input > current_budget.max_input_tokens or current_budget.max_output_tokens == 0:
             return ProviderResult(self.provider_id, "failed", error_code="TOKEN_CAP_EXCEEDED", input_tokens=estimated_input, schema_name=schema_name)
         if current_budget.deadline_ms <= 0:
             return ProviderResult(self.provider_id, "failed", error_code="DEADLINE_EXCEEDED", schema_name=schema_name)
         first_payload = self._payload(schema_name, input_json)
+        first_payload["max_tokens"] = current_budget.max_output_tokens
         transport_error, body = self._post(first_payload, current_budget, 1)
         if transport_error is not None:
             return ProviderResult(**{**transport_error.__dict__, "schema_name": schema_name})
@@ -168,8 +169,9 @@ class LocalOpenAICompatibleProvider:
             decoded = None
         output = extract_structured_output(decoded)
         repaired = False
-        if output is None:
+        if output is None and not current_budget.attempt_id:
             repair_payload = self._payload(schema_name, input_json, True, body.decode("utf-8", "replace"))
+            repair_payload["max_tokens"] = current_budget.max_output_tokens
             transport_error, repaired_body = self._post(repair_payload, current_budget, 2)
             if transport_error is not None:
                 return ProviderResult(**{**transport_error.__dict__, "schema_name": schema_name})

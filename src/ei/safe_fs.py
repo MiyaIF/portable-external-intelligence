@@ -77,17 +77,12 @@ def assert_no_reparse_components(value: Path | str, *, allow_final_reparse: bool
 
 def _is_reparse(path: Path) -> bool:
     try:
-        if path.is_symlink():
-            return True
-        if not path.exists():
-            return False
-        is_junction = getattr(path, "is_junction", None)
-        if callable(is_junction) and is_junction():
-            return True
         info = path.stat(follow_symlinks=False)
         attributes = getattr(info, "st_file_attributes", 0)
         reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-        return bool(attributes & reparse_flag) or bool(getattr(info, "st_reparse_tag", 0))
+        return stat.S_ISLNK(info.st_mode) or bool(attributes & reparse_flag) or bool(getattr(info, "st_reparse_tag", 0))
+    except FileNotFoundError:
+        return False
     except (OSError, ValueError):
         return True
 
@@ -100,8 +95,6 @@ def _reparse_components(path: Path, *, allow_final_reparse: bool = False) -> Non
         if index == 0 and raw.anchor:
             continue
         current = current / part
-        if not current.exists() and not current.is_symlink():
-            continue
         if _is_reparse(current) and not (allow_final_reparse and current == raw):
             _fail("UNSAFE_REPARSE_POINT")
 
@@ -182,7 +175,47 @@ def assert_safe_target(
     return target_raw
 
 
-def _file_digest(path: Path) -> str:
+def _budget_check(budget):
+    if budget is not None:
+        budget.check()
+
+
+def _digest_chunks(digest, path, budget, before):
+    _budget_check(budget)
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+    assert_safe_target(path.parent, path, allow_missing=False, expected_type="file")
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    with os.fdopen(descriptor, "rb") as stream:
+        if identity(os.fstat(stream.fileno())) != identity(before):
+            _fail("SAFE_READ_CHANGED")
+        while True:
+            _budget_check(budget)
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+        if identity(os.fstat(stream.fileno())) != identity(before):
+            _fail("SAFE_READ_CHANGED")
+    if identity(path.stat(follow_symlinks=False)) != identity(before):
+        _fail("SAFE_READ_CHANGED")
+
+
+def _budget_entries(directory, budget):
+    _budget_check(budget)
+    result = []
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            _budget_check(budget)
+            result.append(entry)
+    return sorted(result, key=lambda item: item.name)
+
+
+def _file_digest(path: Path, *, budget=None) -> str:
+    _budget_check(budget)
+    if budget is not None:
+        digest = hashlib.sha256()
+        _digest_chunks(digest, path, budget, path.stat(follow_symlinks=False))
+        return "sha256:" + digest.hexdigest()
     try:
         raw = path.read_bytes()
     except (OSError, ValueError):
@@ -190,16 +223,20 @@ def _file_digest(path: Path) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
 
-def tree_digest(path: Path | str) -> str:
+def tree_digest(path: Path | str, *, budget=None) -> str:
+    _budget_check(budget)
     root = assert_safe_target(path, path, allow_root=True, allow_missing=False, expected_type="dir")
     digest = hashlib.sha256()
 
     def visit(directory: Path, relative: Path) -> None:
         try:
-            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            entries = _budget_entries(directory, budget)
+        except TimeoutError:
+            raise
         except OSError:
             _fail("SAFE_READ_FAILED")
         for entry in entries:
+            _budget_check(budget)
             child = directory / entry.name
             child_relative = relative / entry.name
             if _is_reparse(child):
@@ -210,18 +247,25 @@ def tree_digest(path: Path | str) -> str:
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     _fail("SAFE_TYPE_MISMATCH")
-                data = child.read_bytes()
-                mode = stat.S_IMODE(child.stat(follow_symlinks=False).st_mode)
+                before = child.stat(follow_symlinks=False)
+                data = child.read_bytes() if budget is None else None
+                mode = stat.S_IMODE(before.st_mode)
+            except TimeoutError:
+                raise
             except OSError:
                 _fail("SAFE_READ_FAILED")
             encoded = child_relative.as_posix().encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
             digest.update(mode.to_bytes(4, "big"))
-            digest.update(len(data).to_bytes(8, "big"))
-            digest.update(data)
+            digest.update((len(data) if data is not None else before.st_size).to_bytes(8, "big"))
+            if data is not None:
+                digest.update(data)
+            else:
+                _digest_chunks(digest, child, budget, before)
 
     visit(root, Path())
+    _budget_check(budget)
     return "sha256:" + digest.hexdigest()
 
 
@@ -591,16 +635,20 @@ def safe_ensure_directory(target: Path | str, *, mode: int | None = None) -> Pat
     return safe_mkdir(anchor, target_raw, parents=True, mode=mode)
 
 
-def _tree_entries(root: Path) -> tuple[list[Path], list[Path]]:
+def _tree_entries(root: Path, *, budget=None) -> tuple[list[Path], list[Path]]:
+    _budget_check(budget)
     files: list[Path] = []
     directories: list[Path] = []
 
     def visit(directory: Path) -> None:
         try:
-            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+            entries = _budget_entries(directory, budget)
+        except TimeoutError:
+            raise
         except OSError:
             _fail("SAFE_READ_FAILED")
         for entry in entries:
+            _budget_check(budget)
             child = directory / entry.name
             if _is_reparse(child):
                 _fail("UNSAFE_REPARSE_POINT")
@@ -612,10 +660,13 @@ def _tree_entries(root: Path) -> tuple[list[Path], list[Path]]:
                     files.append(child)
                 else:
                     _fail("SAFE_TYPE_MISMATCH")
+            except TimeoutError:
+                raise
             except OSError:
                 _fail("SAFE_READ_FAILED")
 
     visit(root)
+    _budget_check(budget)
     return files, directories
 
 
@@ -627,7 +678,9 @@ def safe_remove_tree(
     owner: Mapping[str, Any] | None = None,
     kind: str | None = None,
     allow_missing: bool = False,
+    budget=None,
 ) -> bool:
+    _budget_check(budget)
     path = assert_safe_target(root, target, allow_missing=True, expected_type="dir")
     if owner is not None:
         validate_ownership_record(owner, root, path, kind=kind, expected_digest=expected_digest)
@@ -635,20 +688,23 @@ def safe_remove_tree(
         if allow_missing:
             return False
         _fail("SAFE_PATH_MISSING")
-    if expected_digest is not None and tree_digest(path) != expected_digest:
+    if expected_digest is not None and tree_digest(path, **({"budget": budget} if budget is not None else {})) != expected_digest:
         _fail("SAFE_DIGEST_MISMATCH")
-    files, directories = _tree_entries(path)
+    files, directories = _tree_entries(path, **({"budget": budget} if budget is not None else {}))
     # Rebuild the inventory and validate containment immediately before each
     # mutation.  os.unlink/rmdir operate on the exact path and never follow a
     # child symlink, while the preflight rejects all such children anyway.
     for child in sorted(files, key=lambda item: len(item.parts), reverse=True):
+        _budget_check(budget)
         safe_unlink(path, child, expected_digest=None, allow_missing=False)
     for child in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+        _budget_check(budget)
         assert_safe_target(path, child, allow_missing=False, expected_type="dir")
         try:
             child.rmdir()
         except OSError:
             _fail("SAFE_DELETE_FAILED")
+    _budget_check(budget)
     assert_safe_target(root, path, allow_missing=False, expected_type="dir")
     try:
         path.rmdir()

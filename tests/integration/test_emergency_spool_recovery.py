@@ -7,6 +7,7 @@ from pathlib import Path
 from ei.hooks.registry import normalize_hook_event
 from ei.queue import enqueue_receipt, recover_emergency_spool, write_emergency_envelope
 from ei.config import RuntimePaths, Settings
+from ei.runtime_catalog import lookup as runtime_lookup, inventory_paths as runtime_inventory
 
 
 
@@ -34,17 +35,18 @@ def make_isolated_hook_settings(root: Path) -> Settings:
 
 
 class EmergencySpoolRecoveryTests(unittest.TestCase):
-    def test_corrupt_emergency_is_quarantined_and_not_returned(self):
+    def test_corrupt_emergency_is_preserved_unknown_and_not_returned(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
             item = enqueue_receipt(normalize_hook_event("codex-cli", {"hook_event_name": "Stop", "session_id": "s", "turn_id": "t", "cwd": "C:/work"}, settings), None, settings, now=datetime(2026, 8, 26, tzinfo=timezone.utc))
-            (settings.paths.queue_dir / f"{item.queue_id}.json").unlink()
             write_emergency_envelope(item, settings, reason_code="QUEUE_WRITE_FAILED", now=datetime(2026, 8, 26, tzinfo=timezone.utc))
-            emergency = next(settings.paths.emergency_spool_dir.glob("emergency_*.json"))
+            emergency = next(runtime_inventory(settings.paths.emergency_spool_dir, prefix="emergency_"))
             emergency.write_text("{not-json", encoding="utf-8")
             recovered = recover_emergency_spool(settings, now=datetime(2026, 8, 26, 0, 0, 1, tzinfo=timezone.utc))
             self.assertEqual(recovered, ())
-            self.assertTrue((settings.paths.emergency_spool_dir / "quarantine" / emergency.name).exists())
+            self.assertEqual(emergency.read_text(encoding="utf-8"), "{not-json")
+            health = json.loads((settings.paths.emergency_spool_dir / "health.json").read_text(encoding="utf-8"))
+            self.assertEqual(health["status"], "EMERGENCY_INVENTORY_UNKNOWN")
 
 
 if __name__ == "__main__":

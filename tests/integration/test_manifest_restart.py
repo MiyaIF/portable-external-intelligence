@@ -16,13 +16,17 @@ from ei.installer import SetupSelection, setup
 from ei.remote_assurance import build_remote_assurance_receipt, classify_remote, write_remote_assurance_receipt
 
 
-class ManifestRestartIntegrationTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class ManifestRestartIntegrationTests(NotificationIsolationMixin, unittest.TestCase):
     def _installed(self, root: Path) -> tuple[Path, Path, Path]:
         engine = Path.cwd()
         knowledge = root / "private knowledge 日本語"
         runtime = root / "runtime 日本語"
         home = root / "host home"
         home.mkdir()
+        self.notification_isolation.allow_notification_helper()
         result = setup(
             SetupSelection(
                 engine_root=engine,

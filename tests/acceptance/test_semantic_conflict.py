@@ -1,7 +1,9 @@
 import json
 import inspect
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -55,13 +57,39 @@ class SemanticConflictAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "sync.lock"
             path.write_text(json.dumps({"pid": 999999, "acquired_at": "2020-01-01T00:00:00+00:00"}), encoding="utf-8")
-            with FileLock(path):
+            with patch.object(FileLock, "_pid_alive", return_value=False), FileLock(path):
                 self.assertTrue(path.exists())
-            with FileLock(path):
+            with patch.object(FileLock, "_pid_alive", return_value=True), FileLock(path):
                 with self.assertRaises(RuntimeError) as caught:
                     with FileLock(path):
                         pass
                 self.assertEqual(str(caught.exception), "SYNC_LOCK_BUSY")
+
+    def test_old_live_unknown_and_unreadable_ownership_locks_are_preserved(self):
+        for state in (True, None):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "sync.lock"
+                original = json.dumps({"pid": 12345, "acquired_at": "2020-01-01T00:00:00+00:00"})
+                path.write_text(original, encoding="utf-8")
+                with patch.object(FileLock, "_pid_alive", return_value=state):
+                    with self.assertRaisesRegex(RuntimeError, "SYNC_LOCK_BUSY"):
+                        with FileLock(path):
+                            self.fail("unverified owner lock was reclaimed")
+                self.assertEqual(path.read_text(encoding="utf-8"), original)
+        with tempfile.TemporaryDirectory() as tmp:
+            import os
+            path = Path(tmp) / "sync.lock"
+            path.write_bytes(b"invalid ownership")
+            os.utime(path, (1, 1))
+            with self.assertRaisesRegex(RuntimeError, "SYNC_LOCK_BUSY"):
+                with FileLock(path):
+                    self.fail("age-only lock was reclaimed")
+            self.assertEqual(path.read_bytes(), b"invalid ownership")
+
+    @unittest.skipUnless(os.name == "nt", "Windows read-only process handle probe")
+    def test_windows_liveness_never_sends_process_signal(self):
+        with patch("ei.sync.os.name", "nt"), patch("ei.sync.os.kill", side_effect=AssertionError("signal forbidden")):
+            self.assertIs(FileLock._pid_alive(os.getpid()), True)
 
     def test_semantic_conflict_never_uses_force_or_reset(self):
         class ConflictRunner:

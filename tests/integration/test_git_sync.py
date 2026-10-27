@@ -6,7 +6,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ei.config import RuntimePaths, Settings
-from ei.journal import append_event
+from ei.journal import append_event, iter_events
+from ei.operation_runtime import OperationBudget
+from ei.project import project_events
+from ei.index import build_index, read_index_items
 from ei.models import Event
 from ei.remote_assurance import build_remote_assurance_receipt, classify_remote, write_remote_assurance_receipt
 from ei.safe_fs import create_ownership_record, tree_digest, write_ownership_record
@@ -39,6 +42,163 @@ def settings_for(repo: Path, root: Path) -> Settings:
 
 
 class GitSyncTests(unittest.TestCase):
+    def test_exact_managed_staging_then_ff_keeps_source_bytes_without_unlink(self):
+        from ei import sync
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, remote, work = self._bounded_fixture(Path(tmp))
+            # Explicit byte-preserving checkout in this isolated experiment;
+            # no user/global configuration is modified by this fixture.
+            git(work, "config", "core.autocrlf", "false")
+            staged_worktree = Path(tmp) / "staged-worktree"
+            git(work, "worktree", "add", "--detach", str(staged_worktree), "HEAD")
+            runner = sync.GitRunner(work)
+            plan, _, _ = sync._validated_status(runner, settings)
+            self.assertTrue(plan.allowed)
+            before = {relative: (work / relative).read_bytes() for relative in plan.stage_paths if (work / relative).exists()}
+            sync._copy_engine_changes(work, staged_worktree, plan.stage_paths)
+            for relative in plan.stage_paths:
+                git(staged_worktree, "add", "--", relative)
+            git(staged_worktree, "commit", "-m", "isolated synchronized contents")
+            commit = git(staged_worktree, "rev-parse", "HEAD")
+            git(staged_worktree, "push", "origin", "HEAD:main")
+            for relative in plan.stage_paths:
+                git(work, "add", "--", relative)
+            self.assertEqual({relative: (work / relative).read_bytes() for relative in before}, before)
+            git(work, "merge", "--ff-only", commit)
+            self.assertEqual({relative: (work / relative).read_bytes() for relative in before}, before)
+            self.assertEqual(git(work, "status", "--porcelain"), "")
+            self.assertEqual(len(list(iter_events(work / "events"))), 2)
+            self.assertEqual(read_index_items(build_index(work / "knowledge", work / "knowledge" / "index.json"))[0]["rule"], "verified reusable sync rule 2")
+            git(work, "worktree", "remove", str(staged_worktree))
+
+    def _bounded_fixture(self, root):
+        remote, work = root / "remote.git", root / "work"
+        remote.mkdir()
+        work.mkdir()
+        git(root, "init", "--bare", str(remote))
+        git(work, "init", "-b", "main")
+        git(work, "config", "core.autocrlf", "true")
+        git(work, "config", "user.name", "Test User")
+        git(work, "config", "user.email", "test@example.invalid")
+        git(work, "remote", "add", "origin", str(remote))
+        for number in (1, 2):
+            event = Event.create("pattern.promoted", f"2026-09-{number:02d}T00:00:00Z", "test", "machine", {"pattern_id": "pat_sync", "rule": f"verified reusable sync rule {number}", "classification": "private-reusable"}, event_id=f"evt_sync_{number}")
+            append_event(event, work / "events")
+            project_events(iter_events(work / "events"), work / "knowledge", budget=OperationBudget(10000))
+            if number == 1:
+                git(work, "add", "events", "knowledge")
+                git(work, "commit", "-m", "seed")
+                git(work, "push", "origin", "HEAD:main")
+        return settings_for(work, root), remote, work
+
+    def test_bounded_sync_copies_portable_generations_and_keeps_source_recall(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, remote, work = self._bounded_fixture(Path(tmp))
+            result = sync_once(settings, budget=OperationBudget(30000))
+            self.assertTrue(result.ok, result)
+            current = build_index(work / "knowledge", work / "knowledge" / "index.json")
+            self.assertEqual(read_index_items(current)[0]["rule"], "verified reusable sync rule 2")
+            self.assertEqual(len(list(iter_events(work / "events"))), 2)
+            self.assertEqual(git(work, "status", "--porcelain"), "")
+            clone = Path(tmp) / "clone"
+            git(Path(tmp), "-c", "core.autocrlf=true", "clone", "--branch", "main", str(remote), str(clone))
+            rebuilt = project_events(iter_events(clone / "events"), clone / "knowledge", budget=OperationBudget(10000))
+            self.assertEqual(read_index_items(rebuilt)[0]["rule"], "verified reusable sync rule 2")
+            self.assertLessEqual(len(list((clone / "knowledge" / ".projection-generations").iterdir())), 3)
+
+    def test_deadline_after_ownership_preserves_worktree_and_does_not_cleanup(self):
+        from ei import sync
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, remote, work = self._bounded_fixture(Path(tmp))
+            budget = OperationBudget(30000)
+            original = sync._create_worktree
+            def create_then_expire(*args):
+                result = original(*args)
+                budget.deadline = 0
+                return result
+            with patch("ei.sync._create_worktree", side_effect=create_then_expire), patch("ei.sync._cleanup_worktree", side_effect=AssertionError("no post-deadline cleanup")):
+                result = sync_once(settings, budget=budget)
+            self.assertEqual(result.reason_code, "SYNC_BUDGET_EXHAUSTED")
+            self.assertTrue((settings.paths.runtime_root / "sync-worktree.ownership.json").exists())
+            self.assertTrue((settings.paths.runtime_root / "sync-worktree").exists())
+            self.assertFalse((settings.paths.local_state_dir / "sync-state.json").exists())
+            retry = sync_once(settings, budget=OperationBudget(30000))
+            self.assertTrue(retry.ok, retry)
+            self.assertFalse((settings.paths.runtime_root / "sync-worktree.ownership.json").exists())
+
+    def test_timeout_after_push_started_does_not_claim_remote_untouched(self):
+        from ei import sync
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, remote, work = self._bounded_fixture(Path(tmp))
+            original = sync.GitRunner.run
+            budget = OperationBudget(30000)
+            calls = []
+            def push_then_expire(runner, args):
+                calls.append(tuple(args))
+                result = original(runner, args)
+                if args[1] == "push":
+                    budget.deadline = 0
+                    raise TimeoutError("OPERATION_BUDGET_EXHAUSTED")
+                return result
+            with patch("ei.sync.GitRunner.run", push_then_expire):
+                result = sync_once(settings, budget=budget)
+            self.assertEqual(result.reason_code, "SYNC_REMOTE_OUTCOME_UNKNOWN")
+            self.assertEqual(calls[-1][1], "push")
+            self.assertTrue(result.preflight["push_started"])
+            self.assertTrue((settings.paths.runtime_root / "sync-worktree.ownership.json").exists())
+            self.assertFalse((settings.paths.local_state_dir / "sync-state.json").exists())
+            self.assertIn("evt_sync_2.json", git(remote, "ls-tree", "-r", "main"))
+            retry = sync_once(settings, budget=OperationBudget(30000))
+            self.assertTrue(retry.ok, retry)
+            self.assertEqual(len(list(iter_events(work / "events"))), 2)
+            self.assertEqual(git(work, "status", "--porcelain"), "")
+
+    def test_deadline_between_source_stage_and_merge_keeps_current_recall_and_retries(self):
+        from ei import sync
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, remote, work = self._bounded_fixture(Path(tmp))
+            work = work.resolve(strict=True)
+            before = {path: path.read_bytes() for path in (work / "events").rglob("*.json")}
+            original, budget = sync.GitRunner.run, OperationBudget(30000)
+            injector_fired = []
+            def stage_then_expire(runner, args):
+                result = original(runner, args)
+                if runner.repo_root == work and args[1:3] == ["add", "--"]:
+                    injector_fired.append(True)
+                    budget.deadline = 0
+                return result
+            with patch("ei.sync.GitRunner.run", stage_then_expire):
+                result = sync_once(settings, budget=budget)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason_code, "SYNC_SOURCE_RECONCILIATION_PENDING")
+            self.assertTrue(injector_fired)
+            self.assertEqual(result.preflight["push_returncode"], 0)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            self.assertEqual(read_index_items(build_index(work / "knowledge", work / "knowledge" / "index.json"))[0]["rule"], "verified reusable sync rule 2")
+            self.assertTrue((settings.paths.runtime_root / "sync-worktree.ownership.json").exists())
+            retry = sync_once(settings, budget=OperationBudget(30000))
+            self.assertTrue(retry.ok, retry)
+            self.assertEqual(git(work, "status", "--porcelain"), "")
+
+    def test_source_reconciliation_refuses_concurrent_staged_change_without_deleting_bodies(self):
+        from ei import sync
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, remote, work = self._bounded_fixture(Path(tmp))
+            original = sync._reconcile_source_after_push
+            before = {path: path.read_bytes() for path in (work / "events").rglob("*.json")}
+            def change_then_reconcile(*args):
+                (work / "user-note.txt").write_bytes(b"user-owned staged change\n")
+                git(work, "add", "user-note.txt")
+                return original(*args)
+            with patch("ei.sync._reconcile_source_after_push", side_effect=change_then_reconcile):
+                result = sync_once(settings, budget=OperationBudget(30000))
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason_code, "SYNC_SOURCE_RECONCILIATION_PENDING")
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            self.assertEqual(git(work, "show", ":user-note.txt"), "user-owned staged change")
+            self.assertIn("evt_sync_2.json", git(remote, "ls-tree", "-r", "main"))
+            self.assertEqual(read_index_items(build_index(work / "knowledge", work / "knowledge" / "index.json"))[0]["rule"], "verified reusable sync rule 2")
+
     def test_legacy_layout_requires_remote_assurance(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

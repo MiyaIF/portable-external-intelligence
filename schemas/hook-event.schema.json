@@ -18,7 +18,20 @@
     "received_at": {"type": "string", "format": "date-time"},
     "privacy_classification": {"type": "string", "minLength": 1},
     "source_host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
-    "source_host_family": {"type": "string", "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"}
+    "source_host_family": {"type": "string", "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+    "capture_identity": {
+      "type": "object",
+      "required": ["host_id", "instance_hash", "store_id", "session_hash", "turn_hash", "record_hash"],
+      "properties": {
+        "host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+        "instance_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "store_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "session_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "turn_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"},
+        "record_hash": {"type": ["string", "null"], "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }

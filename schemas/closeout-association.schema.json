@@ -1,0 +1,100 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Closeout association intent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "record_id", "status", "host_hash", "instance_hash", "store_hash",
+    "session_hash", "record_hash", "cwd_hash", "domain_hash", "target_ids", "target_set_hash",
+    "binding_digest", "content_hash", "created_at", "expires_at", "spool_id", "spool_ref",
+    "decision", "candidate_hash", "changeset_id_hash", "changeset_hash", "application_ref", "witness", "reason_code",
+    "result_digest"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "record_id": {"type": "string", "pattern": "^co_[0-9a-f]{64}$"},
+    "status": {"enum": ["PREPARING", "PREPARED", "APPLIED", "COMMITTED", "LOST"]},
+    "host_hash": {"$ref": "#/$defs/hash"},
+    "instance_hash": {"$ref": "#/$defs/hash"},
+    "store_hash": {"$ref": "#/$defs/hash"},
+    "session_hash": {"$ref": "#/$defs/hash"},
+    "record_hash": {"$ref": "#/$defs/hash"},
+    "cwd_hash": {"$ref": "#/$defs/hash"},
+    "domain_hash": {"$ref": "#/$defs/hash"},
+    "target_ids": {
+      "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+      "items": {"$ref": "#/$defs/hash"}
+    },
+    "target_set_hash": {"$ref": "#/$defs/hash"},
+    "binding_digest": {"$ref": "#/$defs/hash"},
+    "content_hash": {"$ref": "#/$defs/hash"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "spool_id": {"type": "string", "pattern": "^spool_[0-9a-f]{32}$"},
+    "spool_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/spoolRef"}]},
+    "decision": {"anyOf": [{"type": "null"}, {"enum": ["YES", "NO"]}]},
+    "candidate_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "changeset_id_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "changeset_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "application_ref": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/applicationRef"}]},
+    "witness": {"type": "array", "maxItems": 65, "items": {"$ref": "#/$defs/witness"}},
+    "reason_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+    "result_digest": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+    "team_result": {
+      "anyOf": [
+        {"type": "null"},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["status", "reason_code", "personal_event_hash", "team_store_hash", "team_root_hash", "delivery_event_id", "delivery_event_hash", "receipt_id_hash", "receipt_status"],
+          "properties": {
+            "status": {"enum": ["DELIVERED", "NOT_ELIGIBLE", "DEFERRED", "PENDING", "UNKNOWN"]},
+            "reason_code": {"type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$"},
+            "personal_event_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+            "team_store_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+            "team_root_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+            "delivery_event_id": {"anyOf": [{"type": "null"}, {"type": "string", "pattern": "^evt_[0-9TZ]+_[0-9a-f]{12}$"}]},
+            "delivery_event_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+            "receipt_id_hash": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]},
+            "receipt_status": {"anyOf": [{"type": "null"}, {"enum": ["PENDING", "DEFERRED", "DELIVERED", "FAILED"]}]},
+            "integrity_hash": {"$ref": "#/$defs/hash"}
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "spoolRef": {
+      "type": "object", "additionalProperties": false,
+      "required": ["spool_id", "content_hash", "classification", "created_at", "expires_at", "key_id", "encrypted", "purpose"],
+      "properties": {
+        "spool_id": {"type": "string", "pattern": "^spool_[0-9a-f]{32}$"},
+        "content_hash": {"$ref": "#/$defs/hash"},
+        "classification": {"enum": ["public", "private-reusable", "client-confidential"]},
+        "created_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "key_id": {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]},
+        "encrypted": {"const": true},
+        "purpose": {"const": "validated-result"}
+      }
+    },
+    "applicationRef": {
+      "type": "object", "additionalProperties": false,
+      "required": ["marker_id", "occurred_at", "changeset_hash"],
+      "properties": {
+        "marker_id": {"type": "string", "pattern": "^evt_changeset_[0-9a-f]{32}$"},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "changeset_hash": {"$ref": "#/$defs/hash"}
+      }
+    },
+    "witness": {
+      "type": "object", "additionalProperties": false,
+      "required": ["event_id", "occurred_at", "integrity_digest"],
+      "properties": {
+        "event_id": {"type": "string", "minLength": 1, "maxLength": 160},
+        "occurred_at": {"type": "string", "format": "date-time"},
+        "integrity_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    }
+  }
+}

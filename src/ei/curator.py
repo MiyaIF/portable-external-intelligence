@@ -11,7 +11,8 @@ from .gate import GateDecision
 from .index import read_index_items
 from .models import HostApplicability, KnowledgeIndex, PromotionPolicy, validate_host_applicability_mapping, validate_host_label
 from .privacy import inspect_text
-from .ids import stable_hash
+from .ids import fingerprint, stable_hash
+from .redaction import domain_hash
 
 
 _WRITABLE = frozenset({"public", "private-reusable"})
@@ -128,18 +129,29 @@ def _provider_id(provider: Any) -> str:
     return "deterministic-curator"
 
 
-def _patterns(index: Any) -> list[dict[str, Any]]:
+def _checked(values, operation_budget=None):
+    if operation_budget is not None:
+        operation_budget.check()
+    for value in values:
+        if operation_budget is not None:
+            operation_budget.check()
+        yield value
+    if operation_budget is not None:
+        operation_budget.check()
+
+
+def _patterns(index: Any, operation_budget=None) -> list[dict[str, Any]]:
     if isinstance(index, KnowledgeIndex):
-        return [dict(item) for item in read_index_items(index, list(index.active_pattern_ids) or None)]
+        return [dict(item) for item in _checked(read_index_items(index, list(index.active_pattern_ids) or None, budget=operation_budget), operation_budget)]
     if isinstance(index, Mapping):
         value = index.get("patterns", index.get("items", ()))
         if isinstance(value, Mapping):
-            return [{**dict(item), "pattern_id": str(item_id)} for item_id, item in value.items() if isinstance(item, Mapping)]
+            return [{**dict(item), "pattern_id": str(item_id)} for item_id, item in _checked(value.items(), operation_budget) if isinstance(item, Mapping)]
         index = value
     if isinstance(index, Sequence) and not isinstance(index, (str, bytes, bytearray)):
-        return [dict(item) for item in index if isinstance(item, Mapping)]
+        return [dict(item) for item in _checked(index, operation_budget) if isinstance(item, Mapping)]
     if isinstance(index, Iterable) and not isinstance(index, (str, bytes, bytearray)):
-        return [dict(item) for item in index if isinstance(item, Mapping)]
+        return [dict(item) for item in _checked(index, operation_budget) if isinstance(item, Mapping)]
     return []
 
 
@@ -164,7 +176,7 @@ def _candidate_data(candidate: Any) -> dict[str, Any]:
         for name in (
             "title", "claim", "rule", "precondition", "failure_mode", "benefit",
             "classification", "evidence_refs", "provenances", "scopes",
-            "applicability", "domain", "source_ref", "source_kind",
+            "applicability", "domain", "source_ref", "source_kind", "cwd", "cwd_fingerprint",
             "outcome_status", "version_constraint", "exception", "exceptions",
             "source_host_id", "source_host_family", "applicability_scope",
             "applicable_host_ids", "applicable_host_families",
@@ -242,6 +254,18 @@ def _base(data: Mapping[str, Any], provider_id: str, hashes: Sequence[str]) -> d
         source_host_id=source_host_id,
         source_host_family=source_host_family,
     )
+    cwd_digest = data.get("cwd_fingerprint")
+    if not isinstance(cwd_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", cwd_digest):
+        cwd = data.get("cwd")
+        # Match the direct observation route exactly; a path's whitespace,
+        # case and spelling are not interchangeable source evidence.
+        cwd_digest = fingerprint(cwd) if isinstance(cwd, str) and cwd else ""
+    source_ref = _text(data, "source_ref") or "curator"
+    source_ref_identity = (
+        source_ref
+        if re.fullmatch(r"sha256:[0-9a-f]{64}", source_ref)
+        else domain_hash(source_ref, "source-ref")
+    )
     return {
         "actor": "external-intelligence",
         "provider_id": provider_id,
@@ -262,8 +286,9 @@ def _base(data: Mapping[str, Any], provider_id: str, hashes: Sequence[str]) -> d
         "benefit": _text(data, "benefit"),
         "benefit_count": 1 if _text(data, "benefit") else 0,
         "source_kind": _text(data, "source_kind") or classification,
-        "source_ref": _text(data, "source_ref") or "curator",
+        "source_ref": source_ref_identity,
         "outcome_status": _text(data, "outcome_status") or "observed",
+        **({"cwd_fingerprint": cwd_digest} if cwd_digest else {}),
         "source_host_id": source_host_id,
         "source_host_family": source_host_family,
         "applicability_scope": host_scope.scope,
@@ -328,21 +353,21 @@ def _status(pattern: Mapping[str, Any]) -> str:
     return str(pattern.get("status", "active")).casefold()
 
 
-def _match(patterns: Sequence[Mapping[str, Any]], claim: str, candidate_scope: HostApplicability | None = None) -> tuple[str, Mapping[str, Any], float] | None:
+def _match(patterns: Sequence[Mapping[str, Any]], claim: str, candidate_scope: HostApplicability | None = None, operation_budget=None) -> tuple[str, Mapping[str, Any], float] | None:
     eligible = [
-        item for item in patterns
+        item for item in _checked(patterns, operation_budget)
         if _status(item) in {"active", "candidate"}
         and item.get("pattern_id")
         and _applicability_compatible(_pattern_applicability(item), candidate_scope)
     ]
     exact = sorted(
-        (item for item in eligible if normalize_claim(claim) == normalize_claim(_pattern_primary(item))),
+        (item for item in _checked(eligible, operation_budget) if normalize_claim(claim) == normalize_claim(_pattern_primary(item))),
         key=lambda item: (str(item.get("pattern_id")), str(item.get("cluster_id", ""))),
     )
     if exact:
         return "exact", exact[0], 1.0
     scored: list[tuple[float, Mapping[str, Any]]] = []
-    for item in eligible:
+    for item in _checked(eligible, operation_budget):
         target = _pattern_text(item)
         score = similarity(claim, target)
         if alias_match(claim, target):
@@ -380,7 +405,17 @@ def _changeset(candidate_id: str, operations: Sequence[ChangeOperation], hashes:
     )
 
 
-def curate_candidate(candidate: Any, index: Any, provider: Any, budget: Any = None) -> ChangeSet:
+def curate_candidate(candidate: Any, index: Any, provider: Any, budget: Any = None, *, operation_budget=None) -> ChangeSet:
+    # The positional budget remains the existing promotion-policy input.
+    if operation_budget is not None:
+        operation_budget.check()
+    result = _curate_candidate(candidate, index, provider, budget, operation_budget=operation_budget)
+    if operation_budget is not None:
+        operation_budget.check()
+    return result
+
+
+def _curate_candidate(candidate: Any, index: Any, provider: Any, budget: Any, *, operation_budget=None) -> ChangeSet:
     if isinstance(candidate, GateDecision):
         if candidate.decision != "YES":
             raise ValueError("CURATOR_REQUIRES_GATE_YES")
@@ -397,7 +432,7 @@ def curate_candidate(candidate: Any, index: Any, provider: Any, budget: Any = No
         return _no_change(data, provider_id, reason, hashes or (_hash(claim or title),))
     normalized = _base(data, provider_id, hashes)
     candidate_id = "cand_" + stable_hash({"claim": normalize_claim(claim), "hashes": list(hashes)})[:20]
-    match = _match(_patterns(index), claim, _pattern_applicability(normalized))
+    match = _match(_patterns(index, operation_budget), claim, _pattern_applicability(normalized), operation_budget)
     if match and match[0] == "exact":
         target = match[1]
         payload = {

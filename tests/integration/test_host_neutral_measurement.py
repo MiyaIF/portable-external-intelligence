@@ -17,6 +17,61 @@ from ei.metrics import read_deduplicated_usage
 
 
 class HostNeutralMeasurementTests(unittest.TestCase):
+    def test_exposure_rejects_runtime_alias_before_resolving_it(self):
+        import os
+        import subprocess
+        from types import SimpleNamespace
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            outside, link = root / "outside", root / "runtime-link"
+            outside.mkdir()
+            if os.name == "nt":
+                result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+                self.assertEqual(result.returncode, 0)
+            else:
+                link.symlink_to(outside, target_is_directory=True)
+            try:
+                settings = SimpleNamespace(paths=SimpleNamespace(runtime_root=link))
+                value = ExposureRecord(experiment_id="test", session_id_hash="one", task_id_hash="one", arm="control")
+                with self.assertRaisesRegex(ValueError, "UNSAFE_REPARSE_POINT"):
+                    record_exposure(value, settings, budget=OperationBudget(5000))
+                self.assertEqual(list(outside.iterdir()), [])
+            finally:
+                link.rmdir() if os.name == "nt" else link.unlink()
+
+    def test_exposure_budget_preserves_log_on_interrupted_scan_and_lock_contention(self):
+        from ei.measurement_events import _exclusive_lock
+        from ei.operation_runtime import OperationBudget
+        from tests.integration.test_unattended_operation import RemainingBudget
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._settings(Path(tmp))
+            first = ExposureRecord(experiment_id="test", session_id_hash="one", task_id_hash="one", query_fingerprint="query", arm="control", protocol_hash=ExperimentConfig.defaults().protocol_hash)
+            second = ExposureRecord(experiment_id="test", session_id_hash="two", task_id_hash="two", query_fingerprint="query", arm="control", protocol_hash=ExperimentConfig.defaults().protocol_hash)
+            with self.assertRaises(TimeoutError):
+                record_exposure(first, settings, budget=OperationBudget(0))
+            path = measurement_paths(settings)["exposures"]
+            self.assertFalse(path.exists())
+            record_exposure(first, settings)
+            before = path.read_bytes()
+            budget = RemainingBudget()
+            loads = json.loads
+            def expire(raw):
+                value = loads(raw)
+                budget.remaining = 0
+                return value
+            with patch("ei.measurement_events.json.loads", side_effect=expire), self.assertRaises(TimeoutError):
+                record_exposure(second, settings, budget=budget)
+            self.assertEqual(path.read_bytes(), before)
+            with _exclusive_lock(path.with_name(path.name + ".lock")):
+                with self.assertRaises(TimeoutError):
+                    record_exposure(second, settings, budget=OperationBudget(30))
+            self.assertEqual(path.read_bytes(), before)
+            record_exposure(second, settings, budget=OperationBudget(5000))
+            record_exposure(second, settings, budget=OperationBudget(5000))
+            self.assertEqual(len(path.read_text().splitlines()), 2)
+
     def _settings(self, root: Path):
         (root / "config").mkdir()
         (root / "config" / "defaults.json").write_text(

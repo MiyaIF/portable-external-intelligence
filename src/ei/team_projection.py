@@ -20,12 +20,27 @@ from .index import build_index, read_index_items
 from .journal import event_integrity
 from .models import Event, KnowledgeIndex
 from .project import project_events
+from .operation_runtime import _read_json
+from .safe_fs import safe_atomic_write, safe_ensure_directory
 from .team_store import TeamEventScan, scan_team_events
 
 
 _STORE_ID_RE = re.compile(r"^team_[0-9a-f]{16,64}$")
 _SAFE_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_.-]{1,79}$")
 _CURSOR_SCHEMA_VERSION = 1
+
+
+def _check(budget):
+    if budget is not None:
+        budget.check()
+
+
+def _checked(items, budget):
+    _check(budget)
+    for item in items:
+        _check(budget)
+        yield item
+    _check(budget)
 
 
 @dataclass(frozen=True)
@@ -76,15 +91,14 @@ def team_cache_paths(runtime_root: Path | str, store_id: str) -> TeamProjectionP
     return TeamProjectionPaths(root, knowledge_dir, knowledge_dir / "index.json", root / "cursor.json")
 
 
-def _atomic_json(path: Path, value: Mapping[str, object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8", newline="\n")
-    try:
-        os.replace(temporary, path)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+def _atomic_json(path: Path, value: Mapping[str, object], *, budget=None) -> None:
+    _check(budget)
+    raw = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    if len(raw) > 262144:
+        raise ValueError("TEAM_CURSOR_TOO_LARGE")
+    safe_ensure_directory(path.parent)
+    _check(budget)
+    safe_atomic_write(path.parent, path, raw)
 
 
 def _safe_code(value: object, fallback: str = "TEAM_SCAN_ISSUE") -> str:
@@ -111,9 +125,11 @@ def _issue_counts(issues: tuple[Mapping[str, object], ...]) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _read_cursor(paths: TeamProjectionPaths, store_id: str) -> dict[str, object] | None:
+def _read_cursor(paths: TeamProjectionPaths, store_id: str, *, budget=None) -> dict[str, object] | None:
     try:
-        value = json.loads(paths.cursor_path.read_text(encoding="utf-8"))
+        value = _read_json(paths.cursor_path, budget=budget)
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     if not isinstance(value, Mapping):
@@ -135,9 +151,11 @@ def _read_cursor(paths: TeamProjectionPaths, store_id: str) -> dict[str, object]
     return dict(value)
 
 
-def _load_existing_index(paths: TeamProjectionPaths) -> KnowledgeIndex | None:
+def _load_existing_index(paths: TeamProjectionPaths, *, budget=None) -> KnowledgeIndex | None:
     try:
-        return build_index(paths.knowledge_dir, paths.index_path)
+        return build_index(paths.knowledge_dir, paths.index_path, budget=budget)
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, ValueError):
         return None
 
@@ -197,10 +215,10 @@ def _derived_pattern_event(event: Event, store_id: str) -> Event:
     )
 
 
-def _accepted_events(events: tuple[Event, ...], store_id: str) -> tuple[tuple[Event, ...], tuple[Mapping[str, object], ...]]:
+def _accepted_events(events: tuple[Event, ...], store_id: str, *, budget=None) -> tuple[tuple[Event, ...], tuple[Mapping[str, object], ...]]:
     groups: dict[str, list[Event]] = {}
     issues: list[Mapping[str, object]] = []
-    for event in events:
+    for event in _checked(events, budget):
         key = event.idempotency_key
         payload_key = event.payload.get("idempotency_key")
         if not isinstance(key, str) or payload_key != key:
@@ -208,19 +226,21 @@ def _accepted_events(events: tuple[Event, ...], store_id: str) -> tuple[tuple[Ev
             continue
         groups.setdefault(key, []).append(event)
     accepted: list[Event] = []
-    for key, group in sorted(groups.items()):
+    for key, group in _checked(sorted(groups.items()), budget):
         by_hash: dict[str, Event] = {}
-        for event in group:
+        for event in _checked(group, budget):
             by_hash.setdefault(event_integrity(event), event)
         if len(by_hash) > 1:
             issues.append(_issue("TEAM_IDEMPOTENCY_CONFLICT"))
             continue
         accepted.append(min(by_hash.values(), key=_order_key))
     accepted.sort(key=_order_key)
+    _check(budget)
     return tuple(accepted), tuple(issues)
 
 
-def _existing_pattern_events(index: KnowledgeIndex | None) -> tuple[Event, ...]:
+def _existing_pattern_events(index: KnowledgeIndex | None, *, budget=None) -> tuple[Event, ...]:
+    _check(budget)
     if index is None:
         return ()
     ids = tuple(index.active_pattern_ids) + tuple(index.archive_pattern_ids)
@@ -230,11 +250,13 @@ def _existing_pattern_events(index: KnowledgeIndex | None) -> tuple[Event, ...]:
     if not document_ids:
         return ()
     try:
-        items = read_index_items(index, list(dict.fromkeys(document_ids)))
+        items = read_index_items(index, list(dict.fromkeys(document_ids)), budget=budget)
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, ValueError, KeyError):
         return ()
     result: list[Event] = []
-    for item in items:
+    for item in _checked(items, budget):
         pattern_id = item.get("pattern_id") or item.get("item_id")
         if not isinstance(pattern_id, str) or not pattern_id:
             continue
@@ -273,6 +295,7 @@ def _write_cursor(
     previous: Mapping[str, object] | None,
     *,
     accepted_count: int | None = None,
+    budget=None,
 ) -> None:
     previous_key = previous.get("last_total_order_key") if previous else None
     current_key = list(_order_key(accepted[-1])) if accepted else None
@@ -293,7 +316,7 @@ def _write_cursor(
         "projection_hash": projection_hash,
         "issue_counts": _issue_counts(issues),
     }
-    _atomic_json(paths.cursor_path, value)
+    _atomic_json(paths.cursor_path, value, budget=budget)
 
 
 def _unavailable(paths: TeamProjectionPaths, issue: str, previous: Mapping[str, object] | None, existing: KnowledgeIndex | None) -> TeamProjectionResult:
@@ -307,13 +330,15 @@ def refresh_team_projection(
     store_id: str,
     *,
     scan_fn: Callable[[Path | str], TeamEventScan] | None = None,
+    budget=None,
 ) -> TeamProjectionResult:
     """Refresh one local team cache while preserving it during offline periods."""
 
+    _check(budget)
     store_id = _validate_store_id(store_id)
     paths = team_cache_paths(runtime_root, store_id)
-    previous = _read_cursor(paths, store_id)
-    existing = _load_existing_index(paths)
+    previous = _read_cursor(paths, store_id, budget=budget)
+    existing = _load_existing_index(paths, budget=budget)
     source = Path(shared_root).expanduser()
     try:
         if not source.is_dir():
@@ -323,7 +348,10 @@ def refresh_team_projection(
 
     scanner = scan_fn or scan_team_events
     try:
-        scanned = scanner(source)
+        _check(budget)
+        scanned = scanner(source, budget=budget) if budget is not None else scanner(source)
+    except TimeoutError:
+        raise
     except (OSError, TypeError, ValueError):
         return _unavailable(paths, "TEAM_KNOWLEDGE_UNAVAILABLE", previous, existing)
     if not isinstance(scanned, TeamEventScan):
@@ -332,19 +360,20 @@ def refresh_team_projection(
     if any(item.get("code") in {"TEAM_ROOT_UNAVAILABLE", "TEAM_KNOWLEDGE_UNAVAILABLE"} for item in scan_issues):
         return _unavailable(paths, "TEAM_KNOWLEDGE_UNAVAILABLE", previous, existing)
 
-    accepted, conflict_issues = _accepted_events(tuple(sorted(scanned.events, key=_order_key)), store_id)
+    _check(budget)
+    accepted, conflict_issues = _accepted_events(tuple(sorted(scanned.events, key=_order_key)), store_id, budget=budget)
     issues = tuple(scan_issues) + tuple(conflict_issues)
     known_ids = {item_id for item_id in (tuple(existing.active_pattern_ids) + tuple(existing.archive_pattern_ids) + tuple(getattr(existing, "candidate_pattern_ids", ())))} if existing else set()
-    new_events = tuple(event for event in accepted if _derived_pattern_id(event, store_id) not in known_ids)
+    new_events = tuple(event for event in _checked(accepted, budget) if _derived_pattern_id(event, store_id) not in known_ids)
     previous_count = int(previous.get("accepted_event_count", 0) or 0) if previous else 0
     accepted_count = max(len(accepted), previous_count + len(new_events))
     if existing is not None and not new_events:
-        _write_cursor(paths, store_id, accepted, existing, issues, previous, accepted_count=accepted_count)
+        _write_cursor(paths, store_id, accepted, existing, issues, previous, accepted_count=accepted_count, budget=budget)
         return TeamProjectionResult(paths, existing, issues, "UNCHANGED", accepted_count)
 
-    derived = _existing_pattern_events(existing) + tuple(_derived_pattern_event(event, store_id) for event in new_events)
-    index = project_events(derived, paths.knowledge_dir)
-    _write_cursor(paths, store_id, accepted, index, issues, previous, accepted_count=accepted_count)
+    derived = _existing_pattern_events(existing, budget=budget) + tuple(_derived_pattern_event(event, store_id) for event in _checked(new_events, budget))
+    index = project_events(derived, paths.knowledge_dir, **({"budget": budget} if budget is not None else {}))
+    _write_cursor(paths, store_id, accepted, index, issues, previous, accepted_count=accepted_count, budget=budget)
     status = "UPDATED" if new_events or existing is None else "UNCHANGED"
     return TeamProjectionResult(paths, index, issues, status, accepted_count)
 

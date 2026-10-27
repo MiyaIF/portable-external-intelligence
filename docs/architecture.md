@@ -36,6 +36,18 @@
 
 Hookは短時間の処理だけを行い、候補の重い整理はmaintenanceに渡します。整理AIが利用不能またはquota超過なら、新規候補を `DEFERRED` としてqueueと参照を保持します。別providerへ自動切替しません。整理AIの停止は既存patternのrecallを止めません。
 
+## 無操作運用の永続化と証拠
+
+受付の`SECURED` receiptは暗号化spool・queue・receiptの永続化を示し、知識化や次回recallを示しません。未整理候補はmachine-local runtime、確定したeventと取得projectionは個人knowledge root、cursor・incident・診断記録はruntimeに分かれます。許可sourceの不在・読取不能・走査上限は`UNKNOWN`として扱い、候補なしを`NO`と推定しません。
+
+実装テスト、fixture receipt、CI contract、実Hostからのreceipt、OS通知API送信、利用者画面への実表示は別々の証拠です。mockされたprovider/backendやheadless CIだけで運用完了を推測しません。保持期限、容量上限、通知理由と現在の未実証範囲は[無操作運用ガイド](unattended-operation.md)に記載します。
+
+## trusted closeoutの接続境界
+
+登録済みadapterからのcloseoutでは、native control metadataを候補payloadと別引数で受け、registryがnamespace・binding・明示対象を検証してから共通closeout serviceへ渡します。候補本文やgate/Skill出力から対象controlを作りません。trusted経路は既存形式の構造化YES/NOだけを使い、評価がなければ推論を追加せず`UNKNOWN` / `CLOSEOUT_EVALUATION_REQUIRED`で待機します。通常の`ei closeout`は従来のprovider・privacy・curator・audit・routingを保ち、配布Skillの`changeset_ready`は提案のままです。
+
+maintenanceは既存のbudgetを共有してassociation recoveryをspool GCより前に行います。走査のtop-level完了codeだけでは個々の記録のCOMMITTEDを意味しません。pending・期限切れ・metadata不明は既存health/incidentへ渡し、完了ACKを作らず保持します。既存public adaptersのnative closeout coverageは未対応で、metadataのない対象は`UNKNOWN`です。fake adapter、単体・integration test、CIは実Hostのcloseout metadata提供やOS上の継続動作を証明しません。
+
 ## 適用範囲と取得
 
 Hookで受けたsource Host IDと `host_family` はevent、candidate、patternまで保持します。patternの範囲は次のいずれかです。

@@ -4,17 +4,27 @@ import hashlib
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Sequence
 
 from .ids import machine_id, stable_hash
-from .journal import append_event, iter_events, validate_schema
+from .journal import (
+    JournalIntegrityError,
+    JournalLimitError,
+    _check_budget,
+    append_event,
+    iter_events,
+    read_event,
+    validate_schema,
+)
 from .models import Event, PromotionPolicy, ValidationResult, validate_host_applicability_mapping, validate_host_label
+from .operation_runtime import OperationBudget
 from .persistable_fields import inspect_changeset_payload, inspect_persistable
 from .privacy import inspect_text
 from .redaction import domain_hash
+from .safe_fs import SafeFilesystemError, assert_safe_target
 
 
 OPERATIONS = frozenset({
@@ -26,6 +36,7 @@ _WRITABLE = frozenset({"public", "private-reusable"})
 _SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 _SAFE_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$")
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
+_APPLICATION_MARKER_ID = re.compile(r"^evt_changeset_[0-9a-f]{32}$")
 _FORBIDDEN_KEYS = frozenset({
     "body", "candidate_text", "raw", "raw_input", "raw_response",
     "response", "transcript", "tool_output", "prompt", "query",
@@ -167,6 +178,15 @@ class ChangeSet:
 
 
 @dataclass(frozen=True)
+class AppliedMarkerRef:
+    """Unverified locator for an apply marker; it is not a receipt."""
+
+    marker_id: str
+    occurred_at: str
+    changeset_hash: str
+
+
+@dataclass(frozen=True)
 class ApplyResult:
     applied: bool
     reason_code: str
@@ -174,6 +194,7 @@ class ApplyResult:
     changeset_id: str
     already_applied: bool = False
     validation: ValidationResult = ValidationResult(False, ())
+    application_ref: AppliedMarkerRef | None = None
 
     @property
     def ok(self) -> bool:
@@ -192,17 +213,54 @@ def _timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _application_ref(marker: Event | None) -> AppliedMarkerRef | None:
+    if marker is None:
+        return None
+    marker_id = getattr(marker, "event_id", None)
+    occurred_at = getattr(marker, "occurred_at", None)
+    payload = getattr(marker, "payload", None)
+    changeset_hash = payload.get("changeset_hash") if isinstance(payload, Mapping) else None
+    if not isinstance(marker_id, str) or not _APPLICATION_MARKER_ID.fullmatch(marker_id):
+        return None
+    if not isinstance(occurred_at, str):
+        return None
+    try:
+        _timestamp(occurred_at)
+    except (ValueError, OverflowError):
+        return None
+    if not isinstance(changeset_hash, str) or not _HASH.fullmatch(changeset_hash):
+        return None
+    return AppliedMarkerRef(marker_id, occurred_at, changeset_hash)
+
+
+def _changeset_operation_event_id(changeset_id: str, index: int, operation: ChangeOperation) -> str:
+    return "evt_changeset_" + stable_hash(
+        {"changeset_id": changeset_id, "index": index, "operation": operation.to_dict()}
+    )[:32]
+
+
+def _changeset_application_marker_id(changeset_id: str, marker_payload: Mapping[str, Any]) -> str:
+    return "evt_changeset_" + stable_hash({"changeset_id": changeset_id, "marker": marker_payload})[:32]
+
+
 def _coerce(value: ChangeSet | Mapping[str, Any]) -> ChangeSet:
     return value if isinstance(value, ChangeSet) else ChangeSet.from_mapping(value)
 
 
-def _policy(settings: Any) -> PromotionPolicy:
+def _policy(settings: Any, *, budget=None) -> PromotionPolicy:
+    _check_budget(budget)
     raw_path = getattr(settings, "promotion_policy_path", None)
     path = Path(raw_path) if raw_path else Path()
     if not path.is_file():
         return PromotionPolicy.defaults()
     try:
-        document = json.loads(path.read_text(encoding="utf-8"))
+        if budget is None:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        else:
+            from .operation_runtime import _read_json
+            document = _read_json(path, max_bytes=65536, budget=budget)
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("POLICY_READ_FAILED") from exc
     if not isinstance(document, Mapping):
@@ -293,19 +351,23 @@ def _persisted_identifier(value: Any, domain: str, *, allow_empty: bool = False)
     return domain_hash(value, domain)
 
 
-def _events(settings: Any) -> list[Event]:
+def _events(settings: Any, *, budget=None) -> list[Event]:
+    _check_budget(budget)
     root = Path(settings.paths.event_dir)
     if not root.exists():
         return []
     try:
-        return list(iter_events(root))
+        return list(iter_events(root, budget=budget))
+    except (TimeoutError, JournalLimitError):
+        raise
     except Exception as exc:
         raise ValueError("JOURNAL_CORRUPT") from exc
 
 
-def _states(events: Iterable[Event]) -> dict[str, dict[str, Any]]:
+def _states(events: Iterable[Event], *, budget=None) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
     for event in sorted(events, key=lambda item: (item.occurred_at, item.event_id)):
+        _check_budget(budget)
         if not event.event_type.startswith("pattern."):
             continue
         payload = event.payload
@@ -378,14 +440,17 @@ def _unique(reasons: Iterable[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(str(item) for item in reasons if item))
 
 
-def validate_changeset(changeset: ChangeSet | Mapping[str, Any], settings: Any) -> ValidationResult:
+def validate_changeset(changeset: ChangeSet | Mapping[str, Any], settings: Any, *, budget=None) -> ValidationResult:
+    _check_budget(budget)
     try:
         value = _coerce(changeset)
     except Exception:
         return ValidationResult(False, ("CHANGESET_SCHEMA_INVALID",))
     try:
-        policy = _policy(settings)
-        existing_events = _events(settings)
+        policy = _policy(settings, budget=budget)
+        existing_events = _events(settings, budget=budget)
+    except (TimeoutError, JournalLimitError):
+        raise
     except ValueError as exc:
         return ValidationResult(False, (str(exc),))
     reasons: list[str] = []
@@ -402,9 +467,10 @@ def validate_changeset(changeset: ChangeSet | Mapping[str, Any], settings: Any) 
         reasons.append("STALE_SOURCE_HASH")
     if len(json.dumps(value.to_dict(), ensure_ascii=False).encode("utf-8")) > 512 * 1024:
         reasons.append("CHANGESET_TOO_LARGE")
-    projected = {key: dict(state) for key, state in _states(existing_events).items()}
+    projected = {key: dict(state) for key, state in _states(existing_events, budget=budget).items()}
 
     for operation in value.operations:
+        _check_budget(budget)
         op = operation.operation
         payload = operation.payload
         payload_inspection = inspect_changeset_payload(
@@ -673,7 +739,8 @@ def _first_privacy_pointer(changeset: ChangeSet) -> str:
     return "/"
 
 
-def _failure(settings: Any, changeset: ChangeSet, reason: str, *, field_path: str | None = None) -> None:
+def _failure(settings: Any, changeset: ChangeSet, reason: str, *, field_path: str | None = None, budget=None) -> None:
+    _check_budget(budget)
     root = Path(settings.paths.runtime_dir).resolve()
     repo = Path(settings.paths.engine_root).resolve()
     if root == repo or root.is_relative_to(repo):
@@ -689,6 +756,7 @@ def _failure(settings: Any, changeset: ChangeSet, reason: str, *, field_path: st
     }
     path = root / "changeset-failures.jsonl"
     data = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    _check_budget(budget)
     descriptor = os.open(str(path), os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
     try:
         os.write(descriptor, data)
@@ -697,32 +765,45 @@ def _failure(settings: Any, changeset: ChangeSet, reason: str, *, field_path: st
         os.close(descriptor)
 
 
-def apply_changeset(changeset: ChangeSet | Mapping[str, Any], settings: Any) -> ApplyResult:
+def apply_changeset(changeset: ChangeSet | Mapping[str, Any], settings: Any, *, budget=None) -> ApplyResult:
+    _check_budget(budget)
     try:
         value = _coerce(changeset)
     except Exception:
         return ApplyResult(False, "CHANGESET_SCHEMA_INVALID", (), "unknown")
     try:
-        existing = _events(settings)
+        existing = _events(settings, budget=budget)
+    except (TimeoutError, JournalLimitError):
+        raise
     except ValueError as exc:
         reason = str(exc)
         validation = ValidationResult(False, (reason,))
-        _failure(settings, value, reason, field_path=_first_privacy_pointer(value))
+        _failure(settings, value, reason, field_path=_first_privacy_pointer(value), budget=budget)
         return ApplyResult(False, reason, (), value.changeset_id, validation=validation)
-    if _marker(existing, value.changeset_id) is not None:
-        return ApplyResult(True, "ALREADY_APPLIED", (), value.changeset_id, True, ValidationResult(True, ("ALREADY_APPLIED",)))
-    validation = validate_changeset(value, settings)
+    existing_marker = _marker(existing, value.changeset_id)
+    if existing_marker is not None:
+        return ApplyResult(
+            True,
+            "ALREADY_APPLIED",
+            (),
+            value.changeset_id,
+            True,
+            ValidationResult(True, ("ALREADY_APPLIED",)),
+            _application_ref(existing_marker),
+        )
+    validation = validate_changeset(value, settings, budget=budget)
     if not validation.valid:
         reason = validation.reason_codes[0] if validation.reason_codes else "CHANGESET_INVALID"
-        _failure(settings, value, reason, field_path=_first_privacy_pointer(value))
+        _failure(settings, value, reason, field_path=_first_privacy_pointer(value), budget=budget)
         return ApplyResult(False, reason, (), value.changeset_id, validation=validation)
 
-    state_map = _states(existing)
+    state_map = _states(existing, budget=budget)
     built: list[tuple[Event, str]] = []
     for index, operation in enumerate(value.operations):
+        _check_budget(budget)
         state = state_map.get(operation.target_id) if operation.target_id else None
         event_type, payload = _event_payload(value, operation, state)
-        event_id = "evt_changeset_" + stable_hash({"changeset_id": value.changeset_id, "index": index, "operation": operation.to_dict()})[:32]
+        event_id = _changeset_operation_event_id(value.changeset_id, index, operation)
         built.append((Event.create(event_type, value.generated_at, "external-intelligence", machine_id(), payload, event_id=event_id), event_id))
         if operation.operation == "CREATE_CANDIDATE" and operation.target_id:
             state_map[operation.target_id] = {
@@ -744,19 +825,181 @@ def apply_changeset(changeset: ChangeSet | Mapping[str, Any], settings: Any) -> 
         "provider_id": value.provider_id, "actor": "external-intelligence",
         "source_hashes": list(value.source_hashes),
     }
-    marker_id = "evt_changeset_" + stable_hash({"changeset_id": value.changeset_id, "marker": marker_payload})[:32]
+    marker_id = _changeset_application_marker_id(value.changeset_id, marker_payload)
     built.append((Event.create("curation.changeset.applied", value.generated_at, "external-intelligence", machine_id(), marker_payload, event_id=marker_id), marker_id))
 
     event_ids: list[str] = []
     try:
         for event, event_id in built:
-            append_event(event, settings.paths.event_dir)
+            _check_budget(budget)
+            append_event(event, settings.paths.event_dir, **({"budget": budget} if budget is not None else {}))
             event_ids.append(event_id)
+    except (TimeoutError, JournalLimitError):
+        raise
     except Exception as exc:
         reason = type(exc).__name__ if _SAFE_LABEL.fullmatch(type(exc).__name__) else "APPLY_FAILED"
-        _failure(settings, value, reason)
+        _failure(settings, value, reason, budget=budget)
         return ApplyResult(False, reason, (), value.changeset_id, validation=ValidationResult(False, (reason,)))
-    return ApplyResult(True, "APPLIED", tuple(event_ids), value.changeset_id, validation=validation)
+    return ApplyResult(
+        True,
+        "APPLIED",
+        tuple(event_ids),
+        value.changeset_id,
+        validation=validation,
+        application_ref=_application_ref(built[-1][0]),
+    )
 
 
-__all__ = ["ApplyResult", "ChangeOperation", "ChangeSet", "OPERATIONS", "apply_changeset", "validate_changeset"]
+def read_application_proof(
+    changeset: ChangeSet | Mapping[str, Any],
+    settings: Any,
+    *,
+    application_ref: AppliedMarkerRef,
+    budget=None,
+) -> ApplyResult:
+    """Verify one changeset application by directly reading its journal events."""
+
+    read_budget = budget if budget is not None else OperationBudget(5000)
+    _check_budget(read_budget)
+
+    requested_id = getattr(changeset, "changeset_id", None)
+    if isinstance(changeset, Mapping):
+        requested_id = changeset.get("changeset_id")
+    if not isinstance(requested_id, str) or not _SAFE_ID.fullmatch(requested_id):
+        requested_id = "unknown"
+
+    def invalid() -> ApplyResult:
+        return ApplyResult(
+            False,
+            "APPLICATION_PROOF_INVALID",
+            (),
+            requested_id,
+            validation=ValidationResult(False, ("APPLICATION_PROOF_INVALID",)),
+        )
+
+    try:
+        raw_changeset = changeset.to_dict() if isinstance(changeset, ChangeSet) else changeset
+        value = ChangeSet.from_mapping(raw_changeset)
+        requested_id = value.changeset_id
+
+        if not isinstance(application_ref, AppliedMarkerRef):
+            return invalid()
+        if (
+            not isinstance(application_ref.marker_id, str)
+            or not _APPLICATION_MARKER_ID.fullmatch(application_ref.marker_id)
+            or not isinstance(application_ref.changeset_hash, str)
+            or not _HASH.fullmatch(application_ref.changeset_hash)
+            or not isinstance(application_ref.occurred_at, str)
+        ):
+            return invalid()
+        _timestamp(application_ref.occurred_at)
+
+        # Match journal._event_partition: use the timestamp's written year/month,
+        # without converting its offset to UTC.
+        partition_time = datetime.fromisoformat(application_ref.occurred_at.replace("Z", "+00:00"))
+        year, month = partition_time.strftime("%Y"), partition_time.strftime("%m")
+        event_root = Path(settings.paths.event_dir)
+        marker_path = event_root / year / month / f"{application_ref.marker_id}.json"
+        _check_budget(read_budget)
+        assert_safe_target(event_root, marker_path, allow_missing=False, expected_type="file")
+        marker = read_event(marker_path, budget=read_budget)
+
+        if (
+            marker.event_type != "curation.changeset.applied"
+            or marker.event_id != application_ref.marker_id
+            or marker.occurred_at != application_ref.occurred_at
+            or marker.actor != "external-intelligence"
+            or not isinstance(marker.payload, Mapping)
+            or marker.payload.get("changeset_hash") != application_ref.changeset_hash
+        ):
+            return invalid()
+
+        expected_operation_ids = tuple(
+            _changeset_operation_event_id(value.changeset_id, index, operation)
+            for index, operation in enumerate(value.operations)
+        )
+        if len(set(expected_operation_ids)) != len(expected_operation_ids):
+            return invalid()
+
+        marker_payload = marker.payload
+        expected_marker_payload = {
+            "changeset_id": value.changeset_id,
+            "candidate_id": value.candidate_id,
+            "changeset_hash": application_ref.changeset_hash,
+            "operation_count": len(value.operations),
+            "event_ids": list(expected_operation_ids),
+            "policy_version": value.policy_version,
+            "provider_id": value.provider_id,
+            "actor": "external-intelligence",
+            "source_hashes": list(value.source_hashes),
+        }
+        if (
+            type(marker_payload.get("operation_count")) is not int
+            or marker_payload != expected_marker_payload
+        ):
+            return invalid()
+
+        restored = replace(value, generated_at=marker.occurred_at)
+        if restored.fingerprint != application_ref.changeset_hash:
+            return invalid()
+        expected_marker_id = _changeset_application_marker_id(value.changeset_id, marker_payload)
+        if expected_marker_id != marker.event_id:
+            return invalid()
+
+        permitted_event_types = {
+            "CREATE_OBSERVATION": frozenset({"observation.recorded"}),
+            "ATTACH_EVIDENCE": frozenset({"pattern.candidate_created", "pattern.revised"}),
+            "CREATE_CANDIDATE": frozenset({"pattern.candidate_created"}),
+            "PROMOTE_PATTERN": frozenset({"pattern.promoted"}),
+            "REVISE_PATTERN": frozenset({"pattern.revised"}),
+            "DEPRECATE_PATTERN": frozenset({"pattern.deprecated"}),
+            "TOMBSTONE_PATTERN": frozenset({"pattern.tombstoned"}),
+            "REDACT_REFERENCE": frozenset({"reference.redacted"}),
+            "NO_CHANGE": frozenset({"curation.no_change"}),
+        }
+        for event_id, operation in zip(expected_operation_ids, value.operations):
+            _check_budget(read_budget)
+            operation_path = event_root / year / month / f"{event_id}.json"
+            assert_safe_target(event_root, operation_path, allow_missing=False, expected_type="file")
+            event = read_event(operation_path, budget=read_budget)
+            if (
+                event.event_id != event_id
+                or event.occurred_at != marker.occurred_at
+                or event.actor != "external-intelligence"
+                or event.event_type not in permitted_event_types[operation.operation]
+                or not isinstance(event.payload, Mapping)
+                or event.payload.get("changeset_id") != value.changeset_id
+                or event.payload.get("candidate_id") != value.candidate_id
+                or event.payload.get("change_operation") != operation.operation
+                or event.payload.get("policy_version") != value.policy_version
+                or event.payload.get("provider_id") != value.provider_id
+                or event.payload.get("source_hashes") != list(value.source_hashes)
+            ):
+                return invalid()
+
+        _check_budget(read_budget)
+        return ApplyResult(
+            True,
+            "APPLICATION_PROOF_VERIFIED",
+            (*expected_operation_ids, marker.event_id),
+            value.changeset_id,
+            True,
+            ValidationResult(True, ("APPLICATION_PROOF_VERIFIED",)),
+            application_ref,
+        )
+    except (TimeoutError, JournalLimitError):
+        raise
+    except (JournalIntegrityError, SafeFilesystemError, OSError, ValueError, TypeError, KeyError, OverflowError):
+        return invalid()
+
+
+__all__ = [
+    "AppliedMarkerRef",
+    "ApplyResult",
+    "ChangeOperation",
+    "ChangeSet",
+    "OPERATIONS",
+    "apply_changeset",
+    "read_application_proof",
+    "validate_changeset",
+]

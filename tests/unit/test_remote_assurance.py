@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+from ei.operation_runtime import OperationBudget
 
 from ei.remote_assurance import (
     RemoteAssuranceError,
@@ -21,6 +23,20 @@ from ei.remote_assurance import (
 
 
 class RemoteAssuranceTests(unittest.TestCase):
+    def test_zero_budget_does_not_probe_or_promote_visibility(self):
+        with patch("ei.remote_assurance.subprocess.run", side_effect=AssertionError("no process")):
+            with self.assertRaises(TimeoutError):
+                assure_remote("https://github.com/example/private.git", budget=OperationBudget(0))
+
+    def test_probe_timeout_is_not_verified_or_attested_success(self):
+        remote = "https://github.com/example/private.git"
+        attestation = build_attestation(remote)
+        with patch("ei.remote_assurance.subprocess.run", side_effect=subprocess.TimeoutExpired(["gh"], 1)) as run:
+            with self.assertRaises(TimeoutError):
+                assure_remote(remote, attestation=attestation, budget=OperationBudget(3000))
+        self.assertGreater(run.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(run.call_args.kwargs["timeout"], 3)
+
     @unittest.skipUnless(os.name == "nt", "Windows junction fixture is platform-specific")
     def test_receipt_writer_rejects_junction_child_before_writing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

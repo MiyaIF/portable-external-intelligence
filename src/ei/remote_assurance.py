@@ -111,7 +111,9 @@ def _github_parts(normalized: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-def _probe_github_visibility(owner: str, repository: str, executable: str = "gh") -> tuple[str | None, str]:
+def _probe_github_visibility(owner: str, repository: str, executable: str = "gh", *, budget=None) -> tuple[str | None, str]:
+    if budget is not None:
+        budget.check()
     try:
         result = subprocess.run(
             [executable, "api", f"repos/{owner}/{repository}", "--jq", ".visibility"],
@@ -121,10 +123,16 @@ def _probe_github_visibility(owner: str, repository: str, executable: str = "gh"
             errors="replace",
             shell=False,
             check=False,
-            timeout=20,
+            timeout=min(20, budget.remaining_ms() / 1000) if budget is not None else 20,
         )
+    except subprocess.TimeoutExpired as exc:
+        if budget is not None:
+            raise TimeoutError("OPERATION_BUDGET_EXHAUSTED") from exc
+        return None, "gh_unavailable"
     except (OSError, subprocess.SubprocessError):
         return None, "gh_unavailable"
+    if budget is not None:
+        budget.check()
     if result.returncode != 0:
         return None, "github_api_unverified"
     visibility = result.stdout.strip().casefold()
@@ -146,7 +154,10 @@ def classify_remote(
     visibility: str | None = None,
     attestation: Mapping[str, Any] | None = None,
     github_executable: str = "gh",
+    budget=None,
 ) -> RemoteDescriptor:
+    if budget is not None:
+        budget.check()
     normalized = normalize_remote(remote)
     fingerprint = "sha256:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     if normalized.startswith("file:"):
@@ -157,7 +168,7 @@ def classify_remote(
         source = "explicit"
         resolved_visibility = visibility.casefold() if isinstance(visibility, str) else None
         if resolved_visibility is None:
-            resolved_visibility, source = _probe_github_visibility(owner, repository, github_executable)
+            resolved_visibility, source = _probe_github_visibility(owner, repository, github_executable, **({"budget": budget} if budget is not None else {}))
         if resolved_visibility == "public":
             classification = "public"
         elif resolved_visibility in {"private", "internal"}:
@@ -346,8 +357,11 @@ def assure_remote(
     visibility: str | None = None,
     data_classification: str = "private-reusable",
     github_executable: str = "gh",
+    budget=None,
 ) -> RemoteDescriptor:
-    descriptor = classify_remote(remote, visibility=visibility, attestation=attestation, github_executable=github_executable)
+    if budget is not None:
+        budget.check()
+    descriptor = classify_remote(remote, visibility=visibility, attestation=attestation, github_executable=github_executable, **({"budget": budget} if budget is not None else {}))
     if engine_remote is not None and descriptor.fingerprint == remote_fingerprint(engine_remote):
         raise RemoteAssuranceError("ENGINE_REMOTE_REUSE")
     assert_remote_allowed(descriptor.classification, data_classification=data_classification)

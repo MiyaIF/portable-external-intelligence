@@ -13,6 +13,7 @@ from .inference.base import InferenceBudget, ProviderResult, validate_output
 from .models import validate_host_applicability_mapping, validate_host_label
 from .privacy import inspect_text
 from .queue import QueueItem, QueueState, transition_queue_item
+from .safe_fs import assert_safe_target
 
 
 _REASON_CLASSES = frozenset({
@@ -310,44 +311,73 @@ def decide_inheritance(
     return decision
 
 
-def _record_aggregate(item: QueueItem, decision: GateDecision, settings: Any) -> None:
+def _record_aggregate(item: QueueItem, decision: GateDecision, settings: Any, *, budget=None) -> None:
+    def check():
+        if budget is not None:
+            budget.check()
+    check()
     path = Path(settings.paths.runtime_dir) / "gate-aggregate.json"
+    assert_safe_target(path.parent, path, allow_missing=True, expected_type="file")
+    check()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        value = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {"schema_version": 1, "rows": {}}
+        if path.exists():
+            check()
+            with path.open("rb") as stream:
+                raw = stream.read(262145) if budget is not None else stream.read()
+            check()
+            if budget is not None and len(raw) > 262144:
+                raise ValueError("GATE_AGGREGATE_TOO_LARGE")
+            value = json.loads(raw)
+        else:
+            value = {"schema_version": 1, "rows": {}}
     except (OSError, UnicodeError, json.JSONDecodeError):
+        if budget is not None:
+            raise ValueError("GATE_AGGREGATE_UNAVAILABLE")
         value = {"schema_version": 1, "rows": {}}
     if not isinstance(value, dict) or not isinstance(value.get("rows"), dict):
+        if budget is not None:
+            raise ValueError("GATE_AGGREGATE_INVALID")
         value = {"schema_version": 1, "rows": {}}
+    check()
     day = datetime.now(timezone.utc).date().isoformat()
     provider_class = "local" if item.provider_preference and item.provider_preference[0] in {"local-openai-compatible", "ollama"} else "subscription"
     key = f"{item.host_id}|{day}|{decision.reason_code}|{provider_class}"
     row = value["rows"].setdefault(key, {"host_id": item.host_id, "day": day, "reason_class": decision.reason_code, "provider_class": provider_class, "yes_count": 0, "no_count": 0})
     row["yes_count" if decision.decision == "YES" else "no_count"] += 1
+    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    check()
+    if budget is not None and len(encoded) > 262144:
+        raise ValueError("GATE_AGGREGATE_TOO_LARGE")
     temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8", newline="\n")
+    assert_safe_target(path.parent, temporary, allow_missing=True, expected_type="file")
     try:
+        check()
+        temporary.write_bytes(encoded)
+        check()
         os.replace(temporary, path)
     finally:
         if temporary.exists():
             temporary.unlink()
 
 
-def apply_gate_decision(decision: GateDecision, item: QueueItem, settings: Any) -> ApplyResult:
+def apply_gate_decision(decision: GateDecision, item: QueueItem, settings: Any, *, budget=None) -> ApplyResult:
+    if budget is not None:
+        budget.check()
     if not isinstance(decision, GateDecision) or not isinstance(item, QueueItem):
         raise ValueError("GATE_APPLY_INPUT_INVALID")
     if decision.decision == "NO":
-        _record_aggregate(item, decision, settings)
-        updated = transition_queue_item(item, QueueState.NO_DISCARDED, settings, reason_code=decision.reason_code)
+        _record_aggregate(item, decision, settings, budget=budget)
+        updated = transition_queue_item(item, QueueState.NO_DISCARDED, settings, reason_code=decision.reason_code, budget=budget)
         return ApplyResult(True, decision.reason_code, updated.state, updated, item.payload_ref is not None)
     if decision.decision == "DEFERRED":
-        updated = transition_queue_item(item, QueueState.DEFERRED_QUOTA, settings, reason_code=decision.reason_code, next_eligible_at=decision.next_eligible_at)
+        updated = transition_queue_item(item, QueueState.DEFERRED_QUOTA, settings, reason_code=decision.reason_code, next_eligible_at=decision.next_eligible_at, budget=budget)
         return ApplyResult(False, decision.reason_code, updated.state, updated, False)
     if decision.decision == "FAILED":
-        updated = transition_queue_item(item, QueueState.FAILED, settings, reason_code=decision.reason_code)
+        updated = transition_queue_item(item, QueueState.FAILED, settings, reason_code=decision.reason_code, budget=budget)
         return ApplyResult(False, decision.reason_code, updated.state, updated, False)
-    _record_aggregate(item, decision, settings)
-    updated = transition_queue_item(item, QueueState.YES_CURATING, settings, reason_code="GATE_YES")
+    _record_aggregate(item, decision, settings, budget=budget)
+    updated = transition_queue_item(item, QueueState.YES_CURATING, settings, reason_code="GATE_YES", budget=budget)
     return ApplyResult(True, "GATE_YES", updated.state, updated, False)
 
 

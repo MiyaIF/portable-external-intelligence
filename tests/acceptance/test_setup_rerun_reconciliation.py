@@ -23,7 +23,10 @@ def product_hashes(root: Path, *, exclude: tuple[str, ...] = ()) -> dict[str, st
     return values
 
 
-class SetupRerunReconciliationTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class SetupRerunReconciliationTests(NotificationIsolationMixin, unittest.TestCase):
     def _selection(self, root: Path) -> SetupSelection:
         home = root / "codex-home"
         home.mkdir(parents=True, exist_ok=True)
@@ -63,6 +66,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             selection = self._selection(root)
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
             before = product_hashes(first.manifest_path.parent, exclude=("setup-operations",))
@@ -73,10 +77,25 @@ class SetupRerunReconciliationTests(unittest.TestCase):
             self.assertEqual(second.changed_paths, ())
             self.assertEqual(before, after)
 
+    def test_already_current_setup_reconciles_requested_scheduler(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            selection = replace(self._selection(root), scheduler=True)
+            self.notification_isolation.allow_notification_helper()
+            registered = {"ok": True, "requested": True, "status": "REGISTERED", "registered": True}
+            with patch("ei.installer.apply_scheduler_transition", return_value=registered) as reconcile_scheduler:
+                first = setup(selection)
+                second = setup(selection)
+            self.assertTrue(first.ok, first.to_dict())
+            self.assertTrue(second.ok, second.to_dict())
+            self.assertEqual(second.reconciliation["status"], "ALREADY_CURRENT")
+            self.assertEqual(reconcile_scheduler.call_count, 2)
+
     def test_team_disable_retains_descriptor_and_shared_files(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             team_root = root / "shared-team"
+            self.notification_isolation.allow_notification_helper()
             enabled = setup(replace(self._selection(root), team_knowledge_root=team_root, team_member_id="member-a", team_knowledge=True))
             self.assertTrue(enabled.ok, enabled.to_dict())
             event = team_root / "members" / "member-a" / "sentinel.json"
@@ -93,6 +112,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             team_root = root / ("broken-team" if broken else "missing-team")
+            self.notification_isolation.allow_notification_helper()
             enabled = setup(replace(self._selection(root), team_knowledge_root=team_root, team_member_id="member-a", team_knowledge=True))
             self.assertTrue(enabled.ok, enabled.to_dict())
             if broken:
@@ -140,6 +160,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             team_root = root / "shared-team"
+            self.notification_isolation.allow_notification_helper()
             first = setup(replace(self._selection(root), team_knowledge_root=team_root, team_member_id="member-a", team_knowledge=True))
             self.assertTrue(first.ok, first.to_dict())
             second = setup(replace(self._selection(root), team_knowledge_root=team_root, team_member_id="member-b", team_knowledge=True))
@@ -153,8 +174,10 @@ class SetupRerunReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             selection = self._selection(root)
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
+            self.notification_isolation.reject_notification_helper()
             moved = setup(replace(selection, runtime_root=root / "runtime-moved"))
             self.assertFalse(moved.ok)
             self.assertEqual(moved.status, "SETUP_BLOCKED")
@@ -164,6 +187,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
     def test_host_removal_removes_only_owned_skill_and_binding(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
             first = setup(self._multi_host_selection(root, ("codex-cli", "claude-code")))
             self.assertTrue(first.ok, first.to_dict())
             first_manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
@@ -188,6 +212,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             selection = self._selection(root)
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
             manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
@@ -195,6 +220,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
             original = json.loads(hook_path.read_text(encoding="utf-8"))
             original["hooks"]["SessionStart"][0]["hooks"][0]["command"] += " --tampered"
             hook_path.write_text(json.dumps(original, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            self.notification_isolation.reject_notification_helper()
             blocked = setup(selection)
             self.assertFalse(blocked.ok)
             self.assertEqual(blocked.status, "SETUP_BLOCKED")
@@ -205,6 +231,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             selection = self._selection(root)
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
             manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
@@ -212,6 +239,7 @@ class SetupRerunReconciliationTests(unittest.TestCase):
             binding = json.loads(binding_path.read_text(encoding="utf-8"))
             binding["runtime_root"] = str(root / "other-runtime")
             binding_path.write_text(json.dumps(binding, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            self.notification_isolation.reject_notification_helper()
             blocked = setup(selection)
             self.assertFalse(blocked.ok)
             self.assertEqual(blocked.status, "SETUP_BLOCKED")

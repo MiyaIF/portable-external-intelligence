@@ -1,15 +1,34 @@
 import hashlib
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from ei.config import RuntimePaths, Settings, load_settings
-from ei.task_scheduler import TASK_NAME, build_maintenance_action, build_launchd_plist, build_systemd_user_unit, build_systemd_user_timer, register_scheduler, remove_scheduler_state, write_scheduler_state
+from ei.task_scheduler import TASK_NAME, build_maintenance_action, build_launchd_plist, build_systemd_user_unit, build_systemd_user_timer, inspect_registered_task, register_scheduler, remove_scheduler_state, write_scheduler_state
 
 
 class TaskSchedulerTests(unittest.TestCase):
+    def _write_lf(self, path: Path, content: str) -> None:
+        with path.open("w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+
+    def test_linux_timer_has_two_native_same_anchor_opportunities_without_rounding(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as tmp:
+            _, action, _ = self._portable_action(Path(tmp))
+            for interval in (7, 30, 90, 100000):
+                timer = build_systemd_user_timer(replace(action, triggers=(f"every_{interval}_minutes",)))
+                self.assertEqual([line for line in timer.splitlines() if line.startswith("OnUnitActiveSec=")],
+                                 [f"OnUnitActiveSec={interval}min", f"OnUnitActiveSec={2 * interval}min"])
+                self.assertIn("OnBootSec=2min", timer)
+                self.assertNotIn("OnCalendar", timer)
+            with self.assertRaisesRegex(ValueError, "SCHEDULER_INTERVAL_OUT_OF_RANGE"):
+                build_systemd_user_timer(replace(action, triggers=(f"every_{2**64}_minutes",)))
+
     def _portable_action(self, root: Path):
         engine = root / "engine"
         knowledge = root / "knowledge"
@@ -55,6 +74,104 @@ class TaskSchedulerTests(unittest.TestCase):
             self.assertTrue(result["retryable"])
             state = json.loads((settings.paths.runtime_root / "scheduler-state.json").read_text(encoding="utf-8"))
             self.assertFalse(state["registered"])
+
+    def test_linux_inspection_rejects_owned_legacy_timer_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, action, _ = self._portable_action(root)
+            unit_dir = root / "systemd-user"
+            unit_dir.mkdir()
+            service = unit_dir / f"{TASK_NAME}.service"
+            timer = unit_dir / f"{TASK_NAME}.timer"
+            self._write_lf(service, build_systemd_user_unit(action))
+            self._write_lf(timer,
+                f"[Unit]\nDescription={TASK_NAME} timer\n\n[Timer]\nOnBootSec=2min\n"
+                f"OnUnitActiveSec=30min\nPersistent=true\nUnit={TASK_NAME}.service\n\n"
+                "[Install]\nWantedBy=timers.target\n"
+            )
+            write_scheduler_state(settings, action, True)
+            completed = subprocess.CompletedProcess([], 0, "active", "")
+            with patch.dict(os.environ, {"EI_SYSTEMD_USER_DIR": str(unit_dir)}), patch(
+                "ei.task_scheduler.subprocess.run", return_value=completed
+            ):
+                result = inspect_registered_task(settings, platform_name="Linux")
+            self.assertTrue(result["registered"])
+            self.assertFalse(result["checks"]["timer_interval"])
+            self.assertFalse(result["ok"])
+
+    def test_linux_registration_upgrades_legacy_timer_when_explicitly_reconciled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, action, _ = self._portable_action(root)
+            script = settings.paths.engine_root / "scripts" / "install-systemd-user.sh"
+            script.parent.mkdir()
+            script.write_text("#!/usr/bin/env sh\n", encoding="utf-8")
+            unit_dir = root / "systemd-user"
+            unit_dir.mkdir()
+            service = unit_dir / f"{TASK_NAME}.service"
+            timer = unit_dir / f"{TASK_NAME}.timer"
+            self._write_lf(service, build_systemd_user_unit(action))
+            self._write_lf(timer,
+                f"[Unit]\nDescription={TASK_NAME} timer\n\n[Timer]\nOnBootSec=2min\n"
+                f"OnUnitActiveSec=30min\nPersistent=true\nUnit={TASK_NAME}.service\n\n"
+                "[Install]\nWantedBy=timers.target\n"
+            )
+            write_scheduler_state(settings, action, True)
+            completed = subprocess.CompletedProcess([], 0, "active", "")
+
+            def run(command, **_kwargs):
+                if any(str(argument).endswith("install-systemd-user.sh") for argument in command):
+                    self._write_lf(service, build_systemd_user_unit(action))
+                    self._write_lf(timer, build_systemd_user_timer(action))
+                return completed
+
+            with patch.dict(os.environ, {"EI_SYSTEMD_USER_DIR": str(unit_dir)}), patch(
+                "ei.task_scheduler.subprocess.run", side_effect=run
+            ) as process:
+                result = register_scheduler(settings, action, settings.paths.engine_root, platform_name="Linux")
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["status"], "REGISTERED")
+            self.assertEqual(timer.read_text(encoding="utf-8"), build_systemd_user_timer(action))
+            self.assertTrue(any(
+                any(str(argument).endswith("install-systemd-user.sh") for argument in call.args[0])
+                for call in process.call_args_list
+            ))
+
+    def test_linux_registration_preserves_same_name_artifact_without_owned_receipt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings, action, _ = self._portable_action(root)
+            script = settings.paths.engine_root / "scripts" / "install-systemd-user.sh"
+            script.parent.mkdir()
+            script.write_text("#!/usr/bin/env sh\n", encoding="utf-8")
+            unit_dir = root / "systemd-user"
+            unit_dir.mkdir()
+            collision = unit_dir / f"{TASK_NAME}.timer"
+            raw = "[Unit]\nDescription=someone else's timer\n"
+            collision.write_text(raw, encoding="utf-8")
+            completed = subprocess.CompletedProcess([], 0, "active", "")
+            with patch.dict(os.environ, {"EI_SYSTEMD_USER_DIR": str(unit_dir)}), patch(
+                "ei.task_scheduler.subprocess.run", return_value=completed
+            ) as process:
+                result = register_scheduler(settings, action, settings.paths.engine_root, platform_name="Linux")
+            self.assertEqual(result["reason_code"], "SCHEDULER_ARTIFACT_CONFLICT")
+            self.assertEqual(collision.read_text(encoding="utf-8"), raw)
+            self.assertFalse(any(str(call.args[0][0]).endswith("install-systemd-user.sh") for call in process.call_args_list))
+
+    def test_windows_registration_does_not_bypass_policy_and_reports_denial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings, action, _ = self._portable_action(Path(tmp))
+            script = settings.paths.engine_root / "scripts" / "install-scheduled-task.ps1"
+            script.parent.mkdir()
+            script.write_text("# test boundary\n", encoding="utf-8")
+            denied = subprocess.CompletedProcess([], 1, "", "PSSecurityException")
+            with patch("ei.task_scheduler.subprocess.run", return_value=denied) as process:
+                result = register_scheduler(settings, action, settings.paths.engine_root, platform_name="Windows")
+            command = process.call_args.args[0]
+            self.assertNotIn("-ExecutionPolicy", command)
+            self.assertNotIn("Bypass", command)
+            self.assertEqual(result["status"], "REGISTRATION_DENIED")
+            self.assertEqual(result["reason_code"], "SCHEDULER_REGISTRATION_DENIED")
     def test_action_keeps_paths_as_separate_argv_values_and_uses_guardrails(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "clone with spaces"

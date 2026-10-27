@@ -76,6 +76,31 @@ class HookEntryTests(unittest.TestCase):
         errors = settings.paths.runtime_dir / "hook-errors.jsonl"
         self.assertIn('"reason_code":"INDEX_UNAVAILABLE"', errors.read_text(encoding="utf-8"))
 
+    def test_missing_generation_pointer_does_not_promote_human_mirror(self):
+        settings = make_hook_settings(self.root)
+        knowledge = settings.paths.knowledge_dir
+        (knowledge / ".projection-generations").mkdir(parents=True)
+        (knowledge / "index.md").write_text("# Knowledge index\n[知識一覧を開く](.projection-generations/example/index.md)\n", encoding="utf-8")
+        self.assertEqual(hook_entry._parse_patterns(settings), [])
+        errors = settings.paths.runtime_dir / "hook-errors.jsonl"
+        self.assertIn('"reason_code":"INDEX_UNAVAILABLE"', errors.read_text(encoding="utf-8"))
+
+    def test_legacy_active_patterns_remain_readable_without_generation(self):
+        settings = make_hook_settings(self.root)
+        knowledge = settings.paths.knowledge_dir
+        knowledge.mkdir(parents=True)
+        (knowledge / "index.md").write_text("## Active Patterns\n- [pat_legacy] reuse rule\n", encoding="utf-8")
+        self.assertEqual(hook_entry._parse_patterns(settings)[0]["rule"], "reuse rule")
+
+    def test_generation_link_without_directory_is_not_legacy_fallback(self):
+        settings = make_hook_settings(self.root)
+        knowledge = settings.paths.knowledge_dir
+        knowledge.mkdir(parents=True)
+        (knowledge / "index.md").write_text("[guide](.projection-generations/missing/index.md)\n", encoding="utf-8")
+        self.assertEqual(hook_entry._parse_patterns(settings), [])
+        errors = settings.paths.runtime_dir / "hook-errors.jsonl"
+        self.assertIn('"reason_code":"INDEX_UNAVAILABLE"', errors.read_text(encoding="utf-8"))
+
     def test_experiment_recall_filters_host_scope_before_exposure(self):
         settings = replace(make_hook_settings(self.root), experiment_enabled=True, experiment_id="retrieval-v1")
         event = normalize_hook_event(
@@ -190,7 +215,8 @@ class HookEntryTests(unittest.TestCase):
     def test_deadline_returns_empty_context_and_sanitized_status(self):
         settings = replace(make_hook_settings(self.root), prompt_budget_ms=1)
         event = normalize_hook_event("codex-cli", {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "t1", "cwd": "C:/work", "prompt": "reload"}, settings)
-        with patch("ei.hook_entry.time.monotonic", side_effect=[0.0, 1.0]):
+        clock = iter((0.0, 1.0))
+        with patch("ei.hook_entry.time.monotonic", side_effect=lambda: next(clock, 1.0)):
             result = handle_normalized_hook(event, settings)
         self.assertEqual(result.status, "DEADLINE_EXCEEDED")
         self.assertEqual(result.additional_context, "")

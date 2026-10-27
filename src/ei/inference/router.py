@@ -4,12 +4,16 @@ import json
 import os
 import re
 import shutil
+import uuid
+from dataclasses import replace
+from datetime import datetime, timezone
+from time import monotonic
 from decimal import Decimal
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable, Mapping, Sequence
 
 from .base import InferenceBudget, InferenceProvider, ProviderResult, unavailable_result
-from .budget import BudgetLedger, BudgetPolicy
+from .budget import BudgetLedger, BudgetLockError, BudgetPolicy
 from .cli_subscription import SubscriptionCLIProvider
 from ..host_profiles import canonical_host_id
 from ..setup_contract import OrganizerSelection
@@ -365,7 +369,7 @@ class ProviderRouter:
             return self.budget_ledger
         if self.settings is None:
             return None
-        return BudgetLedger(self.settings, run_id=budget.candidate_id or None, candidate_id=budget.candidate_id, purpose=budget.purpose)
+        return BudgetLedger(self.settings, run_id=budget.run_id or None, candidate_id=budget.candidate_id, purpose=budget.purpose)
 
     def generate(
         self,
@@ -377,36 +381,38 @@ class ProviderRouter:
     ) -> ProviderResult:
         if not isinstance(stage, str) or not stage:
             raise ValueError("INFERENCE_TASK_REQUIRED")
+        started = monotonic()
         current_budget = InferenceBudget.from_value(budget)
         del policy
         provider = self.selected()
+        if getattr(provider, "locality", "") == "cloud":
+            return ProviderResult(provider.provider_id, "deferred", error_code="PROVIDER_COST_UNKNOWN", schema_name=schema_name)
         ledger = self._ledger_for(current_budget)
-        result = provider.generate(schema_name, input_json, current_budget)
-        if not result.ok or ledger is None:
-            return result
-        from datetime import datetime, timezone
-
-        consumed = ledger.consume(
-            provider.provider_id,
-            result.input_tokens,
-            result.output_tokens,
-            result.cost,
-            datetime.now(timezone.utc),
-            purpose=current_budget.purpose,
-            candidate_id=current_budget.candidate_id,
-            deadline_ms=current_budget.deadline_ms,
-        )
-        if not consumed.allowed:
-            return ProviderResult(
-                provider.provider_id,
-                "failed",
-                error_code=consumed.reason_code,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                cost=result.cost,
-                schema_name=schema_name,
-            )
-        return result
+        if ledger is None:
+            return ProviderResult(provider.provider_id, "deferred", error_code="BUDGET_LEDGER_REQUIRED", schema_name=schema_name)
+        current_budget = replace(current_budget, attempt_id=current_budget.attempt_id or uuid.uuid4().hex)
+        try:
+            reserved = ledger.reserve(current_budget.attempt_id, provider.provider_id, current_budget, datetime.now(timezone.utc))
+        except (OSError, ValueError, BudgetLockError):
+            return ProviderResult(provider.provider_id, "deferred", error_code="BUDGET_STORAGE_UNAVAILABLE", schema_name=schema_name)
+        if not reserved.allowed:
+            return ProviderResult(provider.provider_id, "deferred", error_code=reserved.reason_code,
+                schema_name=schema_name, admission_refused=True)
+        remaining = current_budget.deadline_ms - int((monotonic() - started) * 1000)
+        if remaining <= 0:
+            return ProviderResult(provider.provider_id, "deferred", error_code="DEADLINE_EXCEEDED", schema_name=schema_name)
+        current_budget = replace(current_budget, deadline_ms=remaining)
+        try:
+            result = provider.generate(schema_name, input_json, current_budget)
+        except Exception:
+            result = ProviderResult(provider.provider_id, "failed", error_code="PROVIDER_UNAVAILABLE", schema_name=schema_name)
+        try:
+            ledger.settle(current_budget.attempt_id, result, datetime.now(timezone.utc))
+        except (OSError, ValueError, BudgetLockError):
+            return ProviderResult(provider.provider_id, "deferred", error_code="BUDGET_STORAGE_UNAVAILABLE", schema_name=schema_name)
+        # Only this router's completed reservation refusal proves no call.
+        # Never trust a provider-supplied flag, even with a budget error code.
+        return replace(result, admission_refused=False)
 
 
 __all__ = ["ConfiguredUnavailableProvider", "ProviderRouter", "ProviderSelectionError"]

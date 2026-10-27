@@ -46,7 +46,10 @@ def make_settings(repo: Path, state_root: Path) -> Settings:
     )
 
 
-class TwoMachineSyncTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class TwoMachineSyncTests(NotificationIsolationMixin, unittest.TestCase):
     def test_second_machine_restores_github_existing_without_runtime_state_copy(self):
         class ExistingPrivateRepository:
             def verify_authentication(self):
@@ -110,6 +113,7 @@ class TwoMachineSyncTests(unittest.TestCase):
             with patch("ei.github_knowledge.GitHubKnowledgeClient", return_value=ExistingPrivateRepository()), patch(
                 "ei.github_knowledge._clone_existing_repository", side_effect=clone_private_remote
             ):
+                self.notification_isolation.allow_notification_helper()
                 result = setup(selection)
 
             self.assertTrue(result.ok, result.to_dict())

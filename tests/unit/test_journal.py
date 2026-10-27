@@ -11,6 +11,48 @@ from ei.models import Event
 
 
 class JournalTests(unittest.TestCase):
+    def test_bounded_journal_zero_budget_does_not_read_or_append(self):
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "events"
+            event = Event.create("health.snapshot", "2026-01-01T00:00:00Z", "test", "test", {"status": "ok"})
+            try:
+                with self.assertRaises(TimeoutError):
+                    list(iter_events(root, budget=OperationBudget(0)))
+                with self.assertRaises(TimeoutError):
+                    append_event(event, root, budget=OperationBudget(0))
+            except TypeError as exc:
+                self.fail(str(exc))
+            self.assertFalse(root.exists())
+
+    def test_bounded_journal_accepts_over_one_thousand_events_and_large_valid_event(self):
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for number in range(1001):
+                event = Event.create("health.snapshot", "2026-01-01T00:00:00Z", "test", "test", {"status": "ok"}, event_id=f"evt_history_{number}")
+                append_event(event, root)
+            refs = ["sha256:" + "a" * 64] * 4000
+            event = Event.create("health.snapshot", "2026-01-01T00:00:00Z", "test", "test", {"evidence_refs": refs}, event_id="evt_large")
+            append_event(event, root)
+            try:
+                loaded = list(iter_events(root, budget=OperationBudget(30000)))
+            except TypeError as exc:
+                self.fail(str(exc))
+            self.assertEqual(len(loaded), 1002)
+            self.assertEqual(next(row for row in loaded if row.event_id == "evt_large").payload["evidence_refs"], refs)
+
+    def test_bounded_fixed_limit_is_distinct_from_corruption_and_never_partial(self):
+        from ei.operation_runtime import OperationBudget
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "large.json").write_bytes(b" " * (8 * 1024 * 1024 + 1))
+            try:
+                with self.assertRaisesRegex(ValueError, "JOURNAL_BOUNDED_LIMIT"):
+                    list(iter_events(root, budget=OperationBudget(5000)))
+            except TypeError as exc:
+                self.fail(str(exc))
+
     def test_append_is_atomic_idempotent_and_integrity_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
+
+if TYPE_CHECKING:
+    from ..closeout_service import CloseoutResult
 
 from ..config import HostSpec
 from ..host_profiles import canonical_host_id as _canonical_host_id
 from ..ids import stable_hash
+from ..operation_runtime import OperationBudget
 from .base import BaseHookAdapter, HookAdapter, HookResult, NormalizedHookEvent
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter, CodexAppAdapter
@@ -153,6 +158,78 @@ def hook_config_fragment(host_id: str, executable: Path, repo_root: Path, knowle
     return get_adapter(host_id, settings).config_fragment(Path(executable), Path(repo_root), Path(knowledge_root) if knowledge_root is not None else None, Path(runtime_root) if runtime_root is not None else None)
 
 
+def run_adapter_closeout(
+    host_id: str,
+    control: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    settings: Any,
+    *,
+    now: datetime,
+    budget: OperationBudget,
+) -> CloseoutResult:
+    """Validate native adapter control separately from the candidate payload."""
+    from ..closeout_context import ContextValidation, validate_adapter_context
+    from ..closeout_service import (
+        CloseoutResult,
+        InputError,
+        PrivacyRejected,
+        process_closeout,
+    )
+    from ..inference.router import ProviderSelectionError
+
+    try:
+        canonical = canonical_host_id(host_id)
+        validation = validate_adapter_context(
+            settings, canonical, control, budget=budget
+        )
+    except TimeoutError:
+        raise
+    except Exception:
+        validation = ContextValidation(None, None, "CLOSEOUT_CONTEXT_UNVERIFIED")
+
+    try:
+        return process_closeout(
+            payload, settings, validation=validation, now=now, budget=budget
+        )
+    except PrivacyRejected as exc:
+        code = str(exc).split(":", 1)[0]
+        return CloseoutResult({
+            "ok": False,
+            "error_code": code if code else "PRIVACY_REJECTED",
+            "knowledge": "UNKNOWN",
+            "association": {
+                "status": "REJECTED",
+                "reason_code": code if code else "PRIVACY_REJECTED",
+                "acknowledged": False,
+            },
+        }, 3)
+    except InputError as exc:
+        code = str(exc).split(":", 1)[0]
+        reason = validation.reason_code if not validation.valid else code or "CLOSEOUT_INPUT_INVALID"
+        return CloseoutResult({
+            "ok": False,
+            "error_code": code if code else "CLOSEOUT_INPUT_INVALID",
+            "knowledge": "UNKNOWN",
+            "association": {
+                "status": "UNKNOWN" if not validation.valid else "PENDING",
+                "reason_code": reason,
+                "acknowledged": False,
+            },
+        }, 2)
+    except ProviderSelectionError as exc:
+        code = str(exc).split(":", 1)[0]
+        return CloseoutResult({
+            "ok": False,
+            "error_code": code if code else "NO_PROVIDER_AVAILABLE",
+            "knowledge": "UNKNOWN",
+            "association": {
+                "status": "UNKNOWN",
+                "reason_code": "CLOSEOUT_EVALUATION_REQUIRED",
+                "acknowledged": False,
+            },
+        }, 5)
+
+
 __all__ = [
     "canonical_host_id",
     "encode_hook_result",
@@ -160,5 +237,6 @@ __all__ = [
     "hook_config_fragment",
     "normalize_hook_event",
     "ProfiledHookAdapter",
+    "run_adapter_closeout",
     "supported_events",
 ]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,10 @@ class RolloutSummaryAdapter:
         return value or "rollout"
 
     @classmethod
+    def accepts_path(cls, path: Path) -> bool:
+        return path.suffix.casefold() == ".jsonl" and "rollout" in path.name.casefold()
+
+    @classmethod
     def discover(cls, root: Path) -> Sequence[Path]:
         return tuple(path for path in scan_read_only(root) if path.suffix.casefold() == ".jsonl" and "rollout" in path.name.casefold())
 
@@ -50,6 +55,11 @@ class RolloutSummaryAdapter:
         after = path.stat()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise ValueError("SOURCE_CHANGED_DURING_READ")
+        yield from self.read_verified(path.resolve(), content, before)
+
+    def read_verified(self, source: Path, content: bytes, metadata: os.stat_result) -> Iterable[SourceRecord]:
+        path = Path(source)
+        before = metadata
         source_hash = self._sha256(content)
         observed_at = datetime.fromtimestamp(before.st_mtime, timezone.utc).isoformat()
         session_id = ""
@@ -58,7 +68,7 @@ class RolloutSummaryAdapter:
             "domain": self._domain_from_path(path),
             "outcome_status": "unknown",
         }
-        for line in content.decode("utf-8", errors="strict").splitlines():
+        for line_number, line in enumerate(content.decode("utf-8", errors="strict").splitlines(), 1):
             if not line.strip():
                 continue
             try:
@@ -142,7 +152,7 @@ class RolloutSummaryAdapter:
             record_classification = "external-reference" if external_reference else classification_value.strip()
             yield SourceRecord(
                 source_kind=record_source_kind,
-                source_ref=str(path.resolve()),
+                source_ref=str(path),
                 source_hash=source_hash,
                 observed_at=observed_at,
                 title=title.strip(),
@@ -156,6 +166,8 @@ class RolloutSummaryAdapter:
                 provenance_key=f"rollout:{session_id or source_hash}",
                 source_host_id=self.host_id,
                 source_host_family=self.host_family,
+                stable_record_id=f"line:{line_number}",
+                session_id=session_id,
             )
 
     def iter_records(self, cursor: Mapping[str, Any]) -> Iterable[SourceRecord]:

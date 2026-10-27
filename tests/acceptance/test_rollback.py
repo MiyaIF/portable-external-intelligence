@@ -19,14 +19,24 @@ def _require_contract(condition: bool, code: str) -> None:
         raise AssertionError(code)
 
 
-class RollbackAcceptanceTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin, is_powershell_execution_policy_refusal
+
+
+class RollbackAcceptanceTests(NotificationIsolationMixin, unittest.TestCase):
     def test_rollback_scope_does_not_expand_to_host_set(self):
         self.assertEqual(len(REQUIRED_HOST_IDS), 4)
 
     @unittest.skipUnless(os.name == "nt", "PowerShell rollback wrapper contract is Windows-specific")
     def test_config_backup_restores_exact_original_bytes(self):
         repo = Path.cwd()
-        python_exe = Path(sys.executable)
+        python_exe = self.powershell_python_shim()
+        environment = self.notification_child_environment(allow_notification_helper=True)
+        host_system_root = os.environ.get("WINDIR")
+        self.assertTrue(
+            host_system_root
+            and (Path(host_system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe").is_file()
+        )
+        environment["SystemRoot"] = str(Path(host_system_root).resolve())
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             home = root / "codex"
@@ -37,12 +47,34 @@ class RollbackAcceptanceTests(unittest.TestCase):
             hooks.write_bytes(b'{"hooks":{"Stop":[{"id":"user-stop","hooks":[]}]}}\n')
             original_config_hash = hashlib.sha256(config.read_bytes()).hexdigest()
             original_hooks_hash = hashlib.sha256(hooks.read_bytes()).hexdigest()
-            install = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(repo / "scripts" / "install.ps1"), "-RepoPath", str(repo), "-CodexHome", str(home), "-OrganizerProvider", "subscription-cli", "-OrganizerHost", "codex-cli", "-PythonExe", str(python_exe), "-SkipVenv", "-NoScheduledTask"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-            _require_contract(install.returncode == 0, "ROLLBACK_INSTALL_WRAPPER_FAILED")
+            install = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-File", str(repo / "scripts" / "install.ps1"), "-RepoPath", str(repo), "-CodexHome", str(home), "-OrganizerProvider", "subscription-cli", "-OrganizerHost", "codex-cli", "-PythonExe", str(python_exe), "-SkipVenv", "-NoScheduledTask"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                timeout=120,
+            )
+            if is_powershell_execution_policy_refusal(install.stdout, install.stderr):
+                self.skipTest("PowerShell execution policy refused install.ps1; no override was used, so rollback remains unverified")
+            _require_contract(install.returncode == 0, f"ROLLBACK_INSTALL_WRAPPER_FAILED:{install.stdout!r}:{install.stderr!r}")
             manifest = home / "external-intelligence" / "install-manifest.json"
             manifest_sha256 = "sha256:" + hashlib.sha256(manifest.read_bytes()).hexdigest()
-            uninstall = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(repo / "scripts" / "uninstall.ps1"), "-ManifestPath", str(manifest), "-PythonExe", str(python_exe), "-ConfirmManifestSha256", manifest_sha256, "-RestoreConfigBackup"], capture_output=True, text=True, encoding="utf-8", errors="replace")
-            _require_contract(uninstall.returncode == 0, "ROLLBACK_UNINSTALL_WRAPPER_FAILED")
+            uninstall = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-File", str(repo / "scripts" / "uninstall.ps1"), "-ManifestPath", str(manifest), "-PythonExe", str(python_exe), "-ConfirmManifestSha256", manifest_sha256, "-RestoreConfigBackup"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                timeout=120,
+            )
+            if is_powershell_execution_policy_refusal(uninstall.stdout, uninstall.stderr):
+                self.skipTest("PowerShell execution policy refused uninstall.ps1; no override was used, so rollback remains unverified")
+            _require_contract(uninstall.returncode == 0, f"ROLLBACK_UNINSTALL_WRAPPER_FAILED:{uninstall.stdout!r}:{uninstall.stderr!r}")
             _require_contract(original_config_hash == hashlib.sha256(config.read_bytes()).hexdigest(), "ROLLBACK_CONFIG_BYTES_MISMATCH")
             hooks_after = json.loads(hooks.read_text(encoding="utf-8"))
             _require_contract([item["id"] for item in hooks_after["hooks"]["Stop"]] == ["user-stop"], "ROLLBACK_HOOKS_CONTENT_MISMATCH")

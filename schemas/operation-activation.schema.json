@@ -1,0 +1,121 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://external-intelligence.invalid/schemas/operation-activation.schema.json",
+  "title": "External Intelligence automatic operation state",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "settings", "evidence"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "settings": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["notifications", "initial_test"],
+      "properties": {
+        "notifications": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["enabled", "channel"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "channel": { "const": "os" }
+          }
+        },
+        "initial_test": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["allow_model_test", "allow_notification_test"],
+          "properties": {
+            "allow_model_test": { "type": "boolean" },
+            "allow_notification_test": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hosts": {
+          "type": "object",
+          "propertyNames": { "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$" },
+          "additionalProperties": { "$ref": "#/$defs/hostEvidence" }
+        },
+        "scheduler": { "$ref": "#/$defs/schedulerEvidence" },
+        "notification": { "$ref": "#/$defs/notificationEvidence" }
+      }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "timestamp": { "type": "string", "format": "date-time", "maxLength": 128 },
+    "observation": {
+      "enum": [
+        "HOST_RECEIPT", "SYNTHETIC_END_TO_END", "ISOLATION_UNAVAILABLE",
+        "AUTH_OR_TRUST_REQUIRED", "NOT_RUN", "SCHEDULER_RUN_OBSERVED",
+        "SCHEDULER_MONITOR_UNSUPPORTED", "OS_SEND_ACCEPTED",
+        "USER_CONFIRMED_DISPLAY", "OS_DENIED", "OS_UNAVAILABLE", "OS_FAILED"
+      ]
+    },
+    "status": { "enum": ["VERIFIED", "UNVERIFIED"] },
+    "hostEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "binding", "hook", "accumulation", "recall", "host_version",
+        "engine_code_sha256", "binding_sha256", "os_family", "os_version",
+        "channel", "tested_at", "observation"
+      ],
+      "properties": {
+        "binding": { "$ref": "#/$defs/status" },
+        "hook": { "$ref": "#/$defs/status" },
+        "accumulation": { "$ref": "#/$defs/status" },
+        "recall": { "$ref": "#/$defs/status" },
+        "host_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "engine_code_sha256": { "$ref": "#/$defs/hash" },
+        "binding_sha256": { "$ref": "#/$defs/hash" },
+        "os_family": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "os_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "channel": { "const": "work-cli" },
+        "tested_at": { "$ref": "#/$defs/timestamp" },
+        "observation": { "$ref": "#/$defs/observation" },
+        "candidate_ref_sha256": { "$ref": "#/$defs/hash" },
+        "event_ref_sha256": { "$ref": "#/$defs/hash" },
+        "recall_ref_sha256": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "schedulerEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "run", "monitor", "engine_code_sha256", "binding_sha256",
+        "os_family", "os_version", "tested_at", "observation"
+      ],
+      "properties": {
+        "run": { "$ref": "#/$defs/status" },
+        "monitor": { "$ref": "#/$defs/status" },
+        "engine_code_sha256": { "$ref": "#/$defs/hash" },
+        "binding_sha256": { "$ref": "#/$defs/hash" },
+        "os_family": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "os_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "tested_at": { "$ref": "#/$defs/timestamp" },
+        "observation": { "$ref": "#/$defs/observation" }
+      }
+    },
+    "notificationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["send", "display", "channel", "os_family", "os_version", "tested_at", "observation"],
+      "properties": {
+        "send": { "enum": ["SENT", "UNVERIFIED", "DENIED", "UNAVAILABLE", "FAILED"] },
+        "display": { "$ref": "#/$defs/status" },
+        "channel": { "const": "os" },
+        "os_family": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "os_version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "tested_at": { "$ref": "#/$defs/timestamp" },
+        "observation": { "$ref": "#/$defs/observation" },
+        "test_ref_sha256": { "$ref": "#/$defs/hash" }
+      }
+    }
+  }
+}

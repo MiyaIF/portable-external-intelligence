@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import unicodedata
 from datetime import datetime, timezone
@@ -57,6 +58,10 @@ class CodexMemoryAdapter:
         return stem or "memory"
 
     @classmethod
+    def accepts_path(cls, path: Path) -> bool:
+        return path.suffix.casefold() == ".md" and path.name.casefold() in {"memory.md", "memory_summary.md", "raw_memories.md"}
+
+    @classmethod
     def discover(cls, root: Path) -> Sequence[Path]:
         return tuple(
             path
@@ -75,6 +80,11 @@ class CodexMemoryAdapter:
         after = path.stat()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise ValueError("SOURCE_CHANGED_DURING_READ")
+        yield from self.read_verified(path.resolve(), content, before)
+
+    def read_verified(self, source: Path, content: bytes, metadata: os.stat_result) -> Iterable[SourceRecord]:
+        path = Path(source)
+        before = metadata
         text = content.decode("utf-8", errors="strict")
         source_hash = self._sha256(content)
         observed_at = datetime.fromtimestamp(before.st_mtime, timezone.utc).isoformat()
@@ -101,7 +111,7 @@ class CodexMemoryAdapter:
             self.health["parsed"] += 1
             yield SourceRecord(
                 source_kind="codex_memory",
-                source_ref=str(path.resolve()),
+                source_ref=str(path),
                 source_hash=source_hash,
                 observed_at=observed_at,
                 title=f"{domain}:{line_number}",
@@ -114,6 +124,7 @@ class CodexMemoryAdapter:
                 provenance_key=f"memory:{source_hash}",
                 source_host_id=self.host_id,
                 source_host_family=self.host_family,
+                stable_record_id=f"line:{line_number}",
             )
 
     def iter_records(self, cursor: Mapping[str, Any]) -> Iterable[SourceRecord]:
