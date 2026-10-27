@@ -231,7 +231,7 @@ def _stable_failure_code(output: bytes) -> str | None:
         return "TEST_DEPENDENCY_MISSING" + case_suffix
     if "unicodeencodeerror" in lowered or "unicodedecodeerror" in lowered:
         return "TEST_TEXT_ENCODING_FAILED" + case_suffix
-    return None
+    return "TEST_ASSERTION_FAILED" + case_suffix
 
 
 def _environment(repo_root: Path, base_environment: Mapping[str, str] | None = None) -> dict[str, str]:

@@ -1375,3 +1375,15 @@ Windows batchのfake Pythonと`git.exe`を前提とするPowerShell wrapperの�
 **Files:** `tests/unit/test_capture_recovery.py`、`tests/unit/test_gate.py`、`tests/integration/test_one_shot_local_setup.py`、`tests/integration/test_organizer_restart.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。検証報告: `.superpowers/sdd/2026-09-18-reliable-automatic-accumulation-implementation/ci-windows-functional-budget-report.md`。
 
 Windows CIの失敗を機能回帰と時間切れ・故障注入不成立に分けて検証する。frontier permission-error試験は、実8.3 TEMP（repo外）のcanonical targetを比較し、faultが実際に発火したことを確認する。one-shotの機能試験はrun_maintenanceの既定30秒、gate YESは明示30秒の共有OperationBudget、organizerの初回/再開は同じ30秒の試験budgetを用い、結果とprovider呼出数を失敗時に表示する。元のstatus・receipt・retry・件数assertionは維持する。これらは機能試験の時間依存を避ける限定fixture変更であり、製品budget・timeout挙動やstandalone 5秒経路を修正したとの主張はしない。organizer CI失敗の期限原因は証拠不足で未確定のまま記録する。
+
+#### CI残件の解消と既存PCへの反映
+
+利用者の追加承認により、CI修正後の公開main反映、既存PC更新、実CLIの保存・次回取得の検証を行う。週間残量10%を下回る見込みならチェックポイントを残して停止する。既存ナレッジ・identity・明示無効設定を保持し、実機の承認や認証を迂回しない。公開と実運用の完了証拠は分けて報告する。
+
+**Files（macOS fixture修正）:** `tests/acceptance/test_reliable_automatic_accumulation.py`、`docs/plans/2026-09-18-reliable-automatic-accumulation-implementation.md`。
+
+macOSでの一時ディレクトリの字句パスとcanonical pathの違いが原因かを検証し、確認できた場合に限り、この受入テストのfixture入口をcanonical pathに統一する。製品のno-follow検証を緩めず、既存assertion・期待件数・deadlineを維持する。他のWindows/Linux失敗は再取得した具体的証拠に基づき別途Filesを限定する。
+
+**追加Files（CI失敗の識別）:** `src/ei/test_runner.py`、`tests/unit/test_test_runner.py`。隔離clean-cloneの失敗時、汎用assertion failureにも既存の許可文字・長さ制限内で最初の失敗テスト名をreason codeへ付与する。生のtraceback・本文・絶対パスは診断へ追加せず、既存の明示reason codeと依存・文字コードの分類を維持する。成否・件数・skip・timeoutの扱いは変えない。公開CIのLinux失敗箇所を特定するための診断であり、未特定のテスト不具合を修正済みとは扱わない。
+
+**追加Files（複数CLIの機能fixture）:** `tests/acceptance/test_single_intelligence_multi_cli.py`。公開Windows CIの複数CLI受入試験で、整理AI停止時の候補作成が`CAPTURE_BUDGET_EXHAUSTED`となったことを確認した。この1試験専用の候補作成helperに明示20秒の有限OperationBudgetを渡す。検証目的は共有ナレッジ・整理AIの一意性と停止/再開であり、製品の既定5秒での性能保証ではない。queue・receipt・暗号化・再取得・停止時の保持という既存assertionと、製品の既定budgetやdeadline拒否試験は変更しない。

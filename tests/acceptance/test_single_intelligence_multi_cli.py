@@ -32,6 +32,7 @@ from ei.journal import iter_events
 from ei.key_provider import InMemoryKeyProvider
 from ei.maintainer import _RouterAdapter, drain_queue
 from ei.models import CaptureContext, ObservationInput
+from ei.operation_runtime import OperationBudget
 from ei.project import project_events
 from ei.queue import QueueState, list_queue_items, read_queue_item
 from ei.reconciliation import reconcile_lifecycle
@@ -173,7 +174,7 @@ class SingleIntelligenceMultiCliAcceptanceTests(NotificationIsolationMixin, unit
             source_host_family=family,
         )
         prior_events = self._journal_digest(settings)
-        captured = record_agent_observation(observation, context, settings)
+        captured = record_agent_observation(observation, context, settings, budget=OperationBudget(20000))
         self.assertTrue(captured.created, captured)
         queued = read_queue_item(captured.event_id or "", settings)
         self.assertEqual(queued.state, QueueState.READY)

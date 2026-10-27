@@ -43,6 +43,12 @@ def _observation(claim: str = "この手順を別の案件でも再利用する�
     )
 
 
+def _trusted_temp_root(tmp: str | Path) -> Path:
+    """Resolve a test-owned TemporaryDirectory before passing it to safety checks."""
+
+    return Path(tmp).resolve(strict=True)
+
+
 class ReliableAutomaticAccumulationTests(unittest.TestCase):
     # Design 12.8 evidence map (the combined Task 13 run executes these targets):
     # (1) integration.test_adapter_closeout.test_registered_adapter_closeout_applies_and_covers_only_explicit_turns;
@@ -132,7 +138,7 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
 
     def test_structured_recovery_does_not_advance_cursor_before_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = _trusted_temp_root(tmp)
             settings = make_settings(root)
             key = identity()
             source_file = root / "sources" / "memory.md"
@@ -180,7 +186,7 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
 
     def test_structured_recovery_ack_failure_keeps_cursor_uncommitted_until_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = _trusted_temp_root(tmp)
             settings = make_settings(root)
             source_identity = identity()
             source_file = root / "sources" / "memory.md"
@@ -220,8 +226,8 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
 
     def test_hookless_candidates_link_maintenance_projection_and_next_recall_by_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            settings = maintainer_helpers.make_settings(tmp)
+            root = _trusted_temp_root(tmp)
+            settings = maintainer_helpers.make_settings(root)
             claim = (
                 "作業前に対象範囲と保存先を確認し、処理後は同じ範囲を再読込して値と数式を検証する。"
                 "差分が残る場合は完了とせず、元データと実行結果を照合してから次の作業へ進む。"
@@ -489,7 +495,7 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
         from tests.support.sitecustomize import NotificationIsolation
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = _trusted_temp_root(tmp)
             engine = Path(__file__).resolve().parents[2]
             knowledge = root / "private-knowledge"
             runtime = root / "machine-runtime"
