@@ -4,12 +4,15 @@ import os
 import re
 import subprocess
 import sys
+import threading
+import time as _time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 from ei.adapters.codex_memory import CodexMemoryAdapter
+from ei import capture_recovery as capture_recovery_module
 from ei.capture_recovery import RecoverySource, recover_page
 from ei.ingest import ingest_sources
 from ei.key_provider import InMemoryKeyProvider
@@ -17,6 +20,35 @@ from ei.queue import list_queue_items
 from tests.unattended_helpers import NOW, identity, make_settings
 
 FUNCTIONAL_RECOVERY_BUDGET_MS = 20_000
+
+
+class _ControlledMonotonicClock:
+    """Finite logical time for recovery fixtures; every read advances it."""
+
+    def __init__(self, *, step_ms=1):
+        self._value = 0.0
+        self._step_seconds = step_ms / 1000
+
+    def __call__(self):
+        self._value += self._step_seconds
+        return self._value
+
+    def advance_ms(self, milliseconds):
+        self._value += milliseconds / 1000
+
+
+class _ControlledTimeProxy:
+    def __init__(self, clock):
+        self._clock = clock
+        self._controlled_thread = threading.get_ident()
+
+    def monotonic(self):
+        if threading.get_ident() == self._controlled_thread:
+            return self._clock()
+        return _time.monotonic()
+
+    def __getattr__(self, name):
+        return getattr(_time, name)
 
 
 def _diagnostic_token(value):
@@ -58,8 +90,17 @@ class CaptureCatchupTests(unittest.TestCase):
     def ingest(self, source_path=None):
         return ingest_sources(self.settings, [CodexMemoryAdapter([source_path or self.path])])
 
-    def recover(self, *, max_ms=FUNCTIONAL_RECOVERY_BUDGET_MS):
-        return recover_page(self.settings, self.source, now=NOW, max_ms=max_ms)
+    def recover(self, *, max_ms=FUNCTIONAL_RECOVERY_BUDGET_MS, max_bytes=2_097_152, source=None):
+        controlled_time = _ControlledTimeProxy(_ControlledMonotonicClock())
+        with patch("ei.operation_runtime.time", new=controlled_time):
+            with patch("ei.capture_recovery.time", new=controlled_time):
+                return recover_page(
+                    self.settings,
+                    source if source is not None else self.source,
+                    now=NOW,
+                    max_ms=max_ms,
+                    max_bytes=max_bytes,
+                )
 
     @staticmethod
     def recovery_diagnostic(result):
@@ -173,7 +214,7 @@ class CaptureCatchupTests(unittest.TestCase):
         from dataclasses import replace
         self.recover()
         conflict = replace(self.source, instance_hash="sha256:" + "f" * 64)
-        conflict_result = recover_page(self.settings, conflict, now=NOW, max_ms=FUNCTIONAL_RECOVERY_BUDGET_MS)
+        conflict_result = self.recover(source=conflict)
         self.assertEqual(conflict_result.secured, 0, msg=self.recovery_diagnostic(conflict_result))
         other = self.root / "other" / "memory.md"
         other.parent.mkdir()
@@ -185,7 +226,7 @@ class CaptureCatchupTests(unittest.TestCase):
         self.recover()
         binding = next((self.settings.paths.local_state_dir / "source-bindings").glob("*.json"))
         original = binding.read_bytes()
-        result = recover_page(self.settings, self.source, now=NOW, max_ms=10000, max_bytes=500)
+        result = self.recover(max_ms=10000, max_bytes=500)
         self.assertEqual(result.reason_code, "SOURCE_BINDING_LIMIT")
         self.assertEqual(binding.read_bytes(), original)
         self.assertEqual(len(list_queue_items(self.settings)), 1)
@@ -210,6 +251,57 @@ class CaptureCatchupTests(unittest.TestCase):
         recovered = self.recover()
         self.assertEqual(recovered.secured, 1, msg=self.recovery_diagnostic(recovered))
 
+    def test_functional_recovery_does_not_charge_host_clock_jump_during_real_read(self):
+        host_clock = _ControlledMonotonicClock()
+        host_time = _ControlledTimeProxy(host_clock)
+        real_read = capture_recovery_module._read_verified
+
+        def read_then_advance_host_clock(*args, **kwargs):
+            result = real_read(*args, **kwargs)
+            host_clock.advance_ms(FUNCTIONAL_RECOVERY_BUDGET_MS + 1)
+            return result
+
+        with patch("ei.operation_runtime.time", new=host_time):
+            with patch("ei.capture_recovery.time", new=host_time):
+                with patch("ei.capture_recovery._read_verified", side_effect=read_then_advance_host_clock):
+                    result = self.recover()
+        self.assertEqual(result.secured, 1, msg=self.recovery_diagnostic(result))
+        self.assertEqual(len(list_queue_items(self.settings)), 1)
+        self.assertEqual(list(self.settings.paths.event_dir.rglob("*.json")), [])
+
+    def test_deadline_after_real_source_read_does_not_advance_capture_or_cursor(self):
+        clock = _ControlledMonotonicClock()
+        controlled_time = _ControlledTimeProxy(clock)
+        real_read = capture_recovery_module._read_verified
+
+        def read_then_expire_budget(*args, **kwargs):
+            result = real_read(*args, **kwargs)
+            clock.advance_ms(FUNCTIONAL_RECOVERY_BUDGET_MS + 1)
+            return result
+
+        with patch("ei.operation_runtime.time", new=controlled_time):
+            with patch("ei.capture_recovery.time", new=controlled_time):
+                with patch("ei.capture_recovery._read_verified", side_effect=read_then_expire_budget):
+                    result = recover_page(
+                        self.settings,
+                        self.source,
+                        now=NOW,
+                        max_ms=FUNCTIONAL_RECOVERY_BUDGET_MS,
+                    )
+
+        self.assertEqual(result.reason_code, "SOURCE_TIME_LIMIT", msg=self.recovery_diagnostic(result))
+        self.assertEqual(result.scanned, 0)
+        self.assertEqual(result.secured, 0)
+        self.assertFalse(result.cursor_committed)
+        cursor_files = list((self.settings.paths.local_state_dir / "capture-recovery").glob("*.json"))
+        self.assertEqual(len(cursor_files), 1)
+        cursor = json.loads(cursor_files[0].read_bytes())
+        self.assertEqual(cursor["frontier"], [[self.path.name, "file"]])
+        self.assertEqual(cursor["record_offset"], 0)
+        self.assertEqual(cursor["file_version"], "")
+        self.assertEqual(len(list_queue_items(self.settings)), 0)
+        self.assertEqual(list(self.settings.paths.event_dir.rglob("*.json")), [])
+
     def test_live_other_process_excludes_recovery_until_its_handle_closes(self):
         script = (
             "import sys; from pathlib import Path; "
@@ -223,7 +315,7 @@ class CaptureCatchupTests(unittest.TestCase):
         try:
             if process.stdout.readline().strip() != "locked":
                 self.fail("CAPTURE_LOCK_CHILD_READY_FAILED")
-            result = self.recover(max_ms=10000)
+            result = recover_page(self.settings, self.source, now=NOW, max_ms=10000)
             if (result.secured, result.reason_code) != (0, "SOURCE_COORDINATION_UNAVAILABLE"):
                 reason = result.reason_code
                 reason = reason if isinstance(reason, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,47}", reason) else "UNKNOWN"
