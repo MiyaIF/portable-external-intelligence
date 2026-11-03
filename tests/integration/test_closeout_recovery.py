@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import unittest
 import re
+import threading
+import time as _time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -34,7 +36,48 @@ class SimulatedPowerLoss(BaseException):
     pass
 
 
+class _AdvancingMonotonicClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        self.value += 0.001
+        return self.value
+
+    def advance_ms(self, milliseconds):
+        self.value += milliseconds / 1000
+
+
+class _OperationTimeProxy:
+    def __init__(self, clock):
+        self._clock = clock
+        self._controlled_thread = threading.get_ident()
+
+    def monotonic(self):
+        if threading.get_ident() == self._controlled_thread:
+            return self._clock()
+        return _time.monotonic()
+
+    def __getattr__(self, name):
+        return getattr(_time, name)
+
+
 class CloseoutRecoveryIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        self._functional_clock = _AdvancingMonotonicClock()
+        operation_time = patch(
+            "ei.operation_runtime.time",
+            new=_OperationTimeProxy(self._functional_clock),
+        )
+        operation_time.start()
+        self.addCleanup(operation_time.stop)
+
+    def _with_finite_operation_clock(self, operation):
+        clock = _AdvancingMonotonicClock()
+        with patch("ei.operation_runtime.time", new=_OperationTimeProxy(clock)):
+            return operation(clock)
+
     def _fixture(self, *, setup_budget_ms=5000):
         fixture, validation = closeout_test_helpers.CloseoutAssociationTests._validated_fixture(
             self, turns=3, budget_ms=setup_budget_ms
@@ -55,6 +98,192 @@ class CloseoutRecoveryIntegrationTests(unittest.TestCase):
         budget = OperationBudget(10000)
         with association._capture_lock(settings, budget):
             return CloseoutStore(settings, budget=budget).active_records()
+
+    def test_functional_preparation_survives_host_clock_jump_after_real_spool_write(self):
+        from ei import spool
+
+        original_write_spool = association.write_spool
+
+        def exercise(*, isolated):
+            fixture, validation, prepared = self._fixture()
+            initial_receipts = {
+                item: read_receipt(fixture.settings, item) for item in validation.context.target_ids
+            }
+            host_clock = _AdvancingMonotonicClock()
+            saved_refs = []
+            budgets = []
+            apply_calls = []
+
+            def write_then_jump(*args, **kwargs):
+                reference = original_write_spool(*args, **kwargs)
+                saved_refs.append(reference)
+                self.assertIs(kwargs.get("budget"), budgets[0])
+                host_clock.advance_ms(15001)
+                return reference
+
+            def crash_at_application(*args, **kwargs):
+                apply_calls.append((args, kwargs))
+                raise SimulatedPowerLoss()
+
+            def invoke():
+                budget = OperationBudget(15000)
+                budgets.append(budget)
+                try:
+                    association.apply_associated_closeout(
+                        fixture.settings,
+                        validation,
+                        content_hash=CONTENT_HASH,
+                        prepare=lambda: prepared,
+                        now=NOW,
+                        budget=budget,
+                    )
+                except SimulatedPowerLoss:
+                    return "fault", budget
+                except TimeoutError as exc:
+                    return "timeout", budget, exc
+                return "returned", budget
+
+            with patch("ei.operation_runtime.time", new=_OperationTimeProxy(host_clock)):
+                with patch.object(association, "write_spool", side_effect=write_then_jump), patch.object(
+                    association, "apply_changeset", side_effect=crash_at_application
+                ):
+                    if isolated:
+                        outcome = self._with_finite_operation_clock(lambda _: invoke())
+                    else:
+                        outcome = invoke()
+            return fixture, validation, initial_receipts, host_clock, saved_refs, apply_calls, outcome
+
+        red = exercise(isolated=False)
+        fixture, validation, initial_receipts, host_clock, saved_refs, apply_calls, outcome = red
+        self.assertEqual(outcome[0], "timeout", msg=f"control outcome={outcome[0]}")
+        self.assertEqual(str(outcome[2]), "OPERATION_BUDGET_EXHAUSTED")
+        self.assertEqual(len(saved_refs), 1)
+        self.assertGreaterEqual(host_clock.value, outcome[1].deadline)
+        self.assertTrue(spool.lookup(fixture.settings.paths.spool_dir, saved_refs[0].spool_id).exists())
+        self.assertEqual(apply_calls, [])
+        active = self._active(fixture.settings)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["status"], "PREPARING")
+        self.assertIsNone(active[0]["spool_ref"])
+        self.assertEqual(
+            {item: read_receipt(fixture.settings, item) for item in validation.context.target_ids},
+            initial_receipts,
+        )
+
+        green = exercise(isolated=True)
+        _, _, _, host_clock, saved_refs, apply_calls, outcome = green
+        self.assertEqual(outcome[0], "fault", msg=f"functional outcome={outcome[0]}")
+        self.assertEqual(len(saved_refs), 1)
+        self.assertTrue(spool.lookup(green[0].settings.paths.spool_dir, saved_refs[0].spool_id).exists())
+        self.assertEqual(len(apply_calls), 1)
+        self.assertGreaterEqual(host_clock.value, 15001 / 1000)
+
+    def test_actual_deadline_crossing_keeps_preparation_recoverable_and_retry_duplicate_free(self):
+        from ei import spool
+
+        fixture, validation, prepared = self._fixture()
+        initial_receipts = {
+            item: read_receipt(fixture.settings, item) for item in validation.context.target_ids
+        }
+        original_write_spool = association.write_spool
+        original_check = OperationBudget.check
+        crossings = {"written": False, "deadline_checked": False, "raised": False}
+        saved_refs = []
+        prepare_calls = []
+        budget = OperationBudget(15000)
+
+        def observed_check():
+            if self._functional_clock.value >= budget.deadline:
+                crossings["deadline_checked"] = True
+            try:
+                return original_check(budget)
+            except TimeoutError:
+                crossings["raised"] = True
+                raise
+
+        budget.check = observed_check
+
+        def write_then_cross_deadline(*args, **kwargs):
+            self.assertIs(kwargs.get("budget"), budget)
+            reference = original_write_spool(*args, **kwargs)
+            saved_refs.append(reference)
+            crossings["written"] = True
+            self._functional_clock.advance_ms(15001)
+            return reference
+
+        def prepare():
+            prepare_calls.append(True)
+            return prepared
+
+        with patch.object(association, "write_spool", side_effect=write_then_cross_deadline), patch.object(
+            association, "apply_changeset", wraps=association.apply_changeset
+        ) as apply_changeset:
+            with self.assertRaisesRegex(TimeoutError, "OPERATION_BUDGET_EXHAUSTED"):
+                association.apply_associated_closeout(
+                    fixture.settings,
+                    validation,
+                    content_hash=CONTENT_HASH,
+                    prepare=prepare,
+                    now=NOW,
+                    budget=budget,
+                )
+
+        self.assertEqual(crossings, {"written": True, "deadline_checked": True, "raised": True})
+        self.assertEqual(len(saved_refs), 1)
+        self.assertEqual(prepare_calls, [True])
+        self.assertEqual(apply_changeset.call_count, 0)
+        self.assertTrue(spool.lookup(fixture.settings.paths.spool_dir, saved_refs[0].spool_id).exists())
+        active = self._active(fixture.settings)
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0]["status"], "PREPARING")
+        self.assertIsNone(active[0]["spool_ref"])
+        self.assertIsNone(active[0]["application_ref"])
+        self.assertEqual(active[0]["witness"], [])
+        record_id = active[0]["record_id"]
+        self.assertEqual(
+            {item: read_receipt(fixture.settings, item) for item in validation.context.target_ids},
+            initial_receipts,
+        )
+
+        with patch("ei.curator.curate_candidate", side_effect=AssertionError("recovery curated again")):
+            recovered = association.recover_closeout_associations(
+                fixture.settings,
+                now=NOW,
+                budget=OperationBudget(30000),
+            )
+        self.assertEqual(recovered["processed"], 1)
+        self.assertEqual(recovered["results"][0]["record_id"], record_id)
+        self.assertEqual(recovered["results"][0]["association"], "COMMITTED")
+        self.assertEqual(self._active(fixture.settings), [])
+
+        terminal_budget = OperationBudget(10000)
+        with association._capture_lock(fixture.settings, terminal_budget):
+            terminal = CloseoutStore(fixture.settings, budget=terminal_budget).read_record(record_id)
+        self.assertEqual(terminal["status"], "COMMITTED")
+        marker_id = terminal["application_ref"]["marker_id"]
+        saved_event_ids = tuple(item["event_id"] for item in terminal["witness"])
+        self.assertTrue(marker_id)
+        self.assertEqual(len(saved_event_ids), len(set(saved_event_ids)))
+        committed_receipts = {
+            item: read_receipt(fixture.settings, item) for item in validation.context.target_ids
+        }
+        self.assertTrue(all(receipt is not None and receipt.state == "SECURED" for receipt in committed_receipts.values()))
+
+        replay = association.apply_associated_closeout(
+            fixture.settings,
+            validation,
+            content_hash=CONTENT_HASH,
+            prepare=lambda: self.fail("committed retry prepared again"),
+            now=NOW.replace(minute=1),
+            budget=OperationBudget(15000),
+        )
+        self.assertTrue(replay.acknowledged)
+        self.assertEqual(replay.association, "COMMITTED")
+        self.assertEqual(replay.event_ids, saved_event_ids)
+        self.assertEqual(
+            {item: read_receipt(fixture.settings, item) for item in validation.context.target_ids},
+            committed_receipts,
+        )
 
     def test_recovery_reapplies_prepared_spool_without_preparing_again(self):
         fixture, validation, prepared = self._fixture()

@@ -1437,6 +1437,12 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 
 ## Windows取得・復旧の機能fixtureと期限試験の分離
 
+### 2026-11-03: closeout recoveryの保存準備と復旧検証
+
+同じ公開SHAのpush側Windows互換性検証では、`tests/acceptance/test_reliable_automatic_accumulation.py` の `test_capture_ack_requires_durable_spool_queue_and_receipt` も失敗した。追加Filesはこのacceptance moduleと本計画書。CIが返した情報は失敗test名までであり、当該ケースの過去CI原因は未確定として扱う。対象のdurable ACK故障注入・再試行だけを調べ、実期限との結合を再現できた場合はtest-localの有限・進む時計に分離する。既存default/explicit予算、4つの故障境界、実I/O・暗号化・排他とspool/queue/receiptのassertionを維持し、独立した実期限切れ・安全な再試行の回帰も確認する。他のacceptance機能を根拠なく一括変更せず、製品コードやCI上限は変えない。分離を外した実RED/GREENと対象全moduleを確認し、上記closeout修正と同じ固定版全件試験・公開SHAのCIで判定する。
+
+追加対象は `tests/integration/test_closeout_recovery.py` と本計画書。公開PR CIのPython 3.13で、14テスト中3ケースが準備spoolの書込み中に `OperationBudget(15000)` を消費し、意図した故障注入・復旧検証の前に `OPERATION_BUDGET_EXHAUSTED` となったことをtracebackで確認した。既に分離したcatchup/pending recoveryは同じCIで合格している。このmoduleの機能検証を分類し、実マシン速度に依存する操作時計だけをtest-localの有限・進む時計へ一貫して分離する。既存5秒／10秒／15秒／30秒の値、実I/O・暗号化・所有権・排他・binding再検証・event/receipt/markerの全assertion、TTLの日時判定、外側300秒上限は維持する。実期限を跨いだ場合に未完了をackせず、安全に復旧して二重保存しない独立ケースを残す。既存の各ケースが機能試験であることを確認した範囲に限り共通fixtureを使い、製品コード・共有test helper・他moduleの時計には変更を広げない。分離を外すと失敗する実RED/GREEN、対象3ケース・対象全module・独立期限試験・差分レビュー・固定版全件試験・同一公開SHAのCIで検証する。秒数増加・再試行での合格扱い・安全条件緩和は行わない。
+
 ### 2026-11-03: pending captureの保存・再開機能fixture
 
 追加対象は `tests/integration/test_pending_capture_recovery.py` と本計画書。公開push CIのPython 3.13で、保存準備が `WAITING` となる3ケースと、意図した保存境界の故障に未到達の2ケースを確認した。ログに理由・残予算がないため元のCI原因は未確定とし、既定5秒の協調期限が機能検証を先取りする経路を限定probeで確認する。このmoduleの成功を前提とする保存・再開操作だけを、有限で進むtest-local時計により実マシン速度から分離する。製品の期限・時計・check・実I/O・暗号化・queue/receipt・所有権・排他・全assertionは維持し、実時間性能の改善とは扱わない。既存の意図的timeout/delete-deadline試験、明示budget同一性検証、実OS待機と外側300秒上限を維持する。実deadlineを跨ぐ独立ケースで未完了をSECUREDと扱わず再開できることを確認する。既存失敗ケース、対象全module、独立期限検証、差分レビューと固定版全件試験を経て、同一公開SHAのCIを確認する。秒数増加だけの変更・skip・成功条件緩和・新しい汎用fixture基盤は追加しない。

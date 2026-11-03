@@ -7,7 +7,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from time import monotonic as _real_monotonic
 from unittest.mock import patch
 
 from ei.adapters.codex_memory import CodexMemoryAdapter
@@ -50,6 +52,45 @@ def _trusted_temp_root(tmp: str | Path) -> Path:
     return Path(tmp).resolve(strict=True)
 
 
+class _HostClockJump:
+    """Simulate an instant host delay through the OperationBudget clock reference."""
+
+    def __init__(self) -> None:
+        self._owner_thread = threading.get_ident()
+        self._reads = 0
+
+    @property
+    def reads(self) -> int:
+        return self._reads
+
+    def monotonic(self) -> float:
+        if threading.get_ident() != self._owner_thread:
+            return _real_monotonic()
+        self._reads += 1
+        return 10.0 if self._reads == 1 else 16.0
+
+
+class _FiniteThreadLocalOperationBudgetClock:
+    """Advance only OperationBudget reads on this test thread, with a finite guard."""
+
+    def __init__(self, *, step_seconds: float = 0.001, max_reads: int = 10_000) -> None:
+        self._owner_thread = threading.get_ident()
+        self._step_seconds = step_seconds
+        self._max_reads = max_reads
+        self._reads = 0
+        self._value = 0.0
+
+    def monotonic(self) -> float:
+        if threading.get_ident() != self._owner_thread:
+            return _real_monotonic()
+        if self._reads >= self._max_reads:
+            raise AssertionError("finite OperationBudget test clock read limit exceeded")
+        self._reads += 1
+        value = self._value
+        self._value += self._step_seconds
+        return value
+
+
 class ReliableAutomaticAccumulationTests(unittest.TestCase):
     # Design 12.8 evidence map (the combined Task 13 run executes these targets):
     # (1) integration.test_adapter_closeout.test_registered_adapter_closeout_applies_and_covers_only_explicit_turns;
@@ -83,7 +124,17 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
             self.assertEqual(result["automatic_operation"], "UNVERIFIED")
             self.assertEqual(result["notification_send"], "NOT_ATTEMPTED")
 
-    def test_capture_ack_requires_durable_spool_queue_and_receipt(self) -> None:
+    def _accept_candidate_for_durable_ack(self, *args, **kwargs):
+        try:
+            return accept_candidate(*args, **kwargs)
+        except TimeoutError as exc:
+            self.fail(f"durable ACK fault/retry scenario exhausted its unchanged default budget: {exc}")
+
+    def _exercise_capture_ack_failure_boundaries(self) -> None:
+        with patch("ei.operation_runtime.time", _FiniteThreadLocalOperationBudgetClock()):
+            self._exercise_capture_ack_failure_boundaries_with_local_clock()
+
+    def _exercise_capture_ack_failure_boundaries_with_local_clock(self) -> None:
         cases = (
             "before_spool",
             "after_spool_before_queue",
@@ -113,7 +164,7 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
                             return save_intent(root, path, value, budget=budget)
 
                         stack.enter_context(patch("ei.pending_capture._save", side_effect=fail_commit))
-                    interrupted = accept_candidate(
+                    interrupted = self._accept_candidate_for_durable_ack(
                         settings,
                         candidate_identity,
                         observation,
@@ -122,8 +173,12 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
                         origin="NATIVE_SOURCE",
                     )
 
-                self.assertNotEqual(interrupted.state, "SECURED")
-                retry = accept_candidate(
+                self.assertNotEqual(
+                    interrupted.state,
+                    "SECURED",
+                    msg=f"{case} unexpectedly completed ACK before retry: {interrupted.reason_code}",
+                )
+                retry = self._accept_candidate_for_durable_ack(
                     settings,
                     candidate_identity,
                     observation,
@@ -131,11 +186,20 @@ class ReliableAutomaticAccumulationTests(unittest.TestCase):
                     key_provider=key,
                     origin="NATIVE_SOURCE",
                 )
-                self.assertEqual(retry.state, "SECURED")
+                self.assertEqual(retry.state, "SECURED", msg=f"{case} retry reason={retry.reason_code}")
                 self.assertEqual(len(list_queue_items(settings)), 1)
                 receipt = read_receipt(settings, retry.capture_id)
                 self.assertIsNotNone(receipt)
                 self.assertEqual(receipt.state, "SECURED")
+
+    def test_capture_ack_requires_durable_spool_queue_and_receipt(self) -> None:
+        self._exercise_capture_ack_failure_boundaries()
+
+    def test_capture_ack_failure_boundaries_survive_host_clock_jump(self) -> None:
+        host_clock = _HostClockJump()
+        with patch("ei.operation_runtime.time", host_clock):
+            self._exercise_capture_ack_failure_boundaries()
+        self.assertEqual(host_clock.reads, 0, "the functional scenario must use its local OperationBudget clock")
 
     def test_structured_recovery_does_not_advance_cursor_before_ack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
