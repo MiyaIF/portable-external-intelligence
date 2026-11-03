@@ -12,9 +12,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from .journal import validate_schema
-from .spool import SpoolError, SpoolRef, delete_spool
+from .spool import SpoolError, SpoolRef, delete_spool, _cleanup_temporary
 from .models import Event
+from .safe_fs import safe_unlink
 from .hooks.base import NormalizedHookEvent
+from .runtime_catalog import RuntimeCatalog, CatalogUnknown, lookup, inventory_paths, read_entry
+from .operation_runtime import OperationBudget
 
 
 class QueueError(RuntimeError):
@@ -52,7 +55,7 @@ _ALLOWED_TRANSITIONS = {
     QueueState.IN_PROGRESS: frozenset({QueueState.READY, QueueState.DEFERRED, QueueState.YES_CURATING, QueueState.NO_DISCARDED, QueueState.DONE, QueueState.FAILED_RETRYABLE, QueueState.FAILED_NEEDS_ATTENTION, QueueState.QUARANTINED}),
     QueueState.FAILED_RETRYABLE: frozenset({QueueState.READY, QueueState.IN_PROGRESS, QueueState.DEFERRED, QueueState.FAILED_NEEDS_ATTENTION, QueueState.QUARANTINED}),
     QueueState.FAILED_NEEDS_ATTENTION: frozenset({QueueState.READY, QueueState.QUARANTINED}),
-    QueueState.YES_CURATING: frozenset({QueueState.READY, QueueState.DONE, QueueState.FAILED_RETRYABLE, QueueState.FAILED_NEEDS_ATTENTION, QueueState.QUARANTINED}),
+    QueueState.YES_CURATING: frozenset({QueueState.READY, QueueState.DEFERRED, QueueState.DONE, QueueState.FAILED_RETRYABLE, QueueState.FAILED_NEEDS_ATTENTION, QueueState.QUARANTINED}),
     QueueState.NO_DISCARDED: frozenset(),
     QueueState.DONE: frozenset(),
     QueueState.FAILED: frozenset({QueueState.READY, QueueState.QUARANTINED}),
@@ -83,9 +86,11 @@ class QueueItem:
     last_error_code: str | None = None
     source_host_id: str = ""
     source_host_family: str = ""
+    capture_id: str | None = None
+    validated_result_ref: SpoolRef | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        serialized = {
             "queue_id": self.queue_id,
             "event_id": self.event_id,
             "idempotency_key": self.idempotency_key,
@@ -107,13 +112,25 @@ class QueueItem:
             "last_error_code": self.last_error_code,
             "source_host_id": self.source_host_id,
             "source_host_family": self.source_host_family,
+            "capture_id": self.capture_id,
+            "validated_result_ref": self.validated_result_ref.to_dict() if self.validated_result_ref else None,
         }
+        # Pre-host-scope queues have no trusted source pair. Preserve absence
+        # instead of manufacturing an invalid empty label or a current host.
+        if self.source_host_id == "" and self.source_host_family == "":
+            serialized.pop("source_host_id")
+            serialized.pop("source_host_family")
+        return serialized
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "QueueItem":
         if not isinstance(value, Mapping):
             raise QueueError("QUEUE_ITEM_INVALID")
         try:
+            validate_schema("queue-item", value)
+            if "source_host_id" in value or "source_host_family" in value:
+                if not value.get("source_host_id") or not value.get("source_host_family"):
+                    raise QueueError("QUEUE_ITEM_INVALID")
             result = cls(
                 queue_id=str(value["queue_id"]),
                 event_id=str(value["event_id"]),
@@ -142,6 +159,8 @@ class QueueItem:
                 last_error_code=value.get("last_error_code"),
                 source_host_id=value.get("source_host_id", ""),
                 source_host_family=value.get("source_host_family", ""),
+                capture_id=value.get("capture_id"),
+                validated_result_ref=SpoolRef.from_dict(value["validated_result_ref"]) if value.get("validated_result_ref") is not None else None,
             )
             if result.attempts < 0:
                 raise QueueError("QUEUE_ITEM_INVALID")
@@ -243,25 +262,73 @@ def _emergency_root(settings: Any) -> Path:
     return path
 
 
-def _safe_queue_path(root: Path, queue_id: str) -> Path:
+def _safe_queue_path(root: Path, queue_id: str, budget=None) -> Path:
     if not isinstance(queue_id, str) or not queue_id.startswith("queue_") or any(char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-." for char in queue_id):
         raise QueueError("QUEUE_ID_INVALID")
-    path = (root / f"{queue_id}.json").resolve()
-    if not path.is_relative_to(root):
-        raise QueueError("QUEUE_PATH_TRAVERSAL")
-    return path
+    try:
+        return lookup(root, queue_id, budget=budget)
+    except ValueError as exc:
+        raise QueueError("QUEUE_PATH_TRAVERSAL") from exc
 
 
-def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
+def _tag(key, host):
+    return hashlib.sha256(json.dumps([key, host]).encode("utf-8")).hexdigest()
+
+
+def _update_metadata(root, path, budget):
+    item = _read_item(path, budget=budget)
+    if path.stem != item.queue_id or item.queue_id != _new_queue_id(item.event_id, item.idempotency_key, item.source_host_id):
+        raise QueueError("QUEUE_IDEMPOTENCY_COLLISION")
+    return dict(purpose="queue", tag=_tag(item.idempotency_key, item.source_host_id), retry_tag="",
+                created_at=item.created_at, expires_at=item.payload_ref.expires_at if item.payload_ref else "")
+
+
+def _catalog(root, budget=None, *, replay_id=None):
+    catalog = RuntimeCatalog(root, prefix="queue_", clean_temporary=lambda path: _cleanup_temporary(root, path, budget))
+    def inspect(path):
+        item = _read_item(path, budget=budget)
+        return "queue", _tag(item.idempotency_key, item.source_host_id)
+    page = catalog.migrate_page(budget=budget, inspect_metadata=inspect,
+                                inspect_update=lambda path: _update_metadata(root, path, budget))
+    if not page.complete:
+        reservation = catalog.reservation(replay_id, budget=budget) if replay_id else None
+        if reservation is None or reservation["phase"] != "writing":
+            raise QueueError("QUEUE_INVENTORY_PARTIAL")
+    return catalog
+
+
+def _store(root, item, budget=None):
+    value = item.to_dict()
+    encoded = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    catalog = _catalog(root, budget, replay_id=item.queue_id)
+    reservation = catalog.reservation(item.queue_id, budget=budget)
+    expiry = item.payload_ref.expires_at if item.payload_ref else reservation["expires_at"] if reservation else ""
+    return catalog.write(item.queue_id, encoded, purpose="queue", tag=_tag(item.idempotency_key, item.source_host_id),
+        created_at=item.created_at, expires_at=expiry,
+        budget=budget, writer=lambda path: _atomic_json(path, value, budget=budget))
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any], budget=None) -> None:
+    if budget is not None:
+        budget.check()
     temporary = path.with_name(path.name + f".{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    descriptor = os.open(str(temporary), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    descriptor = os.open(str(temporary), os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0), 0o600)
     try:
-        encoded = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
-        os.write(descriptor, encoded)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    try:
+        try:
+            encoded = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+            remaining = memoryview(encoded)
+            while remaining:
+                if budget is not None:
+                    budget.check()
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise QueueError("QUEUE_WRITE_FAILED")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if budget is not None:
+            budget.check()
         os.replace(temporary, path)
         try:
             os.chmod(path, 0o600)
@@ -269,33 +336,35 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             if os.name != "nt":
                 raise QueueError("QUEUE_PERMISSION_CHECK_FAILED") from exc
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if temporary.exists() or temporary.is_symlink():
+            safe_unlink(path.parent, temporary, allow_missing=True)
 
 
 def _lock_path(root: Path) -> Path:
     return root / ".queue.lock"
 
 
-def _acquire(root: Path) -> int:
+def _acquire(root: Path, budget=None) -> int:
     lock = _lock_path(root)
     started = time.monotonic()
     while True:
+        if budget is not None:
+            budget.check()
         try:
             return os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except (FileExistsError, PermissionError):
-            if not lock.exists():
-                time.sleep(0.001)
-                continue
+        except PermissionError as exc:
+            raise QueueError("QUEUE_LOCK_PERMISSION_DENIED") from exc
+        except FileExistsError:
+            if time.monotonic() - started >= 5:
+                raise QueueError("QUEUE_LOCK_TIMEOUT")
+            time.sleep(min(0.01, budget.remaining_ms() / 1000) if budget is not None else 0.01)
             try:
                 if time.time() - lock.stat().st_mtime > 120:
                     lock.unlink()
-                    continue
+            except PermissionError as exc:
+                raise QueueError("QUEUE_LOCK_PERMISSION_DENIED") from exc
             except OSError:
                 continue
-            if time.monotonic() - started >= 5:
-                raise QueueError("QUEUE_LOCK_TIMEOUT")
-            time.sleep(0.01)
 
 
 def _release(root: Path, descriptor: int) -> None:
@@ -306,11 +375,16 @@ def _release(root: Path, descriptor: int) -> None:
         return
 
 
-def _read_item(path: Path) -> QueueItem:
+def _read_item(path: Path, budget=None) -> QueueItem:
+    if budget is not None:
+        budget.check()
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        root = path.parents[2] if path.parent.parent.name == "managed" else path.parent
+        value = json.loads(read_entry(root, path, budget=budget))
         return QueueItem.from_dict(value)
-    except (OSError, UnicodeError, json.JSONDecodeError, QueueError) as exc:
+    except TimeoutError:
+        raise
+    except (OSError, UnicodeError, ValueError, QueueError) as exc:
         raise QueueError("QUEUE_ITEM_CORRUPT") from exc
 
 
@@ -366,15 +440,11 @@ def _existing_by_idempotency(root: Path, key: str) -> QueueItem | None:
     return None
 
 
-def _existing_by_source_idempotency(root: Path, key: str, source_host_id: str) -> QueueItem | None:
-    for path in sorted(root.glob("queue_*.json")):
-        try:
-            item = _read_item(path)
-        except QueueError:
-            continue
-        if item.idempotency_key == key and item.source_host_id == source_host_id:
-            return item
-    return None
+def _existing_by_source_idempotency(root: Path, key: str, source_host_id: str, budget=None, replay_id=None) -> QueueItem | None:
+    path = _catalog(root, budget, replay_id=replay_id).find_tag(_tag(key, source_host_id), budget=budget)
+    if path is None or (path.stem == replay_id and not path.exists()):
+        return None
+    return _read_item(path, budget=budget)
 
 
 def _new_queue_id(event_id: str, idempotency_key: str, source_host_id: str = "") -> str:
@@ -413,34 +483,60 @@ def _emergency_limits(settings: Any) -> tuple[int, int, int]:
     return values
 
 
-def write_emergency_envelope(item: QueueItem, settings: Any, *, reason_code: str, now: datetime | None = None) -> Path:
+def _read_emergency(root, path, budget):
+    value = json.loads(read_entry(root, path, budget=budget))
+    if (not isinstance(value, dict) or value.get("schema_version") != 1
+            or value.get("emergency_id") != path.stem
+            or _parse_optional_time(value.get("created_at")) is None
+            or _parse_optional_time(value.get("expires_at")) is None):
+        raise QueueError("EMERGENCY_ENVELOPE_INVALID")
+    QueueItem.from_dict(value["queue_item"])
+    return value
+
+
+def _emergency_catalog(root, budget, replay_id=None):
+    catalog = RuntimeCatalog(root, prefix="emergency_", clean_temporary=lambda path: _cleanup_temporary(root, path, budget))
+    def inspect(path):
+        _read_emergency(root, path, budget)
+        return "queue"  # same body-free queue metadata, separate root/accounting
+    page = catalog.migrate_page(budget=budget, inspect_metadata=inspect)
+    if not page.complete:
+        reservation = catalog.reservation(replay_id, budget=budget) if replay_id else None
+        if not reservation or reservation["phase"] != "writing":
+            raise QueueError("EMERGENCY_INVENTORY_UNKNOWN")
+    return catalog
+
+
+def write_emergency_envelope(item: QueueItem, settings: Any, *, reason_code: str, now: datetime | None = None, budget=None) -> Path:
+    budget = budget if budget is not None else OperationBudget(5000)
+    budget.check()
     root = _emergency_root(settings)
     max_items, max_bytes, ttl = _emergency_limits(settings)
-    files = [path for path in root.glob("emergency_*.json") if path.is_file()]
-    current_bytes = sum(path.stat().st_size for path in files)
-    if len(files) >= max_items:
-        _atomic_json(root / "health.json", {"status": "EMERGENCY_SPOOL_FULL", "items": len(files), "bytes": current_bytes})
-        raise QueueError("EMERGENCY_SPOOL_FULL")
     emergency_id = "emergency_" + hashlib.sha256(f"{item.queue_id}|{item.idempotency_key}".encode("utf-8")).hexdigest()[:32]
-    path = (root / f"{emergency_id}.json").resolve()
-    if not path.is_relative_to(root):
-        raise QueueError("EMERGENCY_PATH_TRAVERSAL")
-    created = _aware(now)
-    envelope = {
-        "schema_version": 1,
-        "emergency_id": emergency_id,
-        "queue_item": item.to_dict(),
-        "reason_code": reason_code,
-        "created_at": _iso(created),
-        "expires_at": _iso(created + timedelta(seconds=ttl)),
-    }
-    encoded_size = len(json.dumps(envelope, ensure_ascii=False, sort_keys=True).encode("utf-8"))
-    if current_bytes + encoded_size > max_bytes:
-        health_path = root / "health.json"
-        _atomic_json(health_path, {"status": "EMERGENCY_SPOOL_FULL", "items": len(files), "bytes": current_bytes})
-        raise QueueError("EMERGENCY_SPOOL_FULL")
-    _atomic_json(path, envelope)
-    return path
+    descriptor = _acquire(root, budget=budget)
+    try:
+        catalog = _emergency_catalog(root, budget, replay_id=emergency_id)
+        reservation = catalog.reservation(emergency_id, budget=budget)
+        path = lookup(root, emergency_id, budget=budget)
+        if path.exists():
+            existing = _read_emergency(root, path, budget)
+            if existing["queue_item"] != item.to_dict():
+                raise QueueError("QUEUE_IDEMPOTENCY_COLLISION")
+            return path
+        created = _parse_optional_time(reservation["created_at"]) if reservation else _aware(now)
+        expires = _parse_optional_time(reservation["expires_at"]) if reservation else created + timedelta(seconds=ttl)
+        envelope = {"schema_version": 1, "emergency_id": emergency_id, "queue_item": item.to_dict(),
+                    "reason_code": reason_code, "created_at": _iso(created), "expires_at": _iso(expires)}
+        encoded = (json.dumps(envelope, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+        if not reservation:
+            count, current_bytes = catalog.capacity("queue", budget=budget)
+            if count >= max_items or current_bytes + len(encoded) > max_bytes:
+                _atomic_json(root / "health.json", {"status": "EMERGENCY_SPOOL_FULL", "items": count, "bytes": current_bytes}, budget=budget)
+                raise QueueError("EMERGENCY_SPOOL_FULL")
+        return catalog.write(emergency_id, encoded, purpose="queue", created_at=_iso(created), expires_at=_iso(expires),
+                             budget=budget, writer=lambda target: _atomic_json(target, envelope, budget=budget))
+    finally:
+        _release(root, descriptor)
 
 
 def enqueue_receipt(
@@ -451,7 +547,12 @@ def enqueue_receipt(
     provider_preference: Sequence[str] | None = None,
     stage: str = "inheritance-gate",
     now: datetime | None = None,
+    capture_id: str | None = None,
+    budget=None,
 ) -> QueueItem:
+    budget = budget if budget is not None else OperationBudget(5000)
+    if budget is not None:
+        budget.check()
     if payload_ref is not None and not isinstance(payload_ref, SpoolRef):
         raise QueueError("QUEUE_PAYLOAD_REF_INVALID")
     fields = _event_fields(event)
@@ -478,26 +579,34 @@ def enqueue_receipt(
         privacy_classification=str(fields["privacy_classification"]),
         source_host_id=str(fields["source_host_id"]),
         source_host_family=str(fields["source_host_family"]),
+        capture_id=capture_id,
     )
     try:
         validate_schema("queue-item", item.to_dict())
     except Exception as exc:
         raise QueueError("QUEUE_ITEM_INVALID") from exc
-    descriptor = _acquire(root)
+    descriptor = _acquire(root, budget=budget)
     try:
-        existing = _existing_by_source_idempotency(root, item.idempotency_key, item.source_host_id)
+        existing = _existing_by_source_idempotency(root, item.idempotency_key, item.source_host_id, budget=budget, replay_id=item.queue_id)
         if existing is not None:
             same_payload = (existing.payload_ref.to_dict() if existing.payload_ref else None) == (item.payload_ref.to_dict() if item.payload_ref else None)
-            same_identity = existing.event_id == item.event_id and existing.source_hash == item.source_hash and existing.host_id == item.host_id and same_payload
+            same_identity = existing.event_id == item.event_id and existing.source_hash == item.source_hash and existing.host_id == item.host_id and existing.capture_id == item.capture_id and same_payload
             if same_identity:
                 return existing
             raise QueueError("QUEUE_IDEMPOTENCY_COLLISION")
-        path = _safe_queue_path(root, item.queue_id)
+        path = _safe_queue_path(root, item.queue_id, budget=budget)
+        reservation = RuntimeCatalog(root, prefix="queue_").reservation(item.queue_id, budget=budget)
+        if reservation and reservation["phase"] == "writing" and not path.exists():
+            if not reservation["created_at"]:
+                raise QueueError("QUEUE_RETRY_TIME_UNKNOWN")
+            item = replace(item, created_at=reservation["created_at"])
         try:
-            _atomic_json(path, item.to_dict())
+            _store(root, item, budget=budget)
+        except TimeoutError:
+            raise
         except (OSError, QueueError) as exc:
             try:
-                emergency_path = write_emergency_envelope(item, settings, reason_code="QUEUE_WRITE_FAILED", now=created)
+                emergency_path = write_emergency_envelope(item, settings, reason_code="QUEUE_WRITE_FAILED", now=created, budget=budget)
             except QueueError as emergency_error:
                 raise QueueError(str(emergency_error)) from exc
             return replace(item, state=QueueState.QUARANTINED, last_error_code=f"EMERGENCY:{emergency_path.name}")
@@ -509,7 +618,7 @@ def enqueue_receipt(
 def list_queue_items(settings: Any, *, include_terminal: bool = True) -> tuple[QueueItem, ...]:
     root = _root(settings)
     result: list[QueueItem] = []
-    for path in sorted(root.glob("queue_*.json")):
+    for path in inventory_paths(root, prefix="queue_"):
         try:
             item = _read_item(path)
         except QueueError:
@@ -519,11 +628,13 @@ def list_queue_items(settings: Any, *, include_terminal: bool = True) -> tuple[Q
     return tuple(result)
 
 
-def read_queue_item(queue_id: str, settings: Any) -> QueueItem:
-    path = _safe_queue_path(_root(settings), queue_id)
+def read_queue_item(queue_id: str, settings: Any, *, budget=None) -> QueueItem:
+    if budget is not None:
+        budget.check()
+    path = _safe_queue_path(_root(settings), queue_id, budget=budget)
     if not path.exists():
         raise QueueError("QUEUE_ITEM_NOT_FOUND")
-    return _read_item(path)
+    return _read_item(path, budget=budget)
 
 
 def _parse_optional_time(value: str | None) -> datetime | None:
@@ -538,49 +649,97 @@ def _parse_optional_time(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def claim_queue_item(worker_id: str, settings: Any, now: datetime | None = None, *, lease_seconds: int = 300) -> QueueItem | None:
+def claim_queue_item(worker_id: str, settings: Any, now: datetime | None = None, *, lease_seconds: int = 300, budget=None, max_records=64) -> QueueItem | None:
+    budget = budget if budget is not None else OperationBudget(5000)
+    if budget is not None:
+        budget.check()
     if not isinstance(worker_id, str) or not worker_id or len(worker_id) > 120:
         raise QueueError("QUEUE_WORKER_INVALID")
     if type(lease_seconds) is not int or lease_seconds <= 0:
         raise QueueError("QUEUE_LEASE_INVALID")
     moment = _aware(now)
     root = _root(settings)
-    descriptor = _acquire(root)
-    try:
-        for path in sorted(root.glob("queue_*.json")):
-            try:
-                item = _read_item(path)
-            except QueueError:
-                continue
-            if item.state in _TERMINAL:
-                continue
-            lease_expiry = _parse_optional_time(item.lease_expires_at)
-            if item.state == QueueState.IN_PROGRESS:
-                if lease_expiry is None or lease_expiry > moment:
+    paths = None
+    cleanup_attempted = False
+    while True:
+        cleanup = None
+        descriptor = _acquire(root, budget=budget)
+        try:
+            if paths is None:
+                catalog = _catalog(root, budget)
+                paths = iter(catalog.page("claim", limit=max_records, budget=budget, advance=False).paths)
+            for path in paths:
+                if budget is not None:
+                    budget.check()
+                try:
+                    item = _read_item(path, budget=budget)
+                except QueueError:
+                    catalog.advance("claim", path.stem, budget=budget)
                     continue
-                item = replace(item, state=QueueState.READY, lease_owner=None, lease_expires_at=None, last_error_code="STALE_LEASE_RECLAIMED")
-            if item.state not in {QueueState.READY, QueueState.DEFERRED, QueueState.FAILED_RETRYABLE}:
-                continue
-            eligible = _parse_optional_time(item.next_eligible_at)
-            if eligible is not None and eligible > moment:
-                continue
-            # A claim is the single durable attempt increment.  Normalize old
-            # multi-provider wire data against the current organizer in the
-            # same atomic write, before exposing IN_PROGRESS to a worker.
-            claimed = replace(
-                item,
-                state=QueueState.IN_PROGRESS,
-                attempts=item.attempts + 1,
-                provider_preference=_provider_preference(settings, item.provider_preference),
-                lease_owner=worker_id,
-                lease_expires_at=_iso(moment + timedelta(seconds=lease_seconds)),
-                last_error_code=None,
+                if not cleanup_attempted and item.state in {QueueState.NO_DISCARDED, QueueState.DONE} and (item.payload_ref or item.validated_result_ref):
+                    eligible = _parse_optional_time(item.next_eligible_at)
+                    if eligible is None or eligible <= moment:
+                        cleanup = item
+                        break
+                if item.state in _TERMINAL:
+                    catalog.advance("claim", path.stem, budget=budget)
+                    continue
+                if item.payload_ref is not None and item.payload_ref.purpose == "pending" and _parse_optional_time(item.payload_ref.expires_at) <= moment:
+                    catalog.advance("claim", path.stem, budget=budget)
+                    continue  # reconciliation records loss before deleting the body
+                lease_expiry = _parse_optional_time(item.lease_expires_at)
+                if item.state in {QueueState.IN_PROGRESS, QueueState.YES_CURATING}:
+                    if lease_expiry is None or lease_expiry > moment:
+                        catalog.advance("claim", path.stem, budget=budget)
+                        continue
+                    item = replace(item, state=QueueState.READY, lease_owner=None, lease_expires_at=None, last_error_code="STALE_LEASE_RECLAIMED")
+                if item.state not in {QueueState.READY, QueueState.DEFERRED, QueueState.FAILED_RETRYABLE}:
+                    catalog.advance("claim", path.stem, budget=budget)
+                    continue
+                eligible = _parse_optional_time(item.next_eligible_at)
+                if eligible is not None and eligible > moment:
+                    catalog.advance("claim", path.stem, budget=budget)
+                    continue
+                # A claim is the single durable attempt increment. Normalize
+                # old provider preferences before exposing an AI work lease.
+                claimed = replace(
+                    item,
+                    state=QueueState.IN_PROGRESS,
+                    attempts=item.attempts + 1,
+                    provider_preference=_provider_preference(settings, item.provider_preference),
+                    lease_owner=worker_id,
+                    lease_expires_at=_iso(moment + timedelta(seconds=lease_seconds)),
+                    last_error_code=None,
+                )
+                _store(root, claimed, budget=budget)
+                catalog.advance("claim", path.stem, budget=budget)
+                return claimed
+            if cleanup is None:
+                return None
+        finally:
+            _release(root, descriptor)
+        # Reuse this scan's iterator after at most one cleanup, outside the
+        # queue lock and before leasing any AI work. A durable cooldown avoids
+        # a failing first NO item monopolizing later calls' cleanup attempts.
+        cleanup_attempted = True
+        try:
+            transition_queue_item(
+                cleanup, cleanup.state, settings, now=moment,
+                reason_code=cleanup.last_error_code,
+                next_eligible_at=moment + timedelta(seconds=300),
+                budget=budget,
             )
-            _atomic_json(path, claimed.to_dict())
-            return claimed
-        return None
-    finally:
-        _release(root, descriptor)
+            descriptor = _acquire(root, budget=budget)
+            try:
+                catalog.advance("claim", cleanup.queue_id, budget=budget)
+            finally:
+                _release(root, descriptor)
+        except TimeoutError:
+            raise
+        except (OSError, QueueError, SpoolError, ValueError):
+            # The durable NO + refs remains the retry evidence; never give it
+            # to the organizer or prevent unrelated READY work from claiming.
+            continue
 
 
 def transition_queue_item(
@@ -591,7 +750,11 @@ def transition_queue_item(
     reason_code: str | None = None,
     *,
     next_eligible_at: datetime | None = None,
+    budget=None,
 ) -> QueueItem:
+    budget = budget if budget is not None else OperationBudget(5000)
+    if budget is not None:
+        budget.check()
     if not isinstance(item, QueueItem):
         raise QueueError("QUEUE_ITEM_INVALID")
     raw_target = str(state)
@@ -601,68 +764,134 @@ def transition_queue_item(
         target = QueueState.FAILED_RETRYABLE
     else:
         target = QueueState(str(state))
-    if target != item.state and target not in _ALLOWED_TRANSITIONS[item.state]:
-        raise QueueError("QUEUE_TRANSITION_INVALID")
     moment = _aware(now)
+    def expiry_of_quarantined(current: QueueItem) -> bool:
+        return (
+            current.state == QueueState.QUARANTINED and target == QueueState.FAILED_NEEDS_ATTENTION
+            and reason_code == "PENDING_EXPIRED" and current.capture_id is not None
+            and current.payload_ref is not None and current.payload_ref.purpose == "pending"
+            and _parse_optional_time(current.payload_ref.expires_at) <= moment
+        )
+    if target != item.state and target not in _ALLOWED_TRANSITIONS[item.state] and not expiry_of_quarantined(item):
+        raise QueueError("QUEUE_TRANSITION_INVALID")
     root = _root(settings)
-    path = _safe_queue_path(root, item.queue_id)
-    descriptor = _acquire(root)
+    path = _safe_queue_path(root, item.queue_id, budget=budget)
+    descriptor = _acquire(root, budget=budget)
     try:
-        current = _read_item(path)
+        current = _read_item(path, budget=budget)
         if current.idempotency_key != item.idempotency_key:
             raise QueueError("QUEUE_IDEMPOTENCY_COLLISION")
+        if target != current.state and target not in _ALLOWED_TRANSITIONS[current.state] and not expiry_of_quarantined(current):
+            raise QueueError("QUEUE_TRANSITION_INVALID")
+        terminal_with_refs = target in {QueueState.NO_DISCARDED, QueueState.DONE} and (current.payload_ref is not None or current.validated_result_ref is not None)
+        cleanup_due = None
+        if terminal_with_refs:
+            cleanup_deadline = next_eligible_at or _parse_optional_time(current.next_eligible_at)
+            cleanup_due = _iso(cleanup_deadline or moment + timedelta(seconds=300))
         updated = replace(
             current,
             state=target,
             provider_preference=_provider_preference(settings, current.provider_preference),
-            next_eligible_at=_iso(next_eligible_at) if next_eligible_at else current.next_eligible_at if target in {QueueState.DEFERRED, QueueState.FAILED_RETRYABLE, QueueState.READY} else None,
-            lease_owner=None if target != QueueState.IN_PROGRESS else current.lease_owner,
-            lease_expires_at=None if target != QueueState.IN_PROGRESS else current.lease_expires_at,
-            last_error_code=reason_code,
+            next_eligible_at=cleanup_due if target in {QueueState.NO_DISCARDED, QueueState.DONE} else _iso(next_eligible_at) if next_eligible_at else current.next_eligible_at if target in {QueueState.DEFERRED, QueueState.FAILED_RETRYABLE, QueueState.READY} else None,
+            lease_owner=current.lease_owner if target in {QueueState.IN_PROGRESS, QueueState.YES_CURATING} else None,
+            lease_expires_at=current.lease_expires_at if target in {QueueState.IN_PROGRESS, QueueState.YES_CURATING} else None,
+            last_error_code=reason_code if reason_code is not None else current.last_error_code if target == current.state and target in {QueueState.NO_DISCARDED, QueueState.DONE} else None,
         )
-        if target == QueueState.NO_DISCARDED and current.payload_ref is not None:
-            delete_spool(current.payload_ref, settings, reason_code="NO_DISCARDED")
-            updated = replace(updated, payload_ref=None)
-        _atomic_json(path, updated.to_dict())
+        _store(root, updated, budget=budget)
+    finally:
+        _release(root, descriptor)
+    if target in {QueueState.NO_DISCARDED, QueueState.DONE}:
+        cleanup_reason = "QUEUE_DONE" if target == QueueState.DONE else "NO_DISCARDED"
+        for field in ("payload_ref", "validated_result_ref"):
+            ref = getattr(updated, field)
+            if ref is None:
+                continue
+            # Terminal state and immutable ownership are durable before the
+            # body delete. A retry may safely repeat a delete whose result was
+            # not checkpointed before interruption.
+            delete_spool(ref, settings, reason_code=cleanup_reason, budget=budget)
+            descriptor = _acquire(root, budget=budget)
+            try:
+                current = _read_item(path, budget=budget)
+                if current.idempotency_key != updated.idempotency_key or current.state != target:
+                    raise QueueError("QUEUE_TERMINAL_CLEANUP_BINDING_INVALID")
+                saved_ref = getattr(current, field)
+                if saved_ref == ref:
+                    remaining = current.payload_ref if field != "payload_ref" else current.validated_result_ref
+                    updated = replace(
+                        current,
+                        **{field: None},
+                        next_eligible_at=_iso(moment + timedelta(seconds=300)) if remaining is not None else None,
+                    )
+                    _store(root, updated, budget=budget)
+                elif saved_ref is None:
+                    updated = current
+                else:
+                    raise QueueError("QUEUE_TERMINAL_CLEANUP_BINDING_INVALID")
+            finally:
+                _release(root, descriptor)
+    return updated
+
+
+def attach_validated_result(item: QueueItem, ref: SpoolRef, settings: Any, *, budget=None) -> QueueItem:
+    budget = budget if budget is not None else OperationBudget(5000)
+    budget.check()
+    if ref.purpose != "validated-result":
+        raise QueueError("QUEUE_RESULT_PURPOSE_INVALID")
+    if item.payload_ref and _parse_optional_time(ref.expires_at) > _parse_optional_time(item.payload_ref.expires_at):
+        raise QueueError("QUEUE_RESULT_EXPIRY_INVALID")
+    root = _root(settings)
+    descriptor = _acquire(root, budget=budget)
+    try:
+        current = _read_item(_safe_queue_path(root, item.queue_id, budget=budget), budget=budget)
+        if current != item or current.state != QueueState.IN_PROGRESS:
+            raise QueueError("QUEUE_RESULT_CLAIM_CHANGED")
+        updated = replace(current, validated_result_ref=ref)
+        _store(root, updated, budget=budget)
         return updated
     finally:
         _release(root, descriptor)
 
 
-def recover_emergency_spool(settings: Any, *, now: datetime | None = None) -> tuple[QueueItem, ...]:
+def recover_emergency_spool(settings: Any, *, now: datetime | None = None, budget=None, max_records=64) -> tuple[QueueItem, ...]:
+    budget = budget if budget is not None else OperationBudget(5000)
+    budget.check()
     moment = _aware(now)
     emergency = _emergency_root(settings)
     root = _root(settings)
     recovered: list[QueueItem] = []
-    descriptor = _acquire(root)
+    # Match enqueue's queue -> emergency lock order. No opposite-order path.
+    descriptor = _acquire(root, budget=budget)
     try:
-        for path in sorted(emergency.glob("emergency_*.json")):
-            try:
-                envelope = json.loads(path.read_text(encoding="utf-8"))
-                if not isinstance(envelope, Mapping):
-                    raise QueueError("EMERGENCY_ENVELOPE_INVALID")
-                expiry = _parse_optional_time(envelope.get("expires_at"))
-                if expiry is not None and expiry <= moment:
-                    path.unlink()
-                    continue
+        emergency_lock = _acquire(emergency, budget=budget)
+        try:
+            catalog = _emergency_catalog(emergency, budget)
+            paths = catalog.page("recovery", limit=max_records, budget=budget, advance=False).paths
+            for path in paths:
+                budget.check()
+                envelope = _read_emergency(emergency, path, budget)
                 item = QueueItem.from_dict(envelope["queue_item"])
-                existing = _existing_by_source_idempotency(root, item.idempotency_key, item.source_host_id)
-                if existing is not None:
-                    path.unlink()
+                if _parse_optional_time(envelope["expires_at"]) > moment:
+                    existing = _existing_by_source_idempotency(root, item.idempotency_key, item.source_host_id, budget=budget, replay_id=item.queue_id)
+                    if existing is not None:
+                        if (existing.event_id, existing.source_hash, existing.capture_id, existing.payload_ref) != (item.event_id, item.source_hash, item.capture_id, item.payload_ref):
+                            raise QueueError("QUEUE_IDEMPOTENCY_COLLISION")
+                    else:
+                        existing = replace(item, provider_preference=_provider_preference(settings, item.provider_preference))
+                        _store(root, existing, budget=budget)
+                    # Queue durable outcome precedes verified deletion and cursor.
+                    catalog.delete(path.stem, budget=budget)
                     recovered.append(existing)
-                    continue
-                target = _safe_queue_path(root, item.queue_id)
-                _atomic_json(target, replace(item, provider_preference=_provider_preference(settings, item.provider_preference)).to_dict())
-                path.unlink()
-                recovered.append(item)
-            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, QueueError):
-                quarantine = emergency / "quarantine"
-                quarantine.mkdir(parents=True, exist_ok=True)
-                target = quarantine / path.name
-                try:
-                    os.replace(path, target)
-                except OSError:
-                    _atomic_json(quarantine / (path.stem + ".json"), {"reason_code": "EMERGENCY_CORRUPT"})
+                else:
+                    catalog.delete(path.stem, budget=budget)
+                catalog.advance("recovery", path.stem, budget=budget)
+        except TimeoutError:
+            raise
+        except (OSError, ValueError, KeyError, QueueError):
+            # Keep original bytes and any reservation charge for safe repair.
+            _atomic_json(emergency / "health.json", {"status": "EMERGENCY_INVENTORY_UNKNOWN"}, budget=budget)
+        finally:
+            _release(emergency, emergency_lock)
         return tuple(recovered)
     finally:
         _release(root, descriptor)
@@ -672,14 +901,14 @@ def queue_health(settings: Any) -> QueueHealth:
     root = _root(settings)
     counts = {state: 0 for state in QueueState}
     corrupt = 0
-    for path in sorted(root.glob("queue_*.json")):
+    for path in inventory_paths(root, prefix="queue_"):
         try:
             item = _read_item(path)
             counts[item.state] += 1
         except QueueError:
             corrupt += 1
     emergency = _emergency_root(settings)
-    emergency_files = [path for path in emergency.glob("emergency_*.json") if path.is_file()]
+    emergency_files = tuple(inventory_paths(emergency, prefix="emergency_"))
     configured = getattr(settings, "organizer", None)
     if hasattr(configured, "to_dict"):
         organizer = configured.to_dict()

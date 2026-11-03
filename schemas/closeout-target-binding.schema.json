@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Closed runtime-only Host target binding. Semantic validation is also enforced by ei.journal.validate_schema(\"closeout-target-binding\", value).",
+  "type": "object",
+  "required": ["schema_version", "capture_id", "identity", "scope_hash", "updated_at"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "capture_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "identity": {
+      "type": "object",
+      "required": ["host_id", "instance_hash", "store_id", "session_hash", "turn_hash", "record_hash"],
+      "properties": {
+        "host_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,159}$"},
+        "instance_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "store_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "session_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "turn_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+        "record_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+      },
+      "additionalProperties": false
+    },
+    "scope_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "updated_at": {"type": "string", "format": "date-time", "pattern": "(?:Z|\\+00:00)$"},
+    "closeout_proofs": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["record_id", "target_set_hash", "content_hash", "binding_digest", "result_digest"],
+        "properties": {
+          "record_id": {"type": "string", "pattern": "^co_[0-9a-f]{64}$"},
+          "target_set_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "content_hash": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "binding_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+          "result_digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"}
+        },
+        "additionalProperties": false
+      },
+      "uniqueItems": true
+    }
+  },
+  "additionalProperties": false
+}

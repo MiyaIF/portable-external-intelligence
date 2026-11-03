@@ -46,6 +46,18 @@
     "skill_roots"
   ],
   "properties": {
+    "capture_capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lifecycle", "candidate_input", "source_enumeration", "receipt_correlation", "direct_user_display"],
+      "properties": {
+        "lifecycle": {"enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN"]},
+        "candidate_input": {"enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN"]},
+        "source_enumeration": {"enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN"]},
+        "receipt_correlation": {"enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN"]},
+        "direct_user_display": {"enum": ["SUPPORTED", "UNSUPPORTED", "UNKNOWN"]}
+      }
+    },
     "schema_version": {"const": 1},
     "host_id": {"type": "string", "pattern": "^(?!codex$|claude$|gemini$|qwen$|codex-cli$|claude-code$|gemini-cli$|qwen-code$|codex-app$)(?!\\.|.*[. ]$)(?!con(?:\\..*)?$|prn(?:\\..*)?$|aux(?:\\..*)?$|nul(?:\\..*)?$|com[1-9](?:\\..*)?$|lpt[1-9](?:\\..*)?$)[a-z0-9][a-z0-9._-]{0,159}$"},
     "display_name": {"type": "string", "minLength": 1, "maxLength": 256},

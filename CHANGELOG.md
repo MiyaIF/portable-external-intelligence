@@ -16,3 +16,5 @@ All notable changes to this project are documented here.
 - Personal knowledge is now explicit, with an optional empty team event store, merged bounded recall, separate status/retention reporting, and offline-deferred team maintenance.
 - Setup reruns are manifest-reconciled and non-destructive: identical selections report `ALREADY_CURRENT`, managed conflicts are preserved, and default update/uninstall retain personal/team data.
 - Real-host activation and longitudinal A/B effect validation remain separate evidence gates.
+- Added an unattended-operation guide and fault-injection acceptance coverage; isolated provider/OS fixtures do not claim real Host, OS-notification, or public-CI verification.
+- Connected registered-adapter closeout to the shared service and maintenance recovery. The local fake-adapter test proves only its explicit fixture targets; existing public adapters remain without native closeout coverage metadata.

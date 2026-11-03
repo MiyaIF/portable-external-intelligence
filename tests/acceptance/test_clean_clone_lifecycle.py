@@ -4,9 +4,12 @@ import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
+import venv
+import zipfile
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +32,52 @@ def _load_certifier():
 
 
 class CleanCloneLifecycleTests(unittest.TestCase):
+    def test_wheel_install_is_not_skipped_due_to_source_egg_info(self) -> None:
+        module = _load_certifier()
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            source = workspace / "source with spaces 日本語"
+            source.mkdir()
+            package = source / "ei"
+            package.mkdir()
+            (package / "__init__.py").write_text("raise RuntimeError('SOURCE_MUST_NOT_LOAD')\n", encoding="utf-8")
+            info = source / "portable_external_intelligence.egg-info"
+            info.mkdir()
+            metadata = "Metadata-Version: 2.1\nName: portable-external-intelligence\nVersion: 1.0.0\n"
+            (info / "PKG-INFO").write_text(metadata, encoding="utf-8")
+            wheel = workspace / "portable_external_intelligence-1.0.0-py3-none-any.whl"
+            dist_info = "portable_external_intelligence-1.0.0.dist-info/"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("ei/__init__.py", "INSTALLED_FIXTURE = True\n")
+                archive.writestr("ei/cli.py", "import argparse\nargparse.ArgumentParser().parse_args()\n")
+                archive.writestr(dist_info + "METADATA", metadata)
+                archive.writestr(dist_info + "WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+                archive.writestr(dist_info + "RECORD", "")
+            venv_root = workspace / "venv"
+            venv.EnvBuilder(with_pip=True).create(venv_root)
+            python = venv_root / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+            environment = {**os.environ, "PYTHONPATH": str(source), "PIP_NO_INDEX": "1", "PIP_CONFIG_FILE": os.devnull}
+            installed = subprocess.run(
+                [str(item) for item in module._package_install_arguments(python, wheel)],
+                cwd=source, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=60,
+            )
+            self.assertEqual(installed.returncode, 0, installed.stderr)
+            imported = subprocess.run(
+                [str(python), "-I", "-B", "-c", "import ei; assert ei.INSTALLED_FIXTURE"],
+                cwd=source, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+            self.assertEqual(imported.returncode, 0, "Wheel was not actually installed: " + imported.stderr)
+            module._verify_installed_package(python, wheel, cwd=source, env=environment, timeout=30)
+            with self.assertRaisesRegex(module.CertificationError, "PACKAGE_IMPORT_FAILED"):
+                module._verify_installed_package(
+                    python, workspace / "portable_external_intelligence-9.9.9-py3-none-any.whl",
+                    cwd=source, env=environment, timeout=30,
+                )
+            site_packages = venv_root / ("Lib/site-packages" if os.name == "nt" else f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages")
+            (site_packages / "ei" / "__init__.py").unlink()
+            with self.assertRaisesRegex(module.CertificationError, "PACKAGE_IMPORT_FAILED"):
+                module._verify_installed_package(python, wheel, cwd=source, env=environment, timeout=30)
+
     def test_failure_output_exposes_only_bounded_path_free_suite_diagnostics(self) -> None:
         module = _load_certifier()
         with tempfile.TemporaryDirectory() as tmp:
@@ -77,7 +126,8 @@ class CleanCloneLifecycleTests(unittest.TestCase):
         self.assertEqual(selected, wheel)
         self.assertEqual(
             module._package_install_arguments(Path("python"), selected),
-            [Path("python"), "-m", "pip", "install", "--disable-pip-version-check", "--no-deps", selected],
+            [Path("python"), "-I", "-B", "-X", "utf8", "-m", "pip", "--isolated", "install",
+             "--disable-pip-version-check", "--no-index", "--no-deps", "--force-reinstall", selected],
         )
 
     def test_certifier_rejects_missing_or_ambiguous_built_wheels(self) -> None:
@@ -259,6 +309,118 @@ class CleanCloneLifecycleTests(unittest.TestCase):
         self.assertIn("--check-only", commands["uninstall_check"])
         self.assertNotIn("--check-only", commands["uninstall_apply"])
         self.assertNotIn("--knowledge-root", commands["doctor_from_manifest"])
+
+    def test_offline_certifier_setup_and_maintenance_never_send_native_notifications(self) -> None:
+        certifier = _load_certifier()
+        from ei.incidents import notification_due, update_incidents
+        from ei.installer import SetupSelection, _settings_for_selection, setup, update
+        from ei.notifications.base import DeliveryResult
+        from ei.operation_health import HealthIssue
+        from ei.operation_activation import ensure_operation_state
+        from ei.operation_runtime import service_operation
+        from tests.unattended_helpers import NOW, make_settings
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            runtime = workspace / "machine runtime 日本語"
+            knowledge = workspace / "private knowledge 日本語"
+            host = workspace / "host home 日本語"
+            host.mkdir()
+            selection = SetupSelection(
+                engine_root=ROOT,
+                personal_knowledge_root=knowledge,
+                runtime_root=runtime,
+                hosts=("codex-cli",),
+                organizer_provider="subscription-cli",
+                organizer_host="codex-cli",
+                host_homes={"codex-cli": host},
+                python_exe=Path(sys.executable),
+                skip_venv=True,
+                non_interactive=True,
+                accept_plan=True,
+            )
+            private_environment = {
+                "APPDATA": str(workspace / "private appdata" / "Roaming"),
+                "LOCALAPPDATA": str(workspace / "private appdata" / "Local"),
+                # Missing OS registration capability keeps this lifecycle fixture away from native helpers.
+                "SystemRoot": "",
+            }
+            policy_path = certifier._seed_offline_operation_policy(workspace, runtime)
+            seeded_policy = policy_path.read_bytes()
+
+            with patch.dict(os.environ, private_environment, clear=False), patch(
+                "builtins.input", side_effect=AssertionError("offline setup or maintenance prompted")
+            ):
+                installed = setup(selection)
+                self.assertTrue(installed.ok, installed.to_dict())
+                self.assertEqual(policy_path.read_bytes(), seeded_policy)
+
+                settings = _settings_for_selection(selection)
+                updated = update(settings)
+                self.assertTrue(updated.ok, updated.to_dict())
+                self.assertEqual(policy_path.read_bytes(), seeded_policy)
+
+                incident = update_incidents(
+                    settings,
+                    (HealthIssue("AUTH_FAILED", "organizer", "error", 1),),
+                    now=NOW,
+                )[0]
+                self.assertTrue(notification_due(incident, channel="os", session_hash=None, now=NOW))
+                with patch(
+                    "ei.notifications.base.send_native_notification",
+                    return_value=DeliveryResult("SENT", "OS_ACCEPTED"),
+                ) as send_native:
+                    serviced = service_operation(settings, now=NOW, channel="maintenance", max_ms=5000)
+                self.assertEqual(serviced["notifications_sent"], 0)
+                send_native.assert_not_called()
+
+            policy = json.loads(policy_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                policy["settings"],
+                {
+                    "notifications": {"enabled": False, "channel": "os"},
+                    "initial_test": {"allow_model_test": False, "allow_notification_test": False},
+                },
+            )
+
+            normal_settings = make_settings(workspace / "normal engine defaults")
+            default_policy, reason = ensure_operation_state(normal_settings)
+            self.assertIsNone(reason)
+            self.assertIsNotNone(default_policy)
+            self.assertIs(default_policy["settings"]["notifications"]["enabled"], True)
+
+    def test_offline_operation_policy_seed_refuses_existing_or_unowned_paths(self) -> None:
+        certifier = _load_certifier()
+        conflicting = json.dumps(
+            {
+                "schema_version": 1,
+                "settings": {
+                    "notifications": {"enabled": True, "channel": "os"},
+                    "initial_test": {"allow_model_test": False, "allow_notification_test": False},
+                },
+                "evidence": {},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        for existing in (b"not-json", conflicting):
+            with self.subTest(existing_state=existing[:12]), tempfile.TemporaryDirectory() as tmp:
+                workspace = Path(tmp).resolve()
+                runtime = workspace / "machine runtime 日本語"
+                runtime.mkdir()
+                policy_path = runtime / "automatic-operation.json"
+                policy_path.write_bytes(existing)
+                with self.assertRaisesRegex(certifier.CertificationError, "CERTIFICATION_OPERATION_POLICY_CONFLICT"):
+                    certifier._seed_offline_operation_policy(workspace, runtime)
+                self.assertEqual(policy_path.read_bytes(), existing)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp).resolve()
+            unowned = workspace.parent / (workspace.name + "-outside-runtime")
+            with self.assertRaisesRegex(certifier.CertificationError, "CERTIFICATION_OPERATION_ROOT_INVALID"):
+                certifier._seed_offline_operation_policy(workspace, unowned)
+            self.assertFalse(unowned.exists())
 
     def test_uninstall_apply_reuses_the_previewed_manifest_digest(self) -> None:
         module = _load_certifier()

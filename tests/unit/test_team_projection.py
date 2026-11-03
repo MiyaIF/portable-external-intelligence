@@ -5,8 +5,10 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from ei.models import Event
+from ei.operation_runtime import OperationBudget
 from ei.team_projection import refresh_team_projection, team_cache_paths
 from ei.team_store import TeamEventScan, append_team_event, initialize_team_store
 
@@ -37,6 +39,20 @@ def team_event(event_id: str, *, claim: str, idempotency: str) -> Event:
 
 
 class TeamProjectionTests(unittest.TestCase):
+    def test_interrupted_scan_preserves_projection_and_cursor_then_retries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            shared = root / "shared"
+            descriptor = initialize_team_store(shared, now=NOW, random_id=lambda: "0123456789abcdef")
+            first = refresh_team_projection(shared, root / "runtime", descriptor.store_id)
+            before = {path: path.read_bytes() for path in (first.index_path, first.cursor_path)}
+            with patch("ei.team_projection.scan_team_events", side_effect=TimeoutError("OPERATION_BUDGET_EXHAUSTED")):
+                with self.assertRaises(TimeoutError):
+                    refresh_team_projection(shared, root / "runtime", descriptor.store_id, budget=OperationBudget(5000))
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+            result = refresh_team_projection(shared, root / "runtime", descriptor.store_id, budget=OperationBudget(5000))
+            self.assertEqual(result.status, "UNCHANGED")
+
     def test_paths_and_projection_are_local_and_rebuildable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

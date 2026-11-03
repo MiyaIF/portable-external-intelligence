@@ -9,6 +9,7 @@ from ei.crypto import CryptoError, decrypt_payload, encrypt_payload
 from ei.key_provider import InMemoryKeyProvider, KeyProviderError
 from ei.spool import SpoolError, delete_spool, read_spool, spool_health, write_spool
 from ei.config import RuntimePaths, Settings
+from ei.runtime_catalog import lookup as runtime_lookup, inventory_paths as runtime_inventory
 
 
 NOW = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -48,12 +49,32 @@ class WrongKeyProvider(InMemoryKeyProvider):
 
 
 class CryptoSpoolTests(unittest.TestCase):
+    def test_pending_aad_authenticates_purpose_capture_and_version(self):
+        key = InMemoryKeyProvider()
+        envelope = encrypt_payload(b"candidate", "pending-test", "private-reusable", NOW + timedelta(days=1), key,
+            created_at=NOW, aad_version=2, purpose="pending", capture_id="sha256:" + "a" * 64)
+        self.assertEqual(decrypt_payload(envelope, key, now=NOW), b"candidate")
+        for changes in ({"purpose": "legacy"}, {"purpose": "validated-result"}, {"aad_version": 1},
+                        {"aad_version": 3}, {"capture_id": "sha256:" + "b" * 64}):
+            with self.subTest(changes=changes), self.assertRaises(CryptoError):
+                decrypt_payload(dict(envelope, **changes), key, now=NOW)
+        downgraded = {k: v for k, v in envelope.items() if k not in {"aad_version", "purpose", "capture_id"}}
+        with self.assertRaises(CryptoError):
+            decrypt_payload(downgraded, key, now=NOW)
+
+    def test_unknown_null_version_and_non_string_purpose_are_rejected(self):
+        key = InMemoryKeyProvider()
+        legacy = encrypt_payload(b"legacy", "old", "public", NOW + timedelta(days=1), key, created_at=NOW)
+        for changes in ({"aad_version": None}, {"purpose": []}):
+            with self.subTest(changes=changes), self.assertRaises(CryptoError):
+                decrypt_payload(dict(legacy, **changes), key, now=NOW)
+
     def test_sensitive_payload_is_encrypted_and_plaintext_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
             key = InMemoryKeyProvider()
             ref = write_spool("candidate claim is durable only in encrypted local spool", "private-reusable", settings, key_provider=key, now=NOW, spool_id="spool-sensitive")
-            path = settings.paths.spool_dir / "spool-sensitive.json"
+            path = runtime_lookup(settings.paths.spool_dir, "spool-sensitive")
             serialized = path.read_text(encoding="utf-8")
             self.assertNotIn("candidate claim", serialized)
             self.assertEqual(read_spool(ref, settings, key_provider=key, now=NOW + timedelta(seconds=1)), b"candidate claim is durable only in encrypted local spool")
@@ -64,7 +85,7 @@ class CryptoSpoolTests(unittest.TestCase):
             settings = make_isolated_hook_settings(Path(tmp))
             with self.assertRaisesRegex(SpoolError, "SPOOL_KEY_UNAVAILABLE"):
                 write_spool("payload that must never be written in plaintext", "private-reusable", settings, key_provider=NoKeyProvider(), now=NOW, spool_id="spool-no-key")
-            self.assertFalse((settings.paths.spool_dir / "spool-no-key.json").exists())
+            self.assertFalse((runtime_lookup(settings.paths.spool_dir, "spool-no-key")).exists())
             quarantine = settings.paths.spool_dir / "quarantine" / "spool-no-key.json"
             self.assertTrue(quarantine.exists())
             self.assertNotIn("payload that must never", quarantine.read_text(encoding="utf-8"))
@@ -82,22 +103,41 @@ class CryptoSpoolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
             ref = write_spool("wrong key must not disclose this", "private-reusable", settings, key_provider=InMemoryKeyProvider("right", b"r" * 32), now=NOW, spool_id="spool-wrong-key")
+            path = runtime_lookup(settings.paths.spool_dir, "spool-wrong-key")
+            original = path.read_bytes()
             with self.assertRaisesRegex(SpoolError, "SPOOL_DECRYPT_FAILED"):
                 read_spool(ref, settings, key_provider=WrongKeyProvider(), now=NOW + timedelta(seconds=1))
-            self.assertFalse((settings.paths.spool_dir / "spool-wrong-key.json").exists())
+            self.assertEqual(path.read_bytes(), original)
+            self.assertFalse((settings.paths.spool_dir / "quarantine" / "spool-wrong-key.json").exists())
+            from ei.runtime_catalog import RuntimeCatalog
+            catalog = RuntimeCatalog(settings.paths.spool_dir)
+            self.assertEqual(catalog.reservation(ref.spool_id)["size"], len(original))
+            self.assertEqual(catalog.capacity("legacy"), (1, len(original)))
+            restored_key = InMemoryKeyProvider("right", b"r" * 32)
+            self.assertEqual(read_spool(ref, settings, key_provider=restored_key, now=NOW + timedelta(seconds=2)), b"wrong key must not disclose this")
+            self.assertEqual(path.read_bytes(), original)
+            write_spool("another candidate", "public", settings, key_provider=restored_key, now=NOW + timedelta(seconds=2))
 
     def test_content_hash_mismatch_quarantines_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             settings = make_isolated_hook_settings(Path(tmp))
             key = InMemoryKeyProvider()
             ref = write_spool("content hash guarded", "private-reusable", settings, key_provider=key, now=NOW, spool_id="spool-hash")
-            path = settings.paths.spool_dir / "spool-hash.json"
+            path = runtime_lookup(settings.paths.spool_dir, "spool-hash")
+            original_size = path.stat().st_size
             envelope = json.loads(path.read_text(encoding="utf-8"))
             envelope["content_sha256"] = "sha256:" + "0" * 64
             path.write_text(json.dumps(envelope), encoding="utf-8")
+            tampered = path.read_bytes()
             with self.assertRaisesRegex(SpoolError, "SPOOL_REF_MISMATCH|SPOOL_DECRYPT_FAILED|SPOOL_AAD"):
                 read_spool(ref, settings, key_provider=key, now=NOW + timedelta(seconds=1))
-            self.assertFalse(path.exists())
+            self.assertEqual(path.read_bytes(), tampered)
+            self.assertTrue((settings.paths.spool_dir / "quarantine" / "spool-hash.json").exists())
+            from ei.runtime_catalog import RuntimeCatalog, CatalogUnknown
+            catalog = RuntimeCatalog(settings.paths.spool_dir)
+            self.assertEqual(catalog.reservation(ref.spool_id)["size"], original_size)
+            with self.assertRaises(CatalogUnknown):
+                catalog.capacity("legacy")
 
     def test_expired_spool_is_deleted_and_unreadable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -106,7 +146,7 @@ class CryptoSpoolTests(unittest.TestCase):
             ref = write_spool("expires", "private-reusable", settings, key_provider=key, now=NOW, ttl_seconds=1, spool_id="spool-expired")
             with self.assertRaisesRegex(SpoolError, "SPOOL_EXPIRED"):
                 read_spool(ref, settings, key_provider=key, now=NOW + timedelta(seconds=2))
-            self.assertFalse((settings.paths.spool_dir / "spool-expired.json").exists())
+            self.assertFalse((runtime_lookup(settings.paths.spool_dir, "spool-expired")).exists())
             self.assertFalse(delete_spool("spool-expired", settings))
 
     def test_spool_paths_are_outside_repository_allowlist(self):
@@ -122,7 +162,7 @@ class CryptoSpoolTests(unittest.TestCase):
             settings = make_isolated_hook_settings(Path(tmp))
             ref = write_spool("private encrypted only", "client-confidential", settings, key_provider=InMemoryKeyProvider(), now=NOW)
             self.assertTrue(ref.encrypted)
-            envelope = json.loads((settings.paths.spool_dir / f"{ref.spool_id}.json").read_text(encoding="utf-8"))
+            envelope = json.loads((runtime_lookup(settings.paths.spool_dir, ref.spool_id)).read_text(encoding="utf-8"))
             self.assertEqual(envelope["algorithm"], "AES-256-GCM")
             self.assertNotIn("private encrypted only", json.dumps(envelope))
 

@@ -22,7 +22,7 @@ def next_eligible_at(now: datetime, retry_after_seconds: int | None, attempt: in
     if retry_after_seconds is not None:
         if type(retry_after_seconds) is not int or retry_after_seconds < 0:
             raise ValueError("RETRY_AFTER_INVALID")
-        delay = retry_after_seconds
+        delay = max(retry_after_seconds, BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)])
     else:
         delay = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
     return moment + timedelta(seconds=delay)

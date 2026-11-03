@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,10 @@ class ClaudeAdapter:
             "unsupported_format": 0,
             "excluded": 0,
         }
+
+    @classmethod
+    def accepts_path(cls, path: Path) -> bool:
+        return path.suffix.casefold() == ".json" and path.name.casefold() in cls._NAMES
 
     @classmethod
     def discover(cls, root: Path) -> Sequence[Path]:
@@ -59,6 +64,11 @@ class ClaudeAdapter:
         after = path.stat()
         if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns:
             raise ValueError("SOURCE_CHANGED_DURING_READ")
+        yield from self.read_verified(path.resolve(), content, before)
+
+    def read_verified(self, source: Path, content: bytes, metadata: os.stat_result) -> Iterable[SourceRecord]:
+        path = Path(source)
+        before = metadata
         document = json.loads(content.decode("utf-8"))
         if not isinstance(document, dict) or document.get("schema_version") != 1:
             raise ValueError("UNSUPPORTED_FORMAT")
@@ -93,7 +103,7 @@ class ClaudeAdapter:
             self.health["parsed"] += 1
             yield SourceRecord(
                 source_kind="claude_stable_memory",
-                source_ref=str(path.resolve()),
+                source_ref=str(path),
                 source_hash=source_hash,
                 observed_at=observed_at,
                 title=title,
@@ -107,6 +117,7 @@ class ClaudeAdapter:
                 provenance_key=f"claude:{entry_id}",
                 source_host_id=self.host_id,
                 source_host_family=self.host_family,
+                stable_record_id=self._text(entry.get("id")) or "",
             )
 
     def iter_records(self, cursor: Mapping[str, Any]) -> Iterable[SourceRecord]:

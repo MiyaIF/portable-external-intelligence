@@ -16,6 +16,7 @@ from .ids import canonical_json
 from .journal import event_integrity, read_event
 from .models import Event
 from .persistable_fields import inspect_event_payload
+from .operation_runtime import _read_json
 from .safe_fs import (
     SafeFilesystemError,
     assert_no_reparse_components,
@@ -71,6 +72,19 @@ _TEAM_PAYLOAD_KEYS = frozenset(
         "classification",
     }
 )
+
+
+def _check(budget):
+    if budget is not None:
+        budget.check()
+
+
+def _checked(items, budget):
+    _check(budget)
+    for item in items:
+        _check(budget)
+        yield item
+    _check(budget)
 
 
 @dataclass(frozen=True)
@@ -162,14 +176,17 @@ def _validate_manifest(value: Mapping[str, Any]) -> TeamStoreDescriptor:
     return TeamStoreDescriptor(Path(), store_id, TEAM_STORE_LAYOUT, TEAM_EVENT_SCHEMA_VERSION, created_at)
 
 
-def inspect_team_store(root: Path | str, *, expected_store_id: str | None = None) -> TeamStoreDescriptor:
+def inspect_team_store(root: Path | str, *, expected_store_id: str | None = None, budget=None) -> TeamStoreDescriptor:
     """Read and validate a shared team root without modifying it."""
 
+    _check(budget)
     raw_root, canonical_root = _safe_root(root, require_exists=True)
     try:
         assert_safe_target(raw_root, raw_root, allow_root=True, allow_missing=False, expected_type="dir")
         manifest_path = assert_safe_target(raw_root, raw_root / TEAM_MANIFEST_NAME, allow_missing=False, expected_type="file")
-        raw_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raw_manifest = _read_json(manifest_path, max_bytes=65536, budget=budget)
+    except TimeoutError:
+        raise
     except (SafeFilesystemError, OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("TEAM_STORE_MANIFEST_INVALID") from exc
     if not isinstance(raw_manifest, Mapping):
@@ -178,7 +195,9 @@ def inspect_team_store(root: Path | str, *, expected_store_id: str | None = None
     if expected_store_id is not None and descriptor.store_id != _validate_store_id(expected_store_id):
         _raise("TEAM_STORE_ID_MISMATCH")
     try:
-        entries = {entry.name: entry for entry in raw_root.iterdir()}
+        entries = {entry.name: entry for entry in _checked(raw_root.iterdir(), budget)}
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise ValueError("TEAM_ROOT_UNAVAILABLE") from exc
     if set(entries) - {TEAM_MANIFEST_NAME, "members"} or "members" not in entries:
@@ -403,7 +422,13 @@ def _materialize_team_event(event: Event) -> tuple[Event, bytes]:
     return checked, (canonical_json(mapping) + b"\n")
 
 
-def _existing_event(target: Path) -> Event:
+def _existing_event(target: Path, *, budget=None) -> Event:
+    _check(budget)
+    if budget is not None:
+        value = _read_json(target, max_bytes=MAX_TEAM_EVENT_BYTES, budget=budget)
+        event = _validate_team_event_mapping(value)
+        _check(budget)
+        return event
     try:
         # Prefer the shared journal reader so ordinary event IDs receive the
         # same privacy/integrity checks as personal events.  The local closed
@@ -416,32 +441,40 @@ def _existing_event(target: Path) -> Event:
         raise ValueError("TEAM_EVENT_EXISTING_INVALID") from exc
 
 
-def append_team_event(root: Path | str, member_id: str, writer_id: str, event: Event) -> Path:
+def append_team_event(root: Path | str, member_id: str, writer_id: str, event: Event, *, budget=None) -> Path:
     """Append one event atomically to a writer shard, preserving collisions."""
 
-    descriptor = inspect_team_store(root)
+    _check(budget)
+    descriptor = inspect_team_store(root, budget=budget)
     member_id = _validate_member_id(member_id)
     writer_id = _validate_writer_id(writer_id)
     materialized, payload = _materialize_team_event(event)
+    _check(budget)
+    if len(payload) > MAX_TEAM_EVENT_BYTES:
+        _raise("TEAM_EVENT_OVERSIZED")
     year, month, day = _event_partition(materialized)
     raw_root = descriptor.root
     target_dir = raw_root / "members" / member_id / "writers" / writer_id / "events" / year / month / day
     try:
+        _check(budget)
         safe_ensure_directory(target_dir, mode=0o700)
         target = assert_safe_target(raw_root, target_dir / f"{materialized.event_id}.json", allow_missing=True)
+    except TimeoutError:
+        raise
     except (SafeFilesystemError, OSError, RuntimeError, ValueError) as exc:
         raise ValueError("TEAM_EVENT_PATH_INVALID") from exc
     expected_hash = event_integrity(materialized)
     if target.exists() or target.is_symlink():
         if target.is_symlink():
             _raise("TEAM_EVENT_PATH_INVALID")
-        existing = _existing_event(target)
+        existing = _existing_event(target, budget=budget)
         if event_integrity(existing) == expected_hash:
             return target
         _raise("TEAM_EVENT_ID_CONFLICT")
 
     temporary = target.parent / f".partial-{uuid.uuid4().hex}"
     try:
+        _check(budget)
         with temporary.open("xb") as stream:
             stream.write(payload)
             stream.flush()
@@ -451,21 +484,22 @@ def append_team_event(root: Path | str, member_id: str, writer_id: str, event: E
         if target.exists() or target.is_symlink():
             if target.is_symlink():
                 _raise("TEAM_EVENT_PATH_INVALID")
-            existing = _existing_event(target)
+            existing = _existing_event(target, budget=budget)
             if event_integrity(existing) == expected_hash:
                 return target
             _raise("TEAM_EVENT_ID_CONFLICT")
+        _check(budget)
         os.replace(temporary, target)
-        verified = _existing_event(target)
+        verified = _existing_event(target, budget=budget)
         if event_integrity(verified) != expected_hash:
             _raise("TEAM_EVENT_WRITE_VERIFY_FAILED")
         return target
-    except ValueError:
+    except (TimeoutError, ValueError):
         raise
     except OSError as exc:
         raise ValueError("TEAM_EVENT_WRITE_FAILED") from exc
     finally:
-        if temporary.exists():
+        if (budget is None or budget.remaining_ms() > 0) and temporary.exists():
             try:
                 safe_unlink(raw_root, temporary, allow_missing=True)
             except SafeFilesystemError:
@@ -489,14 +523,20 @@ def _is_reparse(path: Path) -> bool:
         return True
 
 
-def _listdir(path: Path) -> tuple[list[Path], OSError | None]:
+def _listdir(path: Path, *, budget=None) -> tuple[list[Path], OSError | None]:
     try:
-        return sorted(path.iterdir(), key=lambda item: item.name), None
+        _check(budget)
+        with os.scandir(path) as entries:
+            result = [Path(entry.path) for entry in _checked(entries, budget)]
+        return sorted(result, key=lambda item: item.name), None
+    except TimeoutError:
+        raise
     except OSError as exc:
         return [], exc
 
 
-def _scan_event_file(path: Path, root: Path, events: list[Event], issues: list[Mapping[str, object]]) -> None:
+def _scan_event_file(path: Path, root: Path, events: list[Event], issues: list[Mapping[str, object]], *, budget=None) -> None:
+    _check(budget)
     if _is_reparse(path):
         issues.append(_issue("TEAM_REPARSE_POINT", root, path))
         return
@@ -514,11 +554,13 @@ def _scan_event_file(path: Path, root: Path, events: list[Event], issues: list[M
         if path.stat().st_size > MAX_TEAM_EVENT_BYTES:
             issues.append(_issue("TEAM_EVENT_OVERSIZED", root, path))
             return
-        event = _existing_event(path)
+        event = _existing_event(path, budget=budget)
         if path.stem != event.event_id:
             issues.append(_issue("TEAM_EVENT_FILENAME_MISMATCH", root, path))
             return
         events.append(event)
+    except TimeoutError:
+        raise
     except ValueError as exc:
         code = str(exc)
         if code == "TEAM_EVENT_EXISTING_INVALID":
@@ -530,21 +572,22 @@ def _scan_event_file(path: Path, root: Path, events: list[Event], issues: list[M
         issues.append(_issue("TEAM_EVENT_INVALID", root, path))
 
 
-def scan_team_events(root: Path | str) -> TeamEventScan:
+def scan_team_events(root: Path | str, *, budget=None) -> TeamEventScan:
     """Scan only the allowlisted event layout and retain valid events."""
 
+    _check(budget)
     try:
-        descriptor = inspect_team_store(root)
+        descriptor = inspect_team_store(root, budget=budget)
     except ValueError as exc:
         return TeamEventScan((), ({"code": str(exc), "reason_code": str(exc), "path": "."},))
     root_path = descriptor.root
     events: list[Event] = []
     issues: list[Mapping[str, object]] = []
     members_path = root_path / "members"
-    members, error = _listdir(members_path)
+    members, error = _listdir(members_path, budget=budget)
     if error is not None:
         return TeamEventScan((), (_issue("TEAM_ROOT_UNAVAILABLE", root_path, members_path),))
-    for member_path in members:
+    for member_path in _checked(members, budget):
         if _is_reparse(member_path):
             issues.append(_issue("TEAM_REPARSE_POINT", root_path, member_path))
             continue
@@ -555,11 +598,11 @@ def scan_team_events(root: Path | str) -> TeamEventScan:
         if _is_reparse(writers_path) or not writers_path.is_dir():
             issues.append(_issue("TEAM_LAYOUT_INVALID", root_path, writers_path))
             continue
-        writers, writer_error = _listdir(writers_path)
+        writers, writer_error = _listdir(writers_path, budget=budget)
         if writer_error is not None:
             issues.append(_issue("TEAM_ROOT_UNAVAILABLE", root_path, writers_path))
             continue
-        for writer_path in writers:
+        for writer_path in _checked(writers, budget):
             if _is_reparse(writer_path):
                 issues.append(_issue("TEAM_REPARSE_POINT", root_path, writer_path))
                 continue
@@ -570,37 +613,38 @@ def scan_team_events(root: Path | str) -> TeamEventScan:
             if _is_reparse(events_path) or not events_path.is_dir():
                 issues.append(_issue("TEAM_LAYOUT_INVALID", root_path, events_path))
                 continue
-            year_paths, year_error = _listdir(events_path)
+            year_paths, year_error = _listdir(events_path, budget=budget)
             if year_error is not None:
                 issues.append(_issue("TEAM_ROOT_UNAVAILABLE", root_path, events_path))
                 continue
-            for year_path in year_paths:
+            for year_path in _checked(year_paths, budget):
                 if _is_reparse(year_path) or not year_path.is_dir() or not re.fullmatch(r"[0-9]{4}", year_path.name):
                     issues.append(_issue("TEAM_LAYOUT_INVALID", root_path, year_path))
                     continue
-                month_paths, month_error = _listdir(year_path)
+                month_paths, month_error = _listdir(year_path, budget=budget)
                 if month_error is not None:
                     issues.append(_issue("TEAM_ROOT_UNAVAILABLE", root_path, year_path))
                     continue
-                for month_path in month_paths:
+                for month_path in _checked(month_paths, budget):
                     if _is_reparse(month_path) or not month_path.is_dir() or not re.fullmatch(r"[0-9]{2}", month_path.name):
                         issues.append(_issue("TEAM_LAYOUT_INVALID", root_path, month_path))
                         continue
-                    day_paths, day_error = _listdir(month_path)
+                    day_paths, day_error = _listdir(month_path, budget=budget)
                     if day_error is not None:
                         issues.append(_issue("TEAM_ROOT_UNAVAILABLE", root_path, month_path))
                         continue
-                    for day_path in day_paths:
+                    for day_path in _checked(day_paths, budget):
                         if _is_reparse(day_path) or not day_path.is_dir() or not re.fullmatch(r"[0-9]{2}", day_path.name):
                             issues.append(_issue("TEAM_LAYOUT_INVALID", root_path, day_path))
                             continue
-                        files, file_error = _listdir(day_path)
+                        files, file_error = _listdir(day_path, budget=budget)
                         if file_error is not None:
                             issues.append(_issue("TEAM_ROOT_UNAVAILABLE", root_path, day_path))
                             continue
-                        for path in files:
-                            _scan_event_file(path, root_path, events, issues)
+                        for path in _checked(files, budget):
+                            _scan_event_file(path, root_path, events, issues, budget=budget)
     events.sort(key=lambda item: (item.occurred_at, item.event_id, event_integrity(item)))
+    _check(budget)
     return TeamEventScan(tuple(events), tuple(issues))
 
 

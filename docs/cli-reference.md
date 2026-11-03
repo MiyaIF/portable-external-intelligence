@@ -19,7 +19,7 @@ JSON出力は状態、件数、reason code、hashを返します。プロンプ�
 
 | コマンド | 主な引数 |
 |---|---|
-| `ei setup` | `--repo`/`--engine-root`、`--knowledge-mode local\|github-new\|github-existing`、`--personal-knowledge-root`（`--knowledge-root` alias）、`--runtime-root`、`--work-host`（繰り返し）、`--hosts` alias、`--host-home`、`--host-profile`、`--organizer-provider`、`--organizer-host`、`--team-knowledge-root`/`--team-member-id`/`--no-team-knowledge`、`--sync`/`--no-sync`、`--check-only`、`--non-interactive`、`--accept-plan`、`--json` |
+| `ei setup` | `--repo`/`--engine-root`、`--knowledge-mode local\|github-new\|github-existing`、`--personal-knowledge-root`（`--knowledge-root` alias）、`--runtime-root`、`--work-host`（繰り返し）、`--hosts` alias、`--host-home`、`--host-profile`、`--organizer-provider`、`--organizer-host`、`--team-knowledge-root`/`--team-member-id`/`--no-team-knowledge`、`--sync`/`--no-sync`、`--scheduler`/`--no-scheduler`、`--check-only`、`--non-interactive`、`--accept-plan`、`--json` |
 | `ei update` | `--repo`、`--runtime-root`、`--check-only`、`--target-ref`、`--json` |
 | `ei uninstall` | `--manifest`、`--check-only`、`--confirm-manifest-sha256`、`--restore-config-backup`、`--keep-skills`、`--remove-runtime`、`--remove-queue`、`--remove-spool`、`--remove-runtime-cache`、`--remove-venv`、`--force`、`--json` |
 | `ei doctor` | `--strict`、`--repair-plan`、`--json` |
@@ -41,6 +41,14 @@ JSON出力は状態、件数、reason code、hashを返します。プロンプ�
 `--work-host` は作業と記憶取得の入口を1件以上指定します。`--organizer-provider` は候補を整理するAIを1件だけ指定します。`subscription-cli` の場合は `--organizer-host` も必要です。`--providers` は旧設定の読み取り用で、複数の値から先頭を自動選択しません。
 
 対話画面の入力は `1` または `1,2` のように行います。CLI IDを直接使う非対話では、`--work-host`、`--host-home`、整理AI、必要な `--host-profile`、root、`--accept-plan` をそろえます。
+
+定期処理は `--scheduler` / `--no-scheduler`、Git同期は `--sync` / `--no-sync` で別々に指定します。対話ではそれぞれ確認し、再実行時は既存の選択を既定値にします。新規の既定値は両方とも無効です。
+
+Git・PythonがないPCでは、Python版 `ei setup` ではなく [ネイティブsetupスクリプト](setup.md) から開始します。不足ソフトの導入承認はPowerShellの `-InstallPrerequisites` / shellの `--install-prerequisites` で明示できます。`--accept-plan` は不足ソフトの導入承認にはなりません。
+
+追加の管理アプリは導入しません。macOSはAppleのCommand Line ToolsとPython公式パッケージを使い、利用者による画面操作が必要です。macOSで不足ソフトがある場合、非対話では `--install-prerequisites` があってもGUIを起動せず、対話実行または事前導入を案内します。
+
+setup成功時、または設定を保持した一部失敗時のJSONには、設定結果とは別に `activation` が付きます。`activation.hooks` は実Hook受信、`activation.maintenance` は定期処理の確認結果です。再実行・対話の `r` で更新した現在状態は、この `activation` を参照してください。元の `hosts` / `scheduler` はsetup処理時の結果を保持します。`automatic_operation: UNVERIFIED` は、作業・蓄積・整理・次回取得の一連の実運用をこのsetupでは試験していないことを表します。`--check-only` では追加の状態確認・承認案内を行いません。
 
 互換CLI profileの公開例は架空の `test-compatible-cli` だけです。公開adapter familyを再利用できますが、互換性は自動保証されません。`check-only` と `doctor`、実機receiptを個別に確認します。
 

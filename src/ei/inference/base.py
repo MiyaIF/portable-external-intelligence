@@ -86,6 +86,8 @@ class InferenceBudget:
     candidate_id: str = ""
     purpose: str = "inheritance-gate"
     retry_attempt: int = 0
+    run_id: str = ""
+    attempt_id: str = ""
 
     def __post_init__(self) -> None:
         for name in ("max_input_tokens", "max_output_tokens", "deadline_ms", "max_response_bytes", "retry_attempt"):
@@ -97,6 +99,9 @@ class InferenceBudget:
             raise ValueError("INFERENCE_BUDGET_INVALID:purpose")
         if len(self.candidate_id) > 160:
             raise ValueError("INFERENCE_BUDGET_INVALID:candidate_id")
+        for name in ("run_id", "attempt_id"):
+            if not isinstance(getattr(self, name), str) or len(getattr(self, name)) > 200:
+                raise ValueError(f"INFERENCE_BUDGET_INVALID:{name}")
 
     @classmethod
     def from_value(cls, value: InferenceBudget | Mapping[str, Any] | None) -> "InferenceBudget":
@@ -115,6 +120,8 @@ class InferenceBudget:
             "candidate_id": value.get("candidate_id", ""),
             "purpose": value.get("purpose", cls.purpose),
             "retry_attempt": value.get("retry_attempt", 0),
+            "run_id": value.get("run_id", ""),
+            "attempt_id": value.get("attempt_id", ""),
         }
         return cls(**fields)
 
@@ -134,12 +141,16 @@ class ProviderResult:
     attempt: int = 1
     schema_name: str = ""
     metadata: Mapping[str, Any] = field(default_factory=dict)
+    # Internal router evidence, not provider telemetry or a serialized claim.
+    admission_refused: bool = False
 
     def __post_init__(self) -> None:
         if not self.provider_id or len(self.provider_id) > 100:
             raise ValueError("PROVIDER_RESULT_PROVIDER_ID_INVALID")
         if self.status not in _PROVIDER_STATUSES:
             raise ValueError("PROVIDER_RESULT_STATUS_INVALID")
+        if type(self.admission_refused) is not bool:
+            raise ValueError("PROVIDER_RESULT_ADMISSION_REFUSED_INVALID")
         for name in ("input_tokens", "output_tokens", "attempt"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:

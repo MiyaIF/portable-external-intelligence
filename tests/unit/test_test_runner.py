@@ -135,6 +135,41 @@ class TestRunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "failed")
         self.assertEqual(result.error_code, "PORTABLE_PATH_MISMATCH")
 
+    def test_generic_assertion_failure_reports_safe_case_without_private_details(self) -> None:
+        root = self._module_root()
+        relative = "tests/test_assertion.py"
+        private_detail = f'fixture={root / "sensitive-fixture.txt"} private assertion payload'
+        (root / relative).write_text(
+            "import unittest\n\nclass AssertionTest(unittest.TestCase):\n"
+            "    def test_generic_case_identifier(self):\n"
+            f"        self.fail({private_detail!r})\n",
+            encoding="utf-8",
+        )
+
+        result = run_test_module(
+            TestModule("tests.test_assertion", relative),
+            root,
+            timeout_seconds=2,
+            python_executable=Path(sys.executable),
+            log_dir=root / "logs",
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.tests_run, 1)
+        self.assertEqual(result.error_code, "TEST_ASSERTION_FAILED_TEST_GENERIC_CASE_IDENTIFIER")
+        self.assertLessEqual(len(result.error_code or ""), 120)
+        self.assertNotIn(str(root), result.error_code or "")
+        self.assertNotIn(private_detail, result.error_code or "")
+
+    def test_generic_assertion_fallback_ignores_malformed_or_oversized_case_names(self) -> None:
+        outputs = (
+            b"FAIL: test_bad/name (tests.test_case)\nAssertionError: private details\n",
+            ("FAIL: test_" + "x" * 89 + " (tests.test_case)\nAssertionError: private details\n").encode(),
+        )
+        for output in outputs:
+            with self.subTest(output_prefix=output[:32]):
+                self.assertEqual(test_runner._stable_failure_code(output), "TEST_ASSERTION_FAILED")
+
     def test_missing_dependency_reason_includes_only_the_safe_test_case_name(self) -> None:
         root = self._module_root()
         relative = "tests/test_missing.py"

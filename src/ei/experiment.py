@@ -181,19 +181,21 @@ class ExposureResult:
     protocol_hash: str = ""
 
 
-def _append_legacy_exposure(path: Path, record: ExposureRecord) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _append_legacy_exposure(path: Path, record: ExposureRecord, *, budget=None) -> str:
+    from .measurement_events import _log_lines, _append_log_line
+    if budget is not None:
+        budget.check()
     if path.exists():
-        for line in path.read_text(encoding="utf-8").splitlines():
+        for line in _log_lines(path, budget=budget):
             try:
                 item = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if budget is not None:
+                budget.check()
             if isinstance(item, Mapping) and item.get("exposure_id") == record.exposure_id:
                 return record.exposure_id
-    with path.open("a", encoding="utf-8", newline="\n") as stream:
-        stream.write(json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
-        stream.flush()
+    _append_log_line(path, json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", budget=budget)
     return record.exposure_id
 
 
@@ -245,7 +247,10 @@ def prepare_exposure(
     model_family: str = "unknown",
     task_id_hash: str = "",
     retrieval_latency_ms: int = 0,
+    budget=None,
 ) -> ExposureResult:
+    if budget is not None:
+        budget.check()
     experiment = config or ExperimentConfig(experiment_id=experiment_id)
     if experiment.experiment_id != experiment_id:
         raise ValueError("EXPERIMENT_ID_MISMATCH")
@@ -264,6 +269,7 @@ def prepare_exposure(
             ),
             patterns,
             RetrievalPolicy.defaults(),
+            budget=budget,
         )
         if eligible
         else []
@@ -290,9 +296,11 @@ def prepare_exposure(
         context_injected=bool(context),
     )
     if settings is not None:
-        record_exposure_event(record, settings)
+        record_exposure_event(record, settings, budget=budget)
     if record_path is not None:
-        _append_legacy_exposure(Path(record_path), record)
+        _append_legacy_exposure(Path(record_path), record, budget=budget)
+    if budget is not None:
+        budget.check()
     return ExposureResult(
         variant,
         candidate_ids,

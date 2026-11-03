@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import stat
 import subprocess
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,7 +16,8 @@ from .config import Settings
 from .ids import machine_id
 from .journal import JournalIntegrityError, iter_events, read_event
 from .privacy import PrivacyError, assert_syncable, inspect_text
-from .project import project_events
+from .project import project_events, valid_projection_attributes
+from .operation_runtime import _read_json
 from .remote_assurance import RemoteAssuranceError, assure_remote, load_attestation, normalize_remote
 from .safe_fs import (
     SafeFilesystemError,
@@ -40,6 +44,7 @@ from .sync_policy import (
     managed_path_reason,
     normalize_repo_path,
     path_root,
+    validate_managed_path_config,
 )
 
 
@@ -47,6 +52,62 @@ ENGINE_PREFIXES = ("events/", "knowledge/")
 RETRY_SECONDS = (300, 900, 3600, 21600)
 _MAX_SYNC_FILE_BYTES = 2_000_000
 _DEFAULT_REMOTE_RACE_RETRIES = 2
+
+
+@dataclass
+class _SyncAttempt:
+    budget: object | None
+    push_started: bool = False
+    push_returncode: int | None = None
+    worktree: Path | None = None
+
+
+# Lexically scoped to sync_once; nested calls and other threads do not share a
+# deadline. All internal runners, filesystem loops and finally blocks consult
+# this same original object. No helper constructs a replacement allowance.
+_ATTEMPT = ContextVar("ei_sync_attempt", default=None)
+
+
+def _budget():
+    attempt = _ATTEMPT.get()
+    return attempt.budget if attempt is not None else None
+
+
+def _check(budget=None):
+    active = _budget() if budget is None else budget
+    if active is not None:
+        active.check()
+
+
+def _can_continue():
+    return _budget() is None or _budget().remaining_ms() > 0
+
+
+def _checked(items):
+    _check()
+    for item in items:
+        _check()
+        yield item
+    _check()
+
+
+def _json_file(path, maximum=262144):
+    _check()
+    if _budget() is None:
+        return json.loads(path.read_text(encoding="utf-8"))
+    return _read_json(path, max_bytes=maximum, budget=_budget())
+
+
+def _budget_args():
+    return {"budget": _budget()} if _budget() is not None else {}
+
+
+def _sync_file_bytes(path):
+    _check()
+    if _budget() is None:
+        return path.read_bytes()
+    from .index import _read_projection_bytes
+    return _read_projection_bytes(path, budget=_budget(), maximum=_MAX_SYNC_FILE_BYTES)
 
 
 def _sync_root(settings: Settings) -> Path:
@@ -133,7 +194,7 @@ def _normalize_status_path(value: str) -> str:
 
 def _status_entries(lines: Iterable[str]) -> list[_StatusEntry]:
     entries: list[_StatusEntry] = []
-    for line in lines:
+    for line in _checked(lines):
         if not isinstance(line, str) or not line.strip():
             continue
         if len(line) >= 3 and line[2] == " ":
@@ -174,11 +235,21 @@ def managed_paths(settings: Settings) -> Sequence[str]:
 def build_sync_plan(status_lines: Sequence[str], settings: Settings | None = None) -> SyncPlan:
     """Build a non-mutating plan from porcelain status output."""
 
+    _check()
     if settings is not None:
         defaults_path = Path(settings.paths.engine_root) / "config" / "defaults.json"
         if defaults_path.exists():
             try:
-                configured_managed_paths(Path(settings.paths.engine_root))
+                if _budget() is None:
+                    configured_managed_paths(Path(settings.paths.engine_root))
+                else:
+                    document = _json_file(defaults_path)
+                    sync = document.get("sync", {}) if isinstance(document, Mapping) else None
+                    if not isinstance(sync, Mapping):
+                        raise ValueError("SYNC_DEFAULTS_INVALID")
+                    validate_managed_path_config(sync.get("managed_paths", list(DEFAULT_MANAGED_PATHS)))
+            except TimeoutError:
+                raise
             except (OSError, UnicodeError, ValueError):
                 return SyncPlan(False, "SYNC_POLICY_INVALID", [])
     entries = _status_entries(status_lines)
@@ -190,7 +261,7 @@ def build_sync_plan(status_lines: Sequence[str], settings: Settings | None = Non
     review: list[str] = []
     unsafe: list[str] = []
     journal_mutations: list[str] = []
-    for entry in entries:
+    for entry in _checked(entries):
         root = path_root(entry.path)
         if root in MANAGED_ROOTS and not is_managed_path(entry.path):
             unsafe.append(entry.path)
@@ -228,119 +299,179 @@ def build_sync_plan(status_lines: Sequence[str], settings: Settings | None = Non
 class FileLock:
     """Cross-platform exclusive lock with conservative stale-owner recovery."""
 
-    def __init__(self, path: Path, stale_after_seconds: int = 6 * 60 * 60):
+    def __init__(self, path: Path, stale_after_seconds: int = 6 * 60 * 60, *, budget=None):
         self.path = Path(path)
         self.stale_after_seconds = max(60, int(stale_after_seconds))
         self._fd: int | None = None
         self._token = uuid.uuid4().hex
+        self.operation_budget = budget if budget is not None else _budget()
+        self._identity = None
+        self._stale_identity = None
+
+    def _check(self):
+        if self.operation_budget is not None:
+            self.operation_budget.check()
+
+    def _record(self, *, release=False):
+        from .index import _read_projection_bytes
+        raw = _read_projection_bytes(self.path, maximum=4096, budget=None if release else self.operation_budget)
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("SYNC_LOCK_INVALID")
+        return value
 
     @staticmethod
-    def _pid_alive(pid: object) -> bool:
-        if type(pid) is not int or pid <= 0:
-            return False
-        try:
-            os.kill(pid, 0)
-        except PermissionError:
-            return True
-        except (OSError, ValueError):
-            return False
-        return True
+    def _pid_alive(pid: object) -> bool | None:
+        from .spool import _pid_state
+        return _pid_state(pid)
 
     def _stale(self) -> bool:
+        self._check()
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            try:
-                age = datetime.now(timezone.utc).timestamp() - self.path.stat().st_mtime
-            except OSError:
-                return False
-            return age >= self.stale_after_seconds
+            raw = self._record()
+            info = self.path.stat(follow_symlinks=False)
+            self._stale_identity = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        except TimeoutError:
+            raise
+        except (OSError, UnicodeError, ValueError):
+            return False
         pid = raw.get("pid") if isinstance(raw, Mapping) else None
-        if not self._pid_alive(pid):
-            return True
-        acquired_at = raw.get("acquired_at") if isinstance(raw, Mapping) else None
-        if isinstance(acquired_at, str):
-            try:
-                moment = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
-                return (datetime.now(timezone.utc) - _utc_now(moment)).total_seconds() >= self.stale_after_seconds
-            except ValueError:
-                return False
-        return False
+        return self._pid_alive(pid) is False
 
     def __enter__(self) -> "FileLock":
+        self._check()
         safe_ensure_directory(self.path.parent)
-        try:
-            self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError as exc:
-            if not self._stale():
-                raise RuntimeError("SYNC_LOCK_BUSY") from exc
-            try:
-                safe_unlink(self.path.parent, self.path, allow_missing=True)
-            except SafeFilesystemError as cleanup_error:
-                if cleanup_error.code != "SAFE_PATH_MISSING":
-                    raise RuntimeError(cleanup_error.code) from cleanup_error
-            try:
-                self._fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            except FileExistsError as retry_exc:
-                raise RuntimeError("SYNC_LOCK_BUSY") from retry_exc
+        self._check()
+        assert_safe_target(self.path.parent, self.path, allow_missing=True, expected_type="file")
         payload = {
             "pid": os.getpid(),
             "machine_id": machine_id(),
             "acquired_at": datetime.now(timezone.utc).isoformat(),
             "token": self._token,
         }
+        staging = self.path.with_name(self.path.name + "." + self._token + ".tmp")
+        staging_identity = None
         try:
-            os.write(self._fd, json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-            safe_chmod(self.path.parent, self.path, 0o600)
-        except OSError:
+            self._check()
+            self._fd = os.open(staging, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            info = os.fstat(self._fd)
+            self._identity = (info.st_dev, info.st_ino)
+            staging_identity = self._identity
+            self._check()
+            encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if os.write(self._fd, encoded) != len(encoded):
+                raise OSError("SYNC_LOCK_SHORT_WRITE")
+            self._check()
+            info = staging.stat(follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode) or staging_identity != (info.st_dev, info.st_ino) or info.st_nlink != 1:
+                raise OSError("SYNC_LOCK_STAGING_REPLACED")
+            self._check()
+            try:
+                os.link(staging, self.path)
+            except FileExistsError as exc:
+                if not self._stale():
+                    raise RuntimeError("SYNC_LOCK_BUSY") from exc
+                try:
+                    self._check()
+                    info = self.path.stat(follow_symlinks=False)
+                    if self._stale_identity != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns):
+                        raise RuntimeError("SYNC_LOCK_BUSY")
+                    safe_unlink(self.path.parent, self.path, allow_missing=True)
+                except SafeFilesystemError as cleanup_error:
+                    if cleanup_error.code != "SAFE_PATH_MISSING":
+                        raise RuntimeError(cleanup_error.code) from cleanup_error
+                self._check()
+                try:
+                    os.link(staging, self.path)
+                except FileExistsError as retry_exc:
+                    raise RuntimeError("SYNC_LOCK_BUSY") from retry_exc
+            self._check()
+        except BaseException:
+            acquired = os.fstat(self._fd) if self._fd is not None else None
             if self._fd is not None:
                 os.close(self._fd)
                 self._fd = None
-            try:
-                safe_unlink(self.path.parent, self.path, allow_missing=True)
-            except SafeFilesystemError as cleanup_error:
-                if cleanup_error.code != "SAFE_PATH_MISSING":
-                    raise RuntimeError(cleanup_error.code) from cleanup_error
+            self._release_owned()
+            self._release_staging(staging, acquired, expected_links=1)
             raise
+        acquired = os.fstat(self._fd)
+        os.close(self._fd)
+        self._fd = None
+        self._release_staging(staging, acquired, expected_links=2)
         return self
+
+    def _release_staging(self, staging: Path, acquired, *, expected_links: int) -> None:
+        # The private unpublished name is owned by its acquired descriptor.
+        if acquired is None:
+            return
+        try:
+            assert_safe_target(self.path.parent, staging, allow_missing=False, expected_type="file")
+            info = staging.stat(follow_symlinks=False)
+            if (stat.S_ISREG(info.st_mode) and stat.S_ISREG(acquired.st_mode)
+                    and (info.st_dev, info.st_ino) == (acquired.st_dev, acquired.st_ino)
+                    and info.st_nlink == expected_links):
+                safe_unlink(self.path.parent, staging, allow_missing=True)
+        except (OSError, ValueError):
+            return
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+        self._release_owned()
+
+    def _release_owned(self):
+        # Fixed 4KiB resource-release exception, even after the deadline. Only
+        # this acquired token AND file identity authorize removal; no retries.
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            raw = None
-        if isinstance(raw, Mapping) and raw.get("token") != self._token:
-            return
-        try:
+            raw = self._record(release=True)
+            assert_safe_target(self.path.parent, self.path, allow_missing=False, expected_type="file")
+            info = self.path.stat(follow_symlinks=False)
+            if self._identity != (info.st_dev, info.st_ino) or raw.get("token") != self._token:
+                return
             safe_unlink(self.path.parent, self.path, allow_missing=True)
-        except SafeFilesystemError:
+        except (OSError, UnicodeError, ValueError):
             return
 
 
 class GitRunner:
-    def __init__(self, repo_root: Path):
+    def __init__(self, repo_root: Path, *, budget=None):
+        self.operation_budget = budget if budget is not None else _budget()
+        _check(self.operation_budget)
         self.repo_root = Path(repo_root).resolve()
 
     def run(self, args: Sequence[str]) -> CommandResult:
+        _check(self.operation_budget)
         values = list(args)
         if not values or any(not isinstance(value, str) for value in values):
             raise ValueError("GIT_ARGUMENTS_INVALID")
-        completed = subprocess.run(
-            values,
-            cwd=self.repo_root,
-            capture_output=True,
-            text=True,
-            check=False,
-            shell=False,
-        )
+        options = {}
+        if self.operation_budget is not None:
+            options = {"timeout": self.operation_budget.remaining_ms() / 1000,
+                       "stdin": subprocess.DEVNULL,
+                       "env": {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
+                               "GH_PROMPT_DISABLED": "1", "GIT_ASKPASS": "", "SSH_ASKPASS": "",
+                               "SSH_ASKPASS_REQUIRE": "never"}}
+        try:
+            completed = subprocess.run(values, cwd=self.repo_root, capture_output=True,
+                                       text=True, check=False, shell=False, **options)
+        except subprocess.TimeoutExpired as exc:
+            raise TimeoutError("OPERATION_BUDGET_EXHAUSTED") from exc
+        _check(self.operation_budget)
         return CommandResult(completed.returncode, completed.stdout or "", completed.stderr or "")
 
 
 def _run(runner: GitRunner | object, args: Sequence[str]) -> CommandResult:
+    _check()
+    attempt = _ATTEMPT.get()
+    push = len(args) > 1 and args[0] == "git" and args[1] == "push"
+    if push and attempt is not None:
+        attempt.push_started = True
+        attempt.push_returncode = None
     result = runner.run(args)
+    if push and attempt is not None:
+        attempt.push_returncode = int(getattr(result, "returncode", 1))
+    _check()
     if isinstance(result, CommandResult):
         return result
     return CommandResult(
@@ -396,8 +527,11 @@ def _state_path(settings: Settings) -> Path:
 
 
 def _load_state(settings: Settings) -> dict[str, object]:
+    _check()
     try:
-        value = json.loads(_state_path(settings).read_text(encoding="utf-8"))
+        value = _json_file(_state_path(settings))
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError):
         return {}
     if not isinstance(value, dict):
@@ -406,6 +540,7 @@ def _load_state(settings: Settings) -> dict[str, object]:
 
 
 def _save_state(settings: Settings, values: Mapping[str, object]) -> None:
+    _check()
     path = _state_path(settings)
     safe_ensure_directory(path.parent)
     safe_values = {
@@ -421,6 +556,7 @@ def _save_state(settings: Settings, values: Mapping[str, object]) -> None:
         )
         if key in values
     }
+    _check()
     safe_atomic_write(
         Path(settings.paths.runtime_root),
         path,
@@ -518,6 +654,7 @@ def _blocked_result(
 
 
 def _safe_repo_target(repo_root: Path, relative: str) -> Path:
+    _check()
     normalized = normalize_repo_path(relative)
     root = Path(repo_root).resolve()
     try:
@@ -537,7 +674,12 @@ def _validate_sync_file(repo_root: Path, relative: str, *, allow_missing: bool =
     try:
         if target.stat().st_size > _MAX_SYNC_FILE_BYTES:
             raise PrivacyError("PAYLOAD_TOO_LARGE")
-        content = target.read_text(encoding="utf-8", errors="strict")
+        raw = _sync_file_bytes(target)
+        if relative == "knowledge/.gitattributes" and not valid_projection_attributes(raw):
+            raise PrivacyError("PROJECTION_ATTRIBUTES_CONFLICT")
+        content = raw.decode("utf-8", errors="strict")
+    except TimeoutError:
+        raise
     except UnicodeError as exc:
         raise PrivacyError("SYNC_FILE_ENCODING_INVALID") from exc
     except OSError as exc:
@@ -548,7 +690,9 @@ def _validate_sync_file(repo_root: Path, relative: str, *, allow_missing: bool =
         raise
     if path_root(relative) == "events":
         try:
-            read_event(target)
+            read_event(target, **_budget_args())
+        except TimeoutError:
+            raise
         except (JournalIntegrityError, OSError, UnicodeError, ValueError) as exc:
             raise PrivacyError("EVENT_SCHEMA_INVALID") from exc
     elif target.suffix.casefold() == ".json":
@@ -561,8 +705,8 @@ def _validate_sync_file(repo_root: Path, relative: str, *, allow_missing: bool =
 
 
 def _validate_plan_files(repo_root: Path, entries: Sequence[_StatusEntry], plan: SyncPlan) -> None:
-    by_path = {entry.path: entry for entry in entries}
-    for relative in plan.stage_paths:
+    by_path = {entry.path: entry for entry in _checked(entries)}
+    for relative in _checked(plan.stage_paths):
         entry = by_path.get(relative)
         allow_missing = path_root(relative) == "knowledge"
         target = _safe_repo_target(repo_root, relative)
@@ -628,7 +772,7 @@ def _preflight_git(runner: GitRunner | object, settings: Settings) -> str | None
     cached_result = _run(runner, ["git", "diff", "--cached", "--name-only"])
     if cached_result.returncode != 0:
         return "GIT_INDEX_READ_FAILED"
-    for raw in cached_result.stdout.splitlines():
+    for raw in _checked(cached_result.stdout.splitlines()):
         path = _normalize_status_path(raw)
         if path and not is_managed_path(path):
             return "PREEXISTING_STAGED_UNRELATED_CHANGE"
@@ -649,19 +793,23 @@ def _remote_settings_valid(settings: Settings) -> bool:
 def _remote_url(runner: GitRunner, remote_name: str = "origin") -> str | None:
     if not _valid_git_ref(remote_name):
         return None
-    result = runner.run(["git", "remote", "get-url", remote_name])
+    result = _run(runner, ["git", "remote", "get-url", remote_name])
     if result.returncode != 0 or not result.stdout.strip():
         return None
     return result.stdout.strip().splitlines()[0]
 
 
 def _attestation_for(settings: Settings, fingerprint: str) -> Mapping[str, object] | None:
+    _check()
     directory = Path(settings.paths.runtime_root) / "remote-assurance"
     target = directory / (fingerprint.removeprefix("sha256:") + ".json")
     if not target.is_file():
         return None
     try:
-        return load_attestation(target)
+        if _budget() is None:
+            return load_attestation(target)
+        from .remote_assurance import _validate_assurance_receipt
+        return _validate_assurance_receipt(_json_file(target))
     except RemoteAssuranceError:
         return None
 
@@ -700,6 +848,7 @@ def _remote_assurance_reason(settings: Settings) -> str | None:
             engine_remote=engine_remote,
             attestation=assurance,
             data_classification="private-reusable",
+            **_budget_args(),
         )
     except RemoteAssuranceError as exc:
         return exc.code
@@ -727,7 +876,7 @@ def _cached_paths(runner: GitRunner | object) -> tuple[str, ...] | None:
 
 
 def _stage_and_commit(runner: GitRunner | object, paths: Sequence[str], now: datetime) -> tuple[bool, str, tuple[str, ...], str | None]:
-    for relative in sorted(set(paths)):
+    for relative in _checked(sorted(set(paths))):
         stage_result = _run(runner, ["git", "add", "--", relative])
         if stage_result.returncode != 0:
             return False, "GIT_STAGE_FAILED", tuple(sorted(set(paths))), None
@@ -824,15 +973,18 @@ def _sync_in_place(settings: Settings, runner: GitRunner | object, now: datetime
 
 
 def _worktree_paths(settings: Settings, source_root: Path) -> tuple[Path, Path]:
+    _check()
     runtime = Path(settings.paths.runtime_root).resolve()
     name = "sync-worktree"
     try:
         config_root = Path(settings.paths.engine_root)
-        defaults = json.loads((Path(config_root) / "config" / "defaults.json").read_text(encoding="utf-8"))
+        defaults = _json_file(Path(config_root) / "config" / "defaults.json")
         sync = defaults.get("sync", {}) if isinstance(defaults, Mapping) else {}
         configured = sync.get("worktree_name") if isinstance(sync, Mapping) else None
         if isinstance(configured, str) and configured and configured not in {".", ".."} and "/" not in configured and "\\" not in configured:
             name = configured
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError):
         name = "sync-worktree"
     target = runtime / name
@@ -845,6 +997,7 @@ def _worktree_paths(settings: Settings, source_root: Path) -> tuple[Path, Path]:
 
 
 def _create_worktree(source_runner: GitRunner, settings: Settings) -> tuple[Path, Path]:
+    _check()
     source_root = source_runner.repo_root
     target, ownership = _worktree_paths(settings, source_root)
     runtime = Path(settings.paths.runtime_root).resolve()
@@ -852,15 +1005,18 @@ def _create_worktree(source_runner: GitRunner, settings: Settings) -> tuple[Path
     assert_safe_target(runtime, target.parent, allow_root=True, allow_missing=False, expected_type="dir")
     if target.exists():
         try:
-            record = read_ownership_record(ownership, root=runtime)
+            record = _json_file(ownership) if _budget() is not None else read_ownership_record(ownership, root=runtime)
             validate_ownership_record(record, runtime, target, kind="sync-worktree")
+        except TimeoutError:
+            raise
         except (OSError, UnicodeError, ValueError) as exc:
             raise RuntimeError("SYNC_WORKTREE_OWNERSHIP_UNKNOWN") from exc
         authorities = record.get("authority_roots") if isinstance(record, Mapping) else None
         if not isinstance(authorities, Mapping) or authorities.get("source_root") != str(source_root):
             raise RuntimeError("SYNC_WORKTREE_OWNERSHIP_UNKNOWN")
         try:
-            safe_remove_tree(runtime, target, owner=record, kind="sync-worktree")
+            safe_remove_tree(runtime, target, owner=record, kind="sync-worktree", **_budget_args())
+            _check()
             safe_unlink(runtime, ownership, allow_missing=True)
         except SafeFilesystemError as exc:
             raise RuntimeError(exc.code) from exc
@@ -873,26 +1029,33 @@ def _create_worktree(source_runner: GitRunner, settings: Settings) -> tuple[Path
         kind="sync-worktree",
         authority_roots={"source_root": source_root},
     )
+    _check()
     write_ownership_record(ownership, record, root=runtime)
+    attempt = _ATTEMPT.get()
+    if attempt is not None:
+        attempt.worktree = target
     add_result = _run(source_runner, ["git", "worktree", "add", "--detach", str(target), "HEAD"])
     if add_result.returncode != 0:
         try:
             if target.exists():
-                safe_remove_tree(runtime, target, owner=record, kind="sync-worktree", allow_missing=True)
+                safe_remove_tree(runtime, target, owner=record, kind="sync-worktree", allow_missing=True, **_budget_args())
+            _check()
             safe_unlink(runtime, ownership, allow_missing=True)
         except SafeFilesystemError as cleanup_error:
             raise RuntimeError("SYNC_WORKTREE_CREATE_CLEANUP_FAILED") from cleanup_error
         raise RuntimeError("SYNC_WORKTREE_CREATE_FAILED")
     record = dict(record)
-    record["expected_digest"] = tree_digest(target)
+    record["expected_digest"] = tree_digest(target, **_budget_args())
+    _check()
     write_ownership_record(ownership, record, root=runtime)
     return target, ownership
 
 
 def _cleanup_worktree(source_runner: GitRunner, worktree: Path, ownership: Path) -> str | None:
     try:
+        _check()
         runtime = ownership.parent
-        record = read_ownership_record(ownership, root=runtime)
+        record = _json_file(ownership) if _budget() is not None else read_ownership_record(ownership, root=runtime)
         validate_ownership_record(record, runtime, worktree, kind="sync-worktree")
         authorities = record.get("authority_roots") if isinstance(record, Mapping) else None
         if not isinstance(authorities, Mapping) or authorities.get("source_root") != str(source_runner.repo_root):
@@ -902,19 +1065,23 @@ def _cleanup_worktree(source_runner: GitRunner, worktree: Path, ownership: Path)
             ["git", "worktree", "remove", "--force", str(worktree)],
         )
         if remove_result.returncode != 0 and worktree.exists():
-            safe_remove_tree(runtime, worktree, owner=record, kind="sync-worktree")
+            safe_remove_tree(runtime, worktree, owner=record, kind="sync-worktree", **_budget_args())
         elif worktree.exists():
-            safe_remove_tree(runtime, worktree, owner=record, kind="sync-worktree")
+            safe_remove_tree(runtime, worktree, owner=record, kind="sync-worktree", **_budget_args())
         prune_result = _run(source_runner, ["git", "worktree", "prune"])
         if prune_result.returncode != 0 or worktree.exists():
             return "SYNC_WORKTREE_CLEANUP_FAILED"
+        _check()
         safe_unlink(runtime, ownership, allow_missing=True)
         return None
+    except TimeoutError:
+        raise
     except (OSError, ValueError):
         return "SYNC_WORKTREE_CLEANUP_FAILED"
 
 
 def _recover_owned_worktree(source_runner: GitRunner, settings: Settings) -> str | None:
+    _check()
     worktree, ownership = _worktree_paths(settings, source_runner.repo_root)
     worktree_present = worktree.exists() or worktree.is_symlink()
     ownership_present = ownership.exists() or ownership.is_symlink()
@@ -926,12 +1093,27 @@ def _recover_owned_worktree(source_runner: GitRunner, settings: Settings) -> str
 
 
 def _copy_engine_changes(source_root: Path, worktree_root: Path, paths: Sequence[str]) -> None:
-    for relative in paths:
+    for relative in _checked(paths):
         source = _safe_repo_target(source_root, relative)
         target = _safe_repo_target(worktree_root, relative)
         if source.exists():
             if source.is_symlink() or not source.is_file():
                 raise PrivacyError("SYNC_FILE_NOT_REGULAR")
+            if path_root(relative) == "events" and target.exists():
+                # A normal text checkout can have CRLF while the immutable
+                # source event was serialized with LF. Never rewrite an
+                # existing journal record merely to change that encoding.
+                if read_event(source, **_budget_args()).to_dict() != read_event(target, **_budget_args()).to_dict():
+                    raise PrivacyError("EVENT_JOURNAL_MODIFICATION_FORBIDDEN")
+                continue
+            _check()
+            if _budget() is not None:
+                raw = _sync_file_bytes(source)
+                _check()
+                safe_mkdir(worktree_root, target.parent, parents=True)
+                _check()
+                safe_atomic_write(worktree_root, target, raw)
+                continue
             safe_mkdir(worktree_root, target.parent, parents=True)
             temporary = target.with_name(target.name + f".{os.getpid()}.{uuid.uuid4().hex}.tmp")
             safe_copy_file(source_root, source, worktree_root, temporary)
@@ -939,6 +1121,7 @@ def _copy_engine_changes(source_root: Path, worktree_root: Path, paths: Sequence
         elif path_root(relative) == "knowledge" and target.exists():
             if target.is_symlink() or not target.is_file():
                 raise PrivacyError("SYNC_FILE_NOT_REGULAR")
+            _check()
             safe_unlink(worktree_root, target)
         elif path_root(relative) == "events":
             raise PrivacyError("EVENT_FILE_MISSING")
@@ -961,7 +1144,10 @@ def _fetch_and_rebase(worktree_runner: GitRunner, settings: Settings) -> tuple[s
 
 def _project_and_commit(worktree_root: Path, worktree_runner: GitRunner, settings: Settings, now: datetime) -> tuple[str, tuple[str, ...], str | None]:
     try:
-        project_events(iter_events(worktree_root / "events"), worktree_root / "knowledge")
+        _check()
+        project_events(iter_events(worktree_root / "events", **_budget_args()), worktree_root / "knowledge", **_budget_args())
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, ValueError, JournalIntegrityError) as exc:
         return "PROJECTION_FAILED", (), type(exc).__name__
     plan, entries, _ = _validated_status(worktree_runner, settings)
@@ -979,28 +1165,67 @@ def _project_and_commit(worktree_root: Path, worktree_runner: GitRunner, setting
     return reason, staged, sha
 
 
-def _reconcile_source_after_push(source_runner: GitRunner, settings: Settings, commit_sha: str | None, paths: Sequence[str]) -> None:
-    """Fast-forward the source checkout when the pushed commit contains its local engine files."""
-    if not commit_sha:
-        return
-    status = _run(source_runner, ["git", "status", "--porcelain", "--untracked-files=all"])
-    entries = {entry.path: entry for entry in _status_entries(status.stdout.splitlines())} if status.returncode == 0 else {}
-    for relative in paths:
-        entry = entries.get(relative)
-        if entry is None or entry.xy != "??":
-            continue
-        target = _safe_repo_target(source_runner.repo_root, relative)
-        shown = _run(source_runner, ["git", "show", f"{commit_sha}:{relative}"])
-        if shown.returncode == 0 and target.is_file() and target.read_bytes() == shown.stdout.encode("utf-8"):
-            safe_unlink(source_runner.repo_root, target, allow_missing=True)
-    if _remote_assurance_reason(settings):
-        return
-    fetch = _run(source_runner, ["git", "fetch", str(settings.sync_remote)])
-    if fetch.returncode != 0:
-        return
+def _reconcile_source_after_push(source_runner: GitRunner, settings: Settings, commit_sha: str | None, paths: Sequence[str]) -> bool:
+    """Keep source bytes until an exact, already-remote commit can fast-forward.
+
+    Staging identical managed blobs is recoverable across interruption. Never
+    delete an untracked body to make Git accept an otherwise unsafe merge.
+    """
+    if not isinstance(commit_sha, str) or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", commit_sha) is None:
+        return False
+    allowed = set(paths)
+    if any(not is_managed_path(path) for path in _checked(allowed)):
+        return False
+    if _preflight_git(source_runner, settings) or _remote_assurance_reason(settings):
+        return False
+    if _run(source_runner, ["git", "fetch", str(settings.sync_remote)]).returncode != 0:
+        return False
     remote_ref = f"refs/remotes/{settings.sync_remote}/{settings.sync_branch}"
-    if _run(source_runner, ["git", "rev-parse", "--verify", remote_ref]).returncode == 0:
-        _run(source_runner, ["git", "merge", "--ff-only", f"{settings.sync_remote}/{settings.sync_branch}"])
+    for args in (["cat-file", "-e", f"{commit_sha}^{{commit}}"],
+                 ["merge-base", "--is-ancestor", commit_sha, remote_ref],
+                 ["merge-base", "--is-ancestor", "HEAD", commit_sha]):
+        if _run(source_runner, ["git", *args]).returncode != 0:
+            return False
+
+    def checked_entries():
+        plan, entries, status = _validated_status(source_runner, settings)
+        if status.returncode != 0 or (not plan.allowed and plan.reason_code != "NO_ENGINE_CHANGES"):
+            return None
+        if any(entry.path not in allowed or entry.original_path is not None for entry in _checked(entries)):
+            return None
+        return entries
+
+    def matches(entry):
+        relative = entry.path
+        target = _safe_repo_target(source_runner.repo_root, relative)
+        expected = _run(source_runner, ["git", "rev-parse", "--verify", f"{commit_sha}:{relative}"])
+        if not target.exists():
+            return path_root(relative) == "knowledge" and expected.returncode != 0 and "D" in entry.xy
+        _validate_sync_file(source_runner.repo_root, relative)
+        if expected.returncode != 0:
+            return False
+        raw = _run(source_runner, ["git", "hash-object", "--no-filters", "--", relative])
+        if raw.returncode != 0 or raw.stdout.strip() != expected.stdout.strip():
+            return False
+        if entry.xy[0] not in {" ", "?"}:
+            cached = _run(source_runner, ["git", "rev-parse", "--verify", f":{relative}"])
+            if cached.returncode != 0 or cached.stdout.strip() != expected.stdout.strip():
+                return False
+        return True
+
+    entries = checked_entries()
+    if entries is None or any(not matches(entry) for entry in _checked(entries)):
+        return False
+    for entry in _checked(entries):
+        if not matches(entry) or _run(source_runner, ["git", "add", "--", entry.path]).returncode != 0:
+            return False
+    # Recheck the complete status and staged blobs after staging, so a newly
+    # introduced unrelated or different staged change is never carried along.
+    final = checked_entries()
+    if final is None or any(not matches(entry) for entry in _checked(final)):
+        return False
+    merged = _run(source_runner, ["git", "merge", "--ff-only", commit_sha])
+    return merged.returncode == 0 and _commit_sha(source_runner) == commit_sha
 
 
 def _sync_dedicated_worktree(settings: Settings, now: datetime) -> SyncResult:
@@ -1057,7 +1282,9 @@ def _sync_dedicated_worktree(settings: Settings, now: datetime) -> SyncResult:
             result = _blocked_result(settings, reason, now, output=sha or reason, staged=staged, worktree_path=str(worktree))
             return result
         if reason in {"NO_ENGINE_CHANGES", "NO_STAGED_CHANGES"}:
-            result = SyncResult(True, "NO_ENGINE_CHANGES", staged_paths=staged, commit_sha=sha, worktree_path=str(worktree))
+            sha = sha or _commit_sha(worktree_runner)
+            reconciled = _reconcile_source_after_push(source_runner, settings, sha, plan.stage_paths)
+            result = SyncResult(reconciled, "NO_ENGINE_CHANGES" if reconciled else "SYNC_SOURCE_RECONCILIATION_PENDING", staged_paths=staged, commit_sha=sha, worktree_path=str(worktree))
             _record_state(settings, result, now)
             return result
         if reason != "COMMITTED":
@@ -1066,14 +1293,16 @@ def _sync_dedicated_worktree(settings: Settings, now: datetime) -> SyncResult:
 
         max_races = _DEFAULT_REMOTE_RACE_RETRIES
         try:
-            defaults = json.loads((Path(settings.paths.engine_root) / "config" / "defaults.json").read_text(encoding="utf-8"))
+            defaults = _json_file(Path(settings.paths.engine_root) / "config" / "defaults.json")
             sync = defaults.get("sync", {}) if isinstance(defaults, Mapping) else {}
             configured = sync.get("remote_race_retries") if isinstance(sync, Mapping) else None
             if type(configured) is int and 0 <= configured <= 5:
                 max_races = configured
+        except TimeoutError:
+            raise
         except (OSError, UnicodeError, json.JSONDecodeError):
             max_races = _DEFAULT_REMOTE_RACE_RETRIES
-        for remote_attempt in range(max_races + 1):
+        for remote_attempt in _checked(range(max_races + 1)):
             assurance_reason = _remote_assurance_reason(settings)
             if assurance_reason:
                 result = _blocked_result(settings, assurance_reason, now, staged=staged, commit_sha=sha, remote_attempt=remote_attempt, worktree_path=str(worktree))
@@ -1081,8 +1310,8 @@ def _sync_dedicated_worktree(settings: Settings, now: datetime) -> SyncResult:
             push_result = _run(worktree_runner, ["git", "push", str(settings.sync_remote), f"HEAD:refs/heads/{settings.sync_branch}"])
             if push_result.returncode == 0:
                 pushed_sha = _commit_sha(worktree_runner) or sha
-                _reconcile_source_after_push(source_runner, settings, pushed_sha, plan.stage_paths)
-                result = SyncResult(True, "SYNCED", staged_paths=staged, commit_sha=pushed_sha, remote_attempt=remote_attempt, worktree_path=str(worktree))
+                reconciled = _reconcile_source_after_push(source_runner, settings, pushed_sha, plan.stage_paths)
+                result = SyncResult(reconciled, "SYNCED" if reconciled else "SYNC_SOURCE_RECONCILIATION_PENDING", staged_paths=staged, commit_sha=pushed_sha, remote_attempt=remote_attempt, worktree_path=str(worktree), preflight={"push_started": True, "push_returncode": 0, "source_reconciled": reconciled})
                 _record_state(settings, result, now)
                 return result
             conflict = classify_git_conflict(push_result.stdout + "\n" + push_result.stderr)
@@ -1115,17 +1344,19 @@ def _sync_dedicated_worktree(settings: Settings, now: datetime) -> SyncResult:
             return result
         result = _offline_result(settings, staged, "GIT_PUSH_RACE", now, commit_sha=sha, remote_attempt=max_races, worktree_path=str(worktree), output="REMOTE_RACE_RETRY_EXHAUSTED")
         return result
+    except TimeoutError:
+        raise
     except (OSError, RuntimeError, ValueError, PrivacyError) as exc:
         result = _blocked_result(settings, "SYNC_IO_FAILED", now, output=type(exc).__name__, worktree_path=str(worktree) if worktree else None)
         return result
     finally:
-        if worktree is not None and ownership is not None:
+        if worktree is not None and ownership is not None and _can_continue():
             cleanup_error = _cleanup_worktree(source_runner, worktree, ownership)
             if cleanup_error and (result is None or result.ok):
                 raise RuntimeError(cleanup_error)
 
 
-def sync_once(settings: Settings, now: datetime | object | None = None, runner: GitRunner | object | None = None) -> SyncResult:
+def _sync_once(settings: Settings, now: datetime | object | None = None, runner: GitRunner | object | None = None) -> SyncResult:
     """Perform one bounded, privacy-checked synchronization attempt."""
 
     if runner is None and now is not None and not isinstance(now, datetime) and hasattr(now, "run"):
@@ -1133,12 +1364,15 @@ def sync_once(settings: Settings, now: datetime | object | None = None, runner: 
         now = None
     moment = _utc_now(now if isinstance(now, datetime) else None)
     try:
+        _check()
         with FileLock(settings.paths.locks_dir / "sync.lock"):
             if runner is not None:
                 return _sync_in_place(settings, runner, moment)
             if not bool(getattr(settings, "sync_enabled", False)):
                 return _sync_in_place(settings, GitRunner(_sync_root(settings)), moment)
             return _sync_dedicated_worktree(settings, moment)
+    except TimeoutError:
+        raise
     except RuntimeError as exc:
         result = SyncResult(False, str(exc), output=str(exc))
         if str(exc) != "SYNC_LOCK_BUSY":
@@ -1148,6 +1382,21 @@ def sync_once(settings: Settings, now: datetime | object | None = None, runner: 
         result = SyncResult(False, "SYNC_IO_FAILED", output=type(exc).__name__)
         _record_state(settings, result, moment)
         return result
+
+
+def sync_once(settings: Settings, now: datetime | object | None = None, runner: GitRunner | object | None = None, *, budget=None) -> SyncResult:
+    attempt = _SyncAttempt(budget)
+    token = _ATTEMPT.set(attempt)
+    try:
+        return _sync_once(settings, now, runner)
+    except TimeoutError:
+        reason = "SYNC_SOURCE_RECONCILIATION_PENDING" if attempt.push_returncode == 0 else "SYNC_REMOTE_OUTCOME_UNKNOWN" if attempt.push_started else "SYNC_BUDGET_EXHAUSTED"
+        return SyncResult(False, reason,
+                          worktree_path=str(attempt.worktree) if attempt.worktree else None,
+                          preflight={"push_started": attempt.push_started, "push_returncode": attempt.push_returncode,
+                                     "recovery_pending": attempt.worktree is not None})
+    finally:
+        _ATTEMPT.reset(token)
 
 
 __all__ = [

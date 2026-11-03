@@ -421,11 +421,14 @@ def certify_host(
     mode: str,
     settings: Any,
     *,
+    allow_version_probe: bool = True,
     now: datetime | None = None,
     os_family: str | None = None,
     os_version: str | None = None,
     os_profile: str | None = None,
 ) -> CertificationResult:
+    if type(allow_version_probe) is not bool:
+        raise TypeError("CERTIFICATION_VERSION_PROBE_BOOLEAN_REQUIRED")
     try:
         host = canonical_host_id(host_id)
         get_adapter(host)
@@ -451,7 +454,7 @@ def certify_host(
             host_version="fixture",
         )
     observed, host_version, found_real = _read_real_events(host, instance, settings, timestamp)
-    if host_version in {"", "unknown"}:
+    if allow_version_probe and host_version in {"", "unknown"}:
         host_version = _official_host_version(host, settings)
     reasons: list[str] = []
     try:

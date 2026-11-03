@@ -17,7 +17,10 @@ from ei.remote_assurance import build_remote_assurance_receipt, classify_remote,
 from ei.skill_installer import canonical_tree_hash
 
 
-class FreshPcRestoreTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class FreshPcRestoreTests(NotificationIsolationMixin, unittest.TestCase):
     def test_isolated_profile_install_doctor_and_hook_paths_are_portable(self) -> None:
         source_repo = Path.cwd().resolve()
         with tempfile.TemporaryDirectory(prefix="ei-fresh-profile-") as tmp:
@@ -45,15 +48,20 @@ class FreshPcRestoreTests(unittest.TestCase):
                 (home / context_name).write_text(f"# user {host_id}\n", encoding="utf-8")
             knowledge = root / "private knowledge 日本語"
             runtime = root / "machine runtime 日本語"
-            environment = {
-                **os.environ,
-                "PYTHONPATH": str(clone / "src"),
+            environment = self.notification_child_environment(engine_root=clone)
+            child_profile_environment = {
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "CODEX_HOME": str(homes["codex-cli"]),
                 "CLAUDE_CONFIG_DIR": str(homes["claude-code"]),
                 "GEMINI_HOME": str(homes["gemini-cli"]),
                 "QWEN_HOME": str(homes["qwen-code"]),
             }
+            environment.update(child_profile_environment)
+            setup_environment = self.notification_child_environment(
+                engine_root=clone,
+                allow_notification_helper=True,
+            )
+            setup_environment.update(child_profile_environment)
             setup_args = [
                 sys.executable,
                 "-B",
@@ -81,7 +89,7 @@ class FreshPcRestoreTests(unittest.TestCase):
             ]
             for host_id, home in homes.items():
                 setup_args.extend(("--hosts", host_id, "--host-home", f"{host_id}={home}"))
-            setup = subprocess.run(setup_args, cwd=clone, env=environment, capture_output=True, text=True)
+            setup = subprocess.run(setup_args, cwd=clone, env=setup_environment, capture_output=True, text=True)
             self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
             result = json.loads(setup.stdout)
             self.assertTrue(result["ok"], result)
@@ -128,6 +136,7 @@ class FreshPcRestoreTests(unittest.TestCase):
         runtime = root / "runtime"
         home = root / "home"
         home.mkdir()
+        self.notification_isolation.allow_notification_helper()
         result = setup_engine(
             SetupSelection(
                 engine_root=engine,

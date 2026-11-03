@@ -97,7 +97,12 @@ def _atomic_json(path: Path, value: Mapping[str, Any]) -> None:
             temporary.unlink()
 
 
-def _runtime_path(settings: Settings, name: str) -> Path:
+def _runtime_path(settings: Settings, name: str, *, budget=None) -> Path:
+    if budget is not None:
+        from .safe_fs import assert_no_reparse_components
+        budget.check()
+        assert_no_reparse_components(Path(settings.paths.runtime_dir).expanduser())
+        budget.check()
     root = Path(settings.paths.runtime_dir).expanduser().resolve()
     repo = Path(settings.paths.engine_root).expanduser().resolve()
     if root == repo or root.is_relative_to(repo):
@@ -135,9 +140,22 @@ def _hash_tree(settings: Settings) -> str:
     return _hash_json({"files": files}) if files else ""
 
 
-def _template_hash(settings: Settings, host_id: str) -> str:
+def _template_hash(settings: Settings, host_id: str, *, budget=None) -> str:
     try:
+        if budget is not None:
+            from .safe_fs import _file_digest, assert_safe_target, assert_no_reparse_components
+            budget.check()
+            assert_no_reparse_components(Path(settings.paths.engine_root))
+            budget.check()
+            path = _template_path(settings, host_id)
+            assert_safe_target(path.parent, path, allow_missing=True, expected_type="file")
+            if not path.exists():
+                budget.check()
+                return ""
+            return _file_digest(path, budget=budget)
         return _hash_bytes(_template_path(settings, host_id).read_bytes())
+    except TimeoutError:
+        raise
     except OSError:
         return ""
 
@@ -238,7 +256,9 @@ class CertificationReceipt:
             raise ValueError("CANARY_RECEIPT_INVALID") from exc
 
     @classmethod
-    def from_event(cls, event: NormalizedHookEvent, settings: Settings, mode: CertificationMode | None = None) -> "CertificationReceipt":
+    def from_event(cls, event: NormalizedHookEvent, settings: Settings, mode: CertificationMode | None = None, *, budget=None) -> "CertificationReceipt":
+        if budget is not None:
+            budget.check()
         event_hash = _hash_json(event.to_dict())
         spec = _host_spec(event.host_id, settings)
         selected = mode or str(os.environ.get("EI_CANARY_MODE", "real"))
@@ -248,7 +268,7 @@ class CertificationReceipt:
             host_id=event.host_id, host_instance_id=event.host_instance_id, mode=selected,
             host_version=str(os.environ.get("EI_HOST_VERSION", "unknown")), event_receipt_hashes={event.normalized_event_name: event_hash},
             skill_activation_mode=spec.skill_activation_mode if spec.skill_activation_mode in _ALLOWED_ACTIVATION_MODES else "UNAVAILABLE",
-            hook_template_hash=_template_hash(settings, event.host_id), source_skill_hash="",
+            hook_template_hash=_template_hash(settings, event.host_id, budget=budget), source_skill_hash="",
             started_at=event.received_at, completed_at=event.received_at,
         )
 
@@ -503,35 +523,53 @@ def static_canary(host_id: str, host_instance_id: str, settings: Settings) -> St
         return StaticCanaryResult(canonical, str(host_instance_id), False, "UNKNOWN", "", "", "", {}, (type(exc).__name__,))
 
 
-def _read_receipts(settings: Settings) -> tuple[CertificationReceipt, ...]:
-    path = _runtime_path(settings, "canary-receipts.jsonl")
+def _read_receipts(settings: Settings, *, budget=None) -> tuple[CertificationReceipt, ...]:
+    if budget is not None:
+        budget.check()
+    path = _runtime_path(settings, "canary-receipts.jsonl", budget=budget)
     if not path.exists():
         return ()
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        from .measurement_events import _log_lines
+        lines = _log_lines(path, budget=budget) if budget is not None else path.read_text(encoding="utf-8").splitlines()
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError):
         return ()
     result: list[CertificationReceipt] = []
     for line in lines:
+        if budget is not None:
+            budget.check()
         try:
             value = json.loads(line)
             if isinstance(value, Mapping) and value.get("record_type") in {None, "hook_canary"}:
                 result.append(CertificationReceipt.from_mapping(value))
         except (json.JSONDecodeError, TypeError, ValueError, UnicodeError):
             continue
+    if budget is not None:
+        budget.check()
     return tuple(result)
 
 
-def record_canary(receipt: CertificationReceipt, settings: Settings) -> None:
+def record_canary(receipt: CertificationReceipt, settings: Settings, *, budget=None) -> None:
+    if budget is not None:
+        budget.check()
     if not isinstance(receipt, CertificationReceipt):
         raise TypeError("CANARY_RECEIPT_REQUIRED")
     data = receipt.to_dict()
     data["record_type"] = "hook_canary"
     data["recorded_at"] = _iso(None)
     identity = (data["receipt_id"], data["artifact_hash"])
-    if any((row.to_dict().get("receipt_id"), row.to_dict().get("artifact_hash")) == identity for row in _read_receipts(settings)):
-        return
-    _append_jsonl(_runtime_path(settings, "canary-receipts.jsonl"), data)
+    for row in _read_receipts(settings, budget=budget):
+        if budget is not None:
+            budget.check()
+        if (row.to_dict().get("receipt_id"), row.to_dict().get("artifact_hash")) == identity:
+            return
+    if budget is None:
+        _append_jsonl(_runtime_path(settings, "canary-receipts.jsonl"), data)
+    else:
+        from .measurement_events import _append_log_line
+        _append_log_line(_runtime_path(settings, "canary-receipts.jsonl", budget=budget), json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n", budget=budget)
 
 
 def record_skill_discovery(host_id: str, host_instance_id: str, status: SkillDiscoveryStatus, settings: Settings, *, source_skill_hash: str = "", observed_at: datetime | str | None = None) -> None:
@@ -592,7 +630,7 @@ def _write_status_snapshot(settings: Settings, status: Mapping[str, Any]) -> Non
     _atomic_json(path, updated)
 
 
-def read_hook_status(host_id: str, host_instance_id: str, settings: Settings):
+def read_hook_status(host_id: str, host_instance_id: str, settings: Settings, *, persist=True):
     from .hook_status import HookStatus
     canonical = canonical_host_id(host_id)
     static = static_canary(canonical, str(host_instance_id), settings)
@@ -648,12 +686,13 @@ def read_hook_status(host_id: str, host_instance_id: str, settings: Settings):
         status = "INSTRUCTION_FALLBACK"
         reasons.append("INSTRUCTION_FALLBACK_ACTIVE")
     result = HookStatus(canonical, str(host_instance_id), status, skill, spec.skill_activation_mode, spec.capture_primary_path, tuple(dict.fromkeys(reasons)), static.to_dict(), tuple(sorted(current)), _iso(last_received) if last_received else None)
-    _write_status_snapshot(settings, result.to_dict())
+    if persist:
+        _write_status_snapshot(settings, result.to_dict())
     return result
 
 
-def build_canary_receipt_from_event(event: NormalizedHookEvent, settings: Settings, mode: CertificationMode | None = None) -> CertificationReceipt:
-    return CertificationReceipt.from_event(event, settings, mode)
+def build_canary_receipt_from_event(event: NormalizedHookEvent, settings: Settings, mode: CertificationMode | None = None, *, budget=None) -> CertificationReceipt:
+    return CertificationReceipt.from_event(event, settings, mode, budget=budget)
 
 
 def certify_host(host_id: str, host_instance_id: str, mode: CertificationMode, settings: Settings) -> dict[str, Any]:

@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -33,31 +34,43 @@ def _content_hash(content: bytes) -> str:
     return "sha256:" + hashlib.sha256(content).hexdigest()
 
 
-def canonical_aad(spool_id: str, classification: str, expires_at: datetime | str, content_hash: str) -> bytes:
+def canonical_aad(spool_id: str, classification: str, expires_at: datetime | str, content_hash: str, *, aad_version: int | None = None, purpose: str = "legacy", capture_id: str | None = None) -> bytes:
     if not isinstance(spool_id, str) or not spool_id or not isinstance(classification, str) or not classification or not isinstance(content_hash, str) or not content_hash:
         raise CryptoError("SPOOL_AAD_INVALID")
     expiry = _aware_iso(expires_at) if isinstance(expires_at, datetime) else expires_at
     if not isinstance(expiry, str) or not expiry:
         raise CryptoError("SPOOL_AAD_INVALID")
+    fields = {"classification": classification, "content_hash": content_hash, "expires_at": expiry, "spool_id": spool_id}
+    if aad_version is None:
+        if purpose != "legacy" or capture_id is not None:
+            raise CryptoError("SPOOL_AAD_VERSION_INVALID")
+    elif type(aad_version) is int and aad_version == 2:
+        if not isinstance(purpose, str) or purpose not in {"pending", "validated-result"}:
+            raise CryptoError("SPOOL_PURPOSE_INVALID")
+        if not isinstance(capture_id, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", capture_id):
+            raise CryptoError("SPOOL_CAPTURE_ID_INVALID")
+        fields.update(aad_version=2, purpose=purpose, capture_id=capture_id)
+    else:
+        raise CryptoError("SPOOL_AAD_VERSION_INVALID")
     return json.dumps(
-        {"classification": classification, "content_hash": content_hash, "expires_at": expiry, "spool_id": spool_id},
+        fields,
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
 
 
-def encrypt_payload(content: bytes, spool_id: str, classification: str, expires_at: datetime, provider: KeyProvider, *, created_at: datetime | None = None) -> dict[str, Any]:
+def encrypt_payload(content: bytes, spool_id: str, classification: str, expires_at: datetime, provider: KeyProvider, *, created_at: datetime | None = None, aad_version: int | None = None, purpose: str = "legacy", capture_id: str | None = None) -> dict[str, Any]:
     if not isinstance(content, bytes):
         raise TypeError("SPOOL_CONTENT_BYTES_REQUIRED")
     created = created_at or datetime.now(timezone.utc)
     content_hash = _content_hash(content)
-    aad = canonical_aad(spool_id, classification, expires_at, content_hash)
+    aad = canonical_aad(spool_id, classification, expires_at, content_hash, aad_version=aad_version, purpose=purpose, capture_id=capture_id)
     material = provider.current()
     nonce = __import__("secrets").token_bytes(12)
     aes_gcm, _invalid_tag = _cryptography_primitives()
     ciphertext = aes_gcm(material.key).encrypt(nonce, content, aad)
-    return {
+    envelope = {
         "spool_id": spool_id,
         "algorithm": "AES-256-GCM",
         "nonce": base64.b64encode(nonce).decode("ascii"),
@@ -69,6 +82,9 @@ def encrypt_payload(content: bytes, spool_id: str, classification: str, expires_
         "expires_at": _aware_iso(expires_at),
         "key_id": material.key_id,
     }
+    if aad_version is not None:
+        envelope.update(aad_version=aad_version, purpose=purpose, capture_id=capture_id)
+    return envelope
 
 
 def decrypt_payload(
@@ -80,6 +96,9 @@ def decrypt_payload(
 ) -> bytes:
     if not isinstance(envelope, Mapping):
         raise CryptoError("SPOOL_ENVELOPE_INVALID")
+    if any(name in envelope for name in ("aad_version", "purpose", "capture_id")):
+        if type(envelope.get("aad_version")) is not int or envelope["aad_version"] != 2:
+            raise CryptoError("SPOOL_AAD_VERSION_INVALID")
     required = ("spool_id", "algorithm", "nonce", "ciphertext", "aad_sha256", "content_sha256", "classification", "created_at", "expires_at", "key_id")
     if any(field not in envelope for field in required) or envelope.get("algorithm") != "AES-256-GCM":
         raise CryptoError("SPOOL_ENVELOPE_INVALID")
@@ -102,9 +121,8 @@ def decrypt_payload(
     moment = now or datetime.now(timezone.utc)
     if moment.tzinfo is None or moment.utcoffset() is None:
         raise CryptoError("SPOOL_TIME_INVALID")
-    if expiry <= moment.astimezone(timezone.utc):
-        raise CryptoError("SPOOL_EXPIRED")
-    aad = canonical_aad(str(envelope["spool_id"]), str(envelope["classification"]), expiry, str(envelope["content_sha256"]))
+    aad = canonical_aad(str(envelope["spool_id"]), str(envelope["classification"]), expiry, str(envelope["content_sha256"]),
+        aad_version=envelope.get("aad_version"), purpose=envelope.get("purpose", "legacy"), capture_id=envelope.get("capture_id"))
     expected_aad_hash = "sha256:" + hashlib.sha256(aad).hexdigest()
     if envelope["aad_sha256"] != expected_aad_hash:
         raise CryptoError("SPOOL_AAD_MISMATCH")
@@ -116,6 +134,8 @@ def decrypt_payload(
         raise CryptoError("SPOOL_DECRYPT_FAILED") from exc
     if _content_hash(plaintext) != envelope["content_sha256"]:
         raise CryptoError("SPOOL_CONTENT_HASH_MISMATCH")
+    if expiry <= moment.astimezone(timezone.utc):
+        raise CryptoError("SPOOL_EXPIRED")
     return plaintext
 
 

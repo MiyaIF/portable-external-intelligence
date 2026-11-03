@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import io
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -15,8 +16,10 @@ from typing import Any, Mapping
 from unittest.mock import patch
 
 from ei.capture import record_agent_observation
+from ei.capture_ledger import read_receipt
 from ei.cli import _recall
 from ei.inference.base import ProviderResult
+from ei.inference.budget import BudgetLedger
 from ei.inference.router import ProviderRouter
 from ei.installer import (
     SetupSelection,
@@ -27,11 +30,15 @@ from ei.installer import (
     update,
 )
 from ei.journal import iter_events
+from ei.key_provider import InMemoryKeyProvider
 from ei.maintainer import _RouterAdapter, drain_queue
 from ei.models import CaptureContext, ObservationInput
+from ei.operation_runtime import OperationBudget
 from ei.project import project_events
-from ei.queue import QueueState, enqueue_receipt, list_queue_items, read_queue_item
+from ei.queue import QueueState, list_queue_items, read_queue_item
 from ei.reconciliation import reconcile_lifecycle
+from ei.runtime_catalog import lookup as runtime_lookup
+from ei.spool import read_spool
 
 
 CUSTOM_PROFILE: dict[str, object] = {
@@ -45,6 +52,43 @@ CUSTOM_PROFILE: dict[str, object] = {
     "global_context_path": ".config/test-compatible/context.md",
     "skill_roots": [".config/test-compatible/skills"],
 }
+
+FUNCTIONAL_CAPTURE_BUDGET_MS = 20_000
+
+
+def _functional_capture_budget() -> OperationBudget:
+    return OperationBudget(FUNCTIONAL_CAPTURE_BUDGET_MS)
+
+
+def _diagnostic_token(value: object) -> str:
+    if isinstance(value, str) and re.fullmatch(r"[A-Z][A-Z0-9_]{2,95}", value, flags=re.ASCII):
+        return value
+    return "UNKNOWN"
+
+
+def _diagnostic_count(value: object) -> str:
+    if type(value) is int and 0 <= value <= 1_000_000:
+        return str(value)
+    return "UNKNOWN"
+
+
+def _capture_diagnostic(result: Any) -> str:
+    created = "true" if result.created is True else "false" if result.created is False else "UNKNOWN"
+    event_id_present = "true" if isinstance(result.event_id, str) and bool(result.event_id) else "false" if result.event_id is None else "UNKNOWN"
+    return f"stage=capture; created={created}; reason={_diagnostic_token(result.reason_code)}; event_id_present={event_id_present}"
+
+
+def _drain_diagnostic(result: Any) -> str:
+    return (
+        f"stage=drain; status={_diagnostic_token(result.status)}; attempted={_diagnostic_count(result.attempted)}; "
+        f"completed={_diagnostic_count(result.completed)}; deferred={_diagnostic_count(result.deferred)}; "
+        f"failed={_diagnostic_count(result.failed)}; remaining={_diagnostic_count(result.remaining)}"
+    )
+
+
+def _recall_diagnostic(hits: object, stage: str) -> str:
+    count = len(hits) if isinstance(hits, (list, tuple)) else None
+    return f"stage={stage}; hits={_diagnostic_count(count)}"
 
 
 class RecordingOrganizer:
@@ -83,10 +127,18 @@ class RecordingOrganizer:
                 "applicable_host_families": list(input_json.get("applicable_host_families", ())),
             },
             schema_name=schema_name,
+            # This deterministic fixture models measured usage. These fixed
+            # values are synthetic, not estimates or real provider telemetry.
+            input_tokens=100,
+            output_tokens=100,
+            metadata={"usage_known": True, "cost_known": True},
         )
 
 
-class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class SingleIntelligenceMultiCliAcceptanceTests(NotificationIsolationMixin, unittest.TestCase):
     def _selection(self, root: Path) -> SetupSelection:
         homes = {
             "codex-cli": root / "homes" / "codex-cli",
@@ -159,11 +211,26 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             source_host_id=host_id,
             source_host_family=family,
         )
-        captured = record_agent_observation(observation, context, settings)
-        self.assertTrue(captured.created, captured)
-        events = list(iter_events(settings.paths.event_dir))
-        event = next(item for item in events if item.event_id == captured.event_id)
-        queued = enqueue_receipt(event, None, settings)
+        prior_events = self._journal_digest(settings)
+        captured = record_agent_observation(observation, context, settings, budget=_functional_capture_budget())
+        self.assertTrue(captured.created, _capture_diagnostic(captured))
+        queued = read_queue_item(captured.event_id or "", settings)
+        self.assertEqual(queued.state, QueueState.READY)
+        self.assertIsNotNone(queued.capture_id)
+        self.assertIsNotNone(queued.payload_ref)
+        self.assertEqual(queued.payload_ref.purpose, "pending")
+        receipt = read_receipt(settings, queued.capture_id)
+        self.assertEqual(receipt.state, "SECURED")
+        self.assertEqual(receipt.candidate_ids, (queued.queue_id,))
+        body = json.loads(read_spool(queued.payload_ref, settings, expected_capture_id=queued.capture_id))
+        self.assertEqual(body["claim"], phrase)
+        self.assertEqual((body["source_host_id"], body["source_host_family"]), (host_id, family))
+        self.assertEqual(body["applicability_scope"], scope)
+        self.assertEqual(body["applicable_host_ids"], list(applicable_ids))
+        self.assertEqual(body["applicable_host_families"], list(applicable_families))
+        encrypted = runtime_lookup(settings.paths.spool_dir, queued.payload_ref.spool_id).read_bytes()
+        self.assertNotIn(phrase.encode("utf-8"), encrypted)
+        self.assertEqual(self._journal_digest(settings), prior_events)
         return captured.event_id or "", queued
 
     def _recall(self, settings: Any, query: str, host_id: str, *, domain: str = "") -> dict[str, Any]:
@@ -203,9 +270,10 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
         )
 
     def test_two_work_hosts_share_one_intelligence_and_one_organizer(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
+        with tempfile.TemporaryDirectory() as temporary, patch("ei.spool.default_key_provider", return_value=InMemoryKeyProvider("multi-cli-test", b"m" * 32)):
             root = Path(temporary)
             selection = self._selection(root)
+            self.notification_isolation.allow_notification_helper()
             installed = setup(selection)
             self.assertTrue(installed.ok, installed.to_dict())
             manifest_path = root / "runtime" / "install-manifest.json"
@@ -278,10 +346,11 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
                     source_host_family="gemini-compatible",
                 ),
                 settings,
+                budget=_functional_capture_budget(),
             )
-            self.assertFalse(replay.created)
-            self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY")
-            self.assertEqual(len(list(iter_events(settings.paths.event_dir))), 6)
+            self.assertFalse(replay.created, _capture_diagnostic(replay))
+            self.assertEqual(replay.reason_code, "IDEMPOTENT_REPLAY", msg=_capture_diagnostic(replay))
+            self.assertEqual(list(iter_events(settings.paths.event_dir)), [])
             self.assertEqual(len(list_queue_items(settings)), 6)
 
             organizer = RecordingOrganizer()
@@ -289,6 +358,7 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             router = ProviderRouter(
                 [organizer, alternative],
                 organizer=settings.organizer,
+                budget_ledger=BudgetLedger(settings),
             )
             drained = drain_queue(
                 settings,
@@ -297,30 +367,60 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
                 time_budget_ms=600000,
                 now=datetime(2026, 9, 10, tzinfo=timezone.utc),
             )
-            self.assertEqual(drained.completed, 6, drained.to_dict())
+            self.assertEqual(drained.completed, 6, _drain_diagnostic(drained))
             self.assertGreater(organizer.calls, 0)
             self.assertEqual(alternative.calls, 0)
             self.assertTrue(all(item.state == QueueState.DONE for item in list_queue_items(settings)))
+            committed = [event for event in iter_events(settings.paths.event_dir) if event.event_type == "curation.changeset.applied"]
+            self.assertEqual(len(committed), 6)
+            self.assertEqual(
+                {source for event in committed for source in event.payload["source_hashes"]},
+                {item.source_hash for item in list_queue_items(settings)},
+            )
 
-            reconcile_lifecycle(
+            observations = [event for event in iter_events(settings.paths.event_dir) if event.event_type == "observation.recorded"]
+            self.assertEqual(len(observations), 6)
+            for scope in ("universal", "family", "host"):
+                self.assertEqual(
+                    {event.payload["cwd_fingerprint"] for event in observations if event.payload["applicability_scope"] == scope},
+                    {"sha256:" + hashlib.sha256(f"project-{scope}-{number}".encode("utf-8")).hexdigest() for number in (1, 2)},
+                )
+            reconciled = reconcile_lifecycle(
                 list(iter_events(settings.paths.event_dir)),
                 settings.paths.event_dir,
                 now_utc=datetime(2026, 9, 11, tzinfo=timezone.utc),
             )
+            self.assertEqual((reconciled.candidate_events, reconciled.promotion_events), (3, 3))
             project_events(list(iter_events(settings.paths.event_dir)), settings.paths.knowledge_dir)
             settings = _settings_for_selection(selection)
 
-            self.assertEqual(len(captured), 6)
+            self.assertEqual(len(captured), 6, msg=f"stage=multi_cli_captures; count={_diagnostic_count(len(captured))}")
             universal_hits = self._recall(settings, universal_phrase, "qwen-code", domain="domain-universal")["hits"]
             family_hits = self._recall(settings, family_phrase, "test-compatible-cli", domain="domain-family")["hits"]
             family_hits_other_host = self._recall(settings, family_phrase, "qwen-code", domain="domain-family")["hits"]
             host_hits = self._recall(settings, host_phrase, "test-compatible-cli", domain="domain-host")["hits"]
             host_hits_other_host = self._recall(settings, host_phrase, "codex-cli", domain="domain-host")["hits"]
-            self.assertIn(universal_phrase, {item["rule"] for item in universal_hits})
-            self.assertIn(family_phrase, {item["rule"] for item in family_hits})
-            self.assertEqual(family_hits_other_host, [])
-            self.assertIn(host_phrase, {item["rule"] for item in host_hits})
-            self.assertNotIn(host_phrase, {item["rule"] for item in host_hits_other_host})
+            self.assertIn(
+                universal_phrase,
+                {item["rule"] for item in universal_hits},
+                msg=_recall_diagnostic(universal_hits, "universal"),
+            )
+            self.assertIn(
+                family_phrase,
+                {item["rule"] for item in family_hits},
+                msg=_recall_diagnostic(family_hits, "family"),
+            )
+            self.assertEqual(family_hits_other_host, [], msg=_recall_diagnostic(family_hits_other_host, "family_other_host"))
+            self.assertIn(
+                host_phrase,
+                {item["rule"] for item in host_hits},
+                msg=_recall_diagnostic(host_hits, "host"),
+            )
+            self.assertNotIn(
+                host_phrase,
+                {item["rule"] for item in host_hits_other_host},
+                msg=_recall_diagnostic(host_hits_other_host, "host_other_host"),
+            )
 
             outage_observation_id, outage_item = self._capture(
                 settings,
@@ -339,9 +439,14 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
                 time_budget_ms=600000,
                 now=datetime(2026, 9, 10, 0, 0, tzinfo=timezone.utc),
             )
-            self.assertEqual(deferred.deferred, 1, deferred.to_dict())
+            self.assertEqual(deferred.deferred, 1, _drain_diagnostic(deferred))
             self.assertEqual(read_queue_item(outage_item.queue_id, settings).state, QueueState.DEFERRED)
-            self.assertIn(family_phrase, {item["rule"] for item in self._recall(settings, family_phrase, "test-compatible-cli", domain="domain-family")["hits"]})
+            family_hits_after_outage = self._recall(settings, family_phrase, "test-compatible-cli", domain="domain-family")["hits"]
+            self.assertIn(
+                family_phrase,
+                {item["rule"] for item in family_hits_after_outage},
+                msg=_recall_diagnostic(family_hits_after_outage, "family_after_outage"),
+            )
 
             personal_root = root / "personal-knowledge"
             before_identity = self._tree_digest(personal_root)
@@ -366,22 +471,38 @@ class SingleIntelligenceMultiCliAcceptanceTests(unittest.TestCase):
             self.assertFalse((root / "runtime" / "host-profiles" / "test-compatible-cli.json").exists())
             after_remove_settings = _settings_for_selection(removed_selection)
             self.assertEqual(before_journal, self._journal_digest(after_remove_settings))
+            family_hits_after_remove = self._recall(after_remove_settings, family_phrase, "qwen-code", domain="domain-family")["hits"]
             self.assertNotIn(
                 family_phrase,
-                {item["rule"] for item in self._recall(after_remove_settings, family_phrase, "qwen-code", domain="domain-family")["hits"]},
+                {item["rule"] for item in family_hits_after_remove},
+                msg=_recall_diagnostic(family_hits_after_remove, "family_after_host_removal"),
             )
 
             reregistered = update(selection)
             self.assertTrue(reregistered.ok, reregistered.to_dict())
             restored_settings = _settings_for_selection(selection)
-            self.assertIn(family_phrase, {item["rule"] for item in self._recall(restored_settings, family_phrase, "test-compatible-cli", domain="domain-family")["hits"]})
-            self.assertNotIn(host_phrase, {item["rule"] for item in self._recall(restored_settings, host_phrase, "codex-cli", domain="domain-host")["hits"]})
+            family_hits_after_restore = self._recall(restored_settings, family_phrase, "test-compatible-cli", domain="domain-family")["hits"]
+            host_hits_after_restore = self._recall(restored_settings, host_phrase, "codex-cli", domain="domain-host")["hits"]
+            self.assertIn(
+                family_phrase,
+                {item["rule"] for item in family_hits_after_restore},
+                msg=_recall_diagnostic(family_hits_after_restore, "family_after_restore"),
+            )
+            self.assertNotIn(
+                host_phrase,
+                {item["rule"] for item in host_hits_after_restore},
+                msg=_recall_diagnostic(host_hits_after_restore, "host_after_restore_other_host"),
+            )
             self.assertEqual(before_identity, self._tree_digest(personal_root))
             self.assertEqual(before_journal, self._journal_digest(restored_settings))
 
             with patch("ei.team_projection.refresh_team_projection", side_effect=AssertionError("team store read")):
                 disabled_result = self._recall(restored_settings, family_phrase, "test-compatible-cli", domain="domain-family")
-            self.assertEqual(disabled_result["knowledge_stores"]["team"]["status"], "DISABLED")
+            self.assertEqual(
+                disabled_result["knowledge_stores"]["team"]["status"],
+                "DISABLED",
+                msg=f"stage=team_recall; status={_diagnostic_token(disabled_result['knowledge_stores']['team']['status'])}",
+            )
 
             uninstalled = uninstall(manifest_path, UninstallOptions(remove_runtime=False))
             self.assertTrue(uninstalled["ok"], uninstalled)

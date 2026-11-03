@@ -10,7 +10,10 @@ from ei.config import PUBLIC_CLI_HOST_IDS
 from ei.installer import SetupSelection, setup
 
 
-class PublicSetupJourneyTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class PublicSetupJourneyTests(NotificationIsolationMixin, unittest.TestCase):
     def _selection(self, root: Path, *, hosts=PUBLIC_CLI_HOST_IDS) -> SetupSelection:
         repo = Path.cwd()
         homes = {host_id: root / "host homes" / host_id for host_id in hosts}
@@ -50,6 +53,7 @@ class PublicSetupJourneyTests(unittest.TestCase):
             self.assertFalse((root / "machine runtime 日本語 space" / "install-manifest.json").exists())
             self.assertFalse((root / "private knowledge 日本語 space").exists())
 
+            self.notification_isolation.allow_notification_helper()
             applied = setup(selection)
             self.assertTrue(applied.ok, applied.to_dict())
             self.assertEqual(applied.status, "SETUP_COMPLETE")
@@ -76,6 +80,7 @@ class PublicSetupJourneyTests(unittest.TestCase):
             self.assertTrue(checked.ok, checked.to_dict())
             self.assertEqual(checked.host_migrations[0]["status"], "MIGRATED_TO_CLI")
 
+            self.notification_isolation.allow_notification_helper()
             applied = setup(selection)
             self.assertTrue(applied.ok, applied.to_dict())
             self.assertEqual(applied.status, "SETUP_COMPLETE")
@@ -195,6 +200,7 @@ class PublicSetupJourneyTests(unittest.TestCase):
                 "registered": True,
                 "retryable": False,
             }
+            self.notification_isolation.allow_notification_helper()
             with patch("ei.task_scheduler.register_scheduler", return_value=registered):
                 result = setup(selection)
             self.assertTrue(result.ok, result.to_dict())
@@ -211,6 +217,7 @@ class PublicSetupJourneyTests(unittest.TestCase):
                 experiment=True,
             )
 
+            self.notification_isolation.allow_notification_helper()
             result = setup(selection)
 
             self.assertTrue(result.ok, result.to_dict())
@@ -232,6 +239,7 @@ class PublicSetupJourneyTests(unittest.TestCase):
                 "registered": False,
                 "retryable": True,
             }
+            self.notification_isolation.allow_notification_helper()
             with patch("ei.task_scheduler.register_scheduler", return_value=blocked):
                 result = setup(selection)
             self.assertFalse(result.ok)

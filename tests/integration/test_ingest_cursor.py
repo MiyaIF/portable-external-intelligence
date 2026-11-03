@@ -2,13 +2,64 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ei.adapters.codex_memory import CodexMemoryAdapter
 from ei.config import load_settings
 from ei.ingest import ingest_sources
+from ei.ingest import coordinate_record, source_coordination
+from ei.capture_recovery import _observation
+from ei.operation_runtime import OperationBudget
 
 
 class IngestCursorTests(unittest.TestCase):
+    def test_event_route_journal_deadline_leaves_no_ack_and_reuses_same_event(self):
+        from ei import ingest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "memory.md"
+            source.write_text("## Reusable knowledge\n- Validate the saved workbook before reporting completion.\n", encoding="utf-8")
+            settings = self._settings(root)
+            adapter = CodexMemoryAdapter([source])
+            record = next(iter(adapter.iter_records({})))
+            observation = _observation(record)
+            def run(budget=None):
+                with source_coordination(settings, budget=budget):
+                    return coordinate_record(settings, record, adapter.parser_version, "native_memory", observation, budget=budget)
+            with self.assertRaises(TimeoutError):
+                run(OperationBudget(0))
+            self.assertFalse(settings.paths.event_dir.exists())
+            budget = OperationBudget(5000)
+            original_append = ingest.append_event
+            def expire_inside_append(*args, **kwargs):
+                budget.deadline = 0
+                return original_append(*args, **kwargs)
+            with patch("ei.ingest.append_event", side_effect=expire_inside_append):
+                with self.assertRaises(TimeoutError):
+                    run(budget)
+            self.assertEqual(list(settings.paths.event_dir.rglob("*.json")), [])
+            self.assertFalse((settings.paths.local_state_dir / "ingest-cursor.json").exists())
+            receipt, event, created = run(OperationBudget(5000))
+            self.assertIsNone(receipt)
+            self.assertTrue(created)
+            event_path = next(settings.paths.event_dir.rglob("*.json"))
+            before = event_path.read_bytes()
+            original_read = ingest.read_event
+            budget = OperationBudget(5000)
+            def expire_inside_read(*args, **kwargs):
+                budget.deadline = 0
+                return original_read(*args, **kwargs)
+            with patch("ei.ingest.read_event", side_effect=expire_inside_read):
+                with self.assertRaises(TimeoutError):
+                    run(budget)
+            self.assertEqual(event_path.read_bytes(), before)
+            self.assertFalse((settings.paths.local_state_dir / "ingest-cursor.json").exists())
+            _, replay, created = run()
+            self.assertFalse(created)
+            self.assertEqual(replay.event_id, event.event_id)
+            self.assertEqual(event_path.read_bytes(), before)
+            self.assertEqual(len(list(settings.paths.event_dir.rglob("*.json"))), 1)
+
     def _settings(self, root: Path):
         (root / "config").mkdir(exist_ok=True)
         (root / "config" / "defaults.json").write_text(

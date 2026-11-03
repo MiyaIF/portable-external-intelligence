@@ -34,7 +34,13 @@ from ei.config import PUBLIC_CLI_HOST_IDS  # noqa: E402
 from ei.ids import canonical_json  # noqa: E402
 from ei.models import Event  # noqa: E402
 from ei.project import project_events  # noqa: E402
-from ei.safe_fs import safe_atomic_write, safe_ensure_directory  # noqa: E402
+from ei.safe_fs import (  # noqa: E402
+    assert_safe_target,
+    safe_atomic_write,
+    safe_ensure_directory,
+    safe_replace,
+    safe_unlink,
+)
 from ei.test_runner import TestRunnerError, discover_test_modules, run_complete_suite  # noqa: E402
 
 
@@ -399,13 +405,51 @@ def _built_wheel(directory: Path) -> Path:
 def _package_install_arguments(python_executable: Path, wheel: Path) -> list[str | Path]:
     return [
         python_executable,
+        "-I",
+        "-B",
+        "-X",
+        "utf8",
         "-m",
         "pip",
+        "--isolated",
         "install",
         "--disable-pip-version-check",
+        "--no-index",
         "--no-deps",
+        "--force-reinstall",
         wheel,
     ]
+
+
+def _verify_installed_package(
+    python_executable: Path,
+    wheel: Path,
+    *,
+    cwd: Path,
+    env: Mapping[str, str],
+    timeout: float,
+) -> None:
+    # A source egg-info directory can make pip return success without installing
+    # anything. Check the real venv distribution and entry point with no source
+    # directory or caller Python overrides on the import path.
+    probe = (
+        "import importlib.metadata as metadata, pathlib, sys, ei; "
+        "root = pathlib.Path(sys.prefix).resolve(); "
+        "module = pathlib.Path(ei.__file__).resolve(); "
+        "distribution = metadata.distribution('portable-external-intelligence'); "
+        "valid = sys.prefix != sys.base_prefix and module.is_relative_to(root) "
+        "and pathlib.Path(distribution.locate_file('')).resolve().is_relative_to(root) "
+        "and distribution.version == sys.argv[1]; "
+        "sys.exit(0 if valid else 1)"
+    )
+    _run(
+        [python_executable, "-I", "-B", "-X", "utf8", "-c", probe, wheel.name.split("-")[1]],
+        cwd=cwd, env=env, timeout=timeout, code="PACKAGE_IMPORT_FAILED",
+    )
+    _run(
+        [python_executable, "-I", "-B", "-X", "utf8", "-m", "ei.cli", "--help"],
+        cwd=cwd, env=env, timeout=timeout, code="PACKAGE_ENTRYPOINT_FAILED",
+    )
 
 
 def _audit_json(
@@ -525,6 +569,56 @@ def _local_lifecycle_commands(
             "--json",
         ],
     }
+
+
+def _seed_offline_operation_policy(workspace: Path, runtime: Path) -> Path:
+    """Disable routine OS delivery in the certifier-owned fresh runtime."""
+
+    workspace = Path(workspace).expanduser().absolute()
+    runtime = Path(runtime).expanduser().absolute()
+    if runtime != workspace / "machine runtime 日本語":
+        raise CertificationError("CERTIFICATION_OPERATION_ROOT_INVALID")
+    staging_path: Path | None = None
+    try:
+        assert_safe_target(workspace.parent, workspace, allow_missing=False, expected_type="dir")
+        assert_safe_target(workspace, runtime, allow_missing=True)
+        safe_ensure_directory(runtime, mode=0o700)
+        policy_path = runtime / "automatic-operation.json"
+        assert_safe_target(workspace, policy_path, allow_missing=True)
+        if policy_path.exists() or policy_path.is_symlink():
+            raise CertificationError("CERTIFICATION_OPERATION_POLICY_CONFLICT")
+        policy = {
+            "schema_version": 1,
+            "settings": {
+                "notifications": {"enabled": False, "channel": "os"},
+                "initial_test": {"allow_model_test": False, "allow_notification_test": False},
+            },
+            "evidence": {},
+        }
+        raw = canonical_json(policy)
+        if len(raw) > 65536:
+            raise CertificationError("CERTIFICATION_OPERATION_POLICY_INVALID")
+        with tempfile.NamedTemporaryFile(
+            mode="wb", prefix=".automatic-operation-", suffix=".tmp", dir=runtime, delete=False
+        ) as staged_file:
+            staging_path = Path(staged_file.name)
+            staged_file.write(raw)
+            staged_file.flush()
+            os.fsync(staged_file.fileno())
+        safe_replace(workspace, staging_path, workspace, policy_path, source_type="file", replace_existing=False)
+        staging_path = None
+        assert_safe_target(workspace, policy_path, allow_missing=False, expected_type="file")
+        return policy_path
+    except CertificationError:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise CertificationError("CERTIFICATION_OPERATION_POLICY_UNAVAILABLE") from exc
+    finally:
+        if staging_path is not None:
+            try:
+                safe_unlink(workspace, staging_path, allow_missing=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise CertificationError("CERTIFICATION_OPERATION_POLICY_CLEANUP_FAILED") from exc
 
 
 def _confirmed_uninstall_command(
@@ -760,6 +854,7 @@ def certify(source_value: Path | str, *, offline_fixtures: bool, timeout_seconds
             packages = _package_hashes(package_dir)
             wheel = _built_wheel(package_dir)
             _step(steps, "install_package", lambda: _run(_package_install_arguments(python_executable, wheel), cwd=clone, env=environment, timeout=timeout_seconds, code="PACKAGE_INSTALL_FAILED"))
+            _step(steps, "verify_installed_package", lambda: _verify_installed_package(python_executable, wheel, cwd=workspace, env=environment, timeout=timeout_seconds))
             dependency_output = _step(steps, "dependency_lock_audit", lambda: _run([python_executable, "scripts/verify-dependency-lock.py", "--pyproject", "pyproject.toml", "--build-lock", "requirements-build.lock", "--runtime-lock", "requirements-runtime.lock", "--ci-lock", "requirements-ci.lock", "--workflow-dir", ".github/workflows"], cwd=clone, env=environment, timeout=timeout_seconds, code="DEPENDENCY_AUDIT_FAILED"))
             workflow_output = _step(steps, "workflow_security_audit", lambda: _json_command(python_executable, clone, environment, ["public-release", "workflows", "verify", "--workflow-dir", ".github/workflows", "--json"], timeout=timeout_seconds, code="WORKFLOW_AUDIT_FAILED"))
             source_output = _step(steps, "production_source_audit", lambda: _audit_json(python_executable, clone, environment, "scripts/audit-production-source.py", ["--repo", ".", "--json"], timeout=timeout_seconds, code="SOURCE_AUDIT_FAILED"))
@@ -787,6 +882,7 @@ def certify(source_value: Path | str, *, offline_fixtures: bool, timeout_seconds
                 "runtime": workspace / "machine runtime 日本語",
                 "homes": workspace / "host homes 日本語",
             }
+            _seed_offline_operation_policy(workspace, roots["runtime"])
             commands = _local_lifecycle_commands(clone, roots, python_executable, homes)
             setup = _step(steps, "setup_apply", lambda: _run([python_executable, *commands["setup"]], cwd=clone, env=environment, timeout=timeout_seconds, code="SETUP_FAILED"))
             setup_result = _completed_json(setup, "SETUP_FAILED")

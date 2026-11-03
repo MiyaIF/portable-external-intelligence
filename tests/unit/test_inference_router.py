@@ -9,7 +9,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import ei.inference.router as router_module
+from ei.gate import decide_inheritance
 from ei.inference.base import InferenceBudget, ProviderResult
+from ei.inference.budget import BudgetLedger
 from ei.inference.cli_subscription import SubscriptionCLIProvider
 from ei.inference.errors import (
     AUTH_FAILED,
@@ -197,6 +199,9 @@ class InferenceRouterTests(unittest.TestCase):
             "benefit": "reduced_rework",
             "classification": "private-reusable",
             "confidence": 0.9,
+            "applicability_scope": "universal",
+            "applicable_host_ids": [],
+            "applicable_host_families": [],
         }
         outputs = {
             "codex-cli": json.dumps(decision),
@@ -234,11 +239,113 @@ class InferenceRouterTests(unittest.TestCase):
                     argv = tuple(runner.call_args.args[0])
                     for expected in required_argv[transport]:
                         self.assertIn(expected, argv)
+                    if transport == "codex-cli":
+                        schema_index = argv.index("--output-schema") + 1
+                        wire_path = Path(argv[schema_index])
+                        self.assertEqual(wire_path.resolve(), (Path.cwd() / "schemas" / "codex-gate-decision.schema.json").resolve())
+                        wire_schema = json.loads(wire_path.read_text(encoding="utf-8"))
+                        semantic_schema = json.loads((Path.cwd() / "schemas" / "gate-decision.schema.json").read_text(encoding="utf-8"))
+                        self.assertEqual(wire_schema["type"], "object")
+                        self.assertEqual(set(wire_schema["required"]), set(wire_schema["properties"]))
+                        self.assertIs(wire_schema["additionalProperties"], False)
+                        for unsupported in ("allOf", "if", "then", "else"):
+                            self.assertNotIn(unsupported, wire_schema)
+                        self.assertEqual(wire_schema["properties"]["candidate_title"], {"type": "string", "minLength": 1})
+                        self.assertEqual(wire_schema["properties"]["candidate_claim"], {"type": "string", "minLength": 20})
+                        self.assertEqual(wire_schema["properties"]["benefit"], {"type": "string", "minLength": 1})
+                        self.assertEqual(wire_schema["properties"]["classification"], {"type": "string", "minLength": 1})
+                        self.assertEqual(wire_schema["properties"]["confidence"], {"type": "number", "minimum": 0, "maximum": 1})
+                        self.assertEqual(
+                            wire_schema["properties"]["evidence_refs"]["items"]["pattern"],
+                            "^sha256:[0-9a-f]{64}$",
+                        )
+                        self.assertEqual(wire_schema["properties"]["applicable_host_ids"]["maxItems"], 16)
+                        self.assertEqual(wire_schema["properties"]["applicable_host_families"]["maxItems"], 16)
+                        self.assertEqual(wire_schema["properties"]["reason_code"]["enum"], semantic_schema["properties"]["reason_code"]["enum"])
+                        self.assertNotIn("source_host_id", wire_schema["properties"])
+                        self.assertNotIn("source_host_family", wire_schema["properties"])
+                        self.assertIn('"allOf"', runner.call_args.kwargs["input"])
+                        self.assertIn("trusted source_host_id and source_host_family must not be emitted", runner.call_args.kwargs["input"])
+                        self.assertNotIn("Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.", runner.call_args.kwargs["input"])
+                        self.assertIn(
+                            json.dumps(semantic_schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                            runner.call_args.kwargs["input"],
+                        )
+                    else:
+                        self.assertIn("Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.", runner.call_args.kwargs["input"])
+                        self.assertNotIn("trusted source_host_id and source_host_family must not be emitted", runner.call_args.kwargs["input"])
                     self.assertNotIn("sanitized reusable candidate", argv)
                     self.assertIn("sanitized reusable candidate", runner.call_args.kwargs["input"])
                     self.assertEqual(runner.call_args.kwargs["env"]["EI_INTERNAL"], "1")
                     self.assertFalse(runner.call_args.kwargs["shell"])
                     self.assertEqual(runner.call_args.kwargs["cwd"], str(working.resolve()))
+
+    def test_codex_wire_responses_remain_subject_to_gate_semantics_and_trusted_source_pair(self):
+        candidate = {
+            "title": "Reusable finding",
+            "claim": "This verified finding is suitable to retain for similar future tasks.",
+            "classification": "private-reusable",
+            "source_kind": "agent_direct",
+            "source_ref": "bounded-candidate",
+            "source_host_id": "codex-cli",
+            "source_host_family": "codex-compatible",
+        }
+        yes_base = {
+            "decision": "YES",
+            "reason_code": "evidence_verified",
+            "candidate_title": "Reusable finding",
+            "candidate_claim": candidate["claim"],
+            "evidence_refs": ["sha256:" + "a" * 64],
+            "benefit": "reduced_rework",
+            "classification": "private-reusable",
+            "confidence": 0.9,
+            "applicability_scope": "universal",
+            "applicable_host_ids": [],
+            "applicable_host_families": [],
+        }
+        malformed_yes = (
+            {**yes_base, "benefit": "unapproved-benefit"},
+            {**yes_base, "applicability_scope": "untrusted-scope"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            working = Path(tmp)
+            for output in malformed_yes:
+                with self.subTest(output_field="benefit" if output["benefit"] != "reduced_rework" else "applicability_scope"):
+                    provider = SubscriptionCLIProvider(
+                        ("codex",),
+                        transport="codex-cli",
+                        schema_root=Path.cwd() / "schemas",
+                        working_directory=working,
+                        runner=unittest.mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr="")),
+                    )
+                    decision = decide_inheritance(candidate, provider, InferenceBudget(max_input_tokens=5000, max_output_tokens=1000))
+                    self.assertEqual((decision.decision, decision.reason_code), ("FAILED", "MALFORMED_RESPONSE"))
+                    self.assertEqual((decision.source_host_id, decision.source_host_family), ("codex-cli", "codex-compatible"))
+
+            no_output = {
+                "decision": "NO",
+                "reason_code": "no_evidence",
+                "candidate_title": candidate["title"],
+                "candidate_claim": candidate["claim"],
+                "evidence_refs": [],
+                "benefit": "no_future_benefit",
+                "classification": "private-reusable",
+                "confidence": 0.5,
+                "applicability_scope": "universal",
+                "applicable_host_ids": [],
+                "applicable_host_families": [],
+            }
+            provider = SubscriptionCLIProvider(
+                ("codex",),
+                transport="codex-cli",
+                schema_root=Path.cwd() / "schemas",
+                working_directory=working,
+                runner=unittest.mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=json.dumps(no_output), stderr="")),
+            )
+            decision = decide_inheritance(candidate, provider, InferenceBudget(max_input_tokens=5000, max_output_tokens=1000))
+            self.assertEqual((decision.decision, decision.reason_code), ("NO", "no_evidence"))
+            self.assertEqual((decision.source_host_id, decision.source_host_family), ("codex-cli", "codex-compatible"))
 
     def test_disabled_subscription_provider_does_not_require_a_command(self):
         provider = SubscriptionCLIProvider.from_config({"enabled": False, "argv": []})
@@ -260,7 +367,9 @@ class InferenceRouterTests(unittest.TestCase):
     def test_ollama_is_selected_when_local_openai_unavailable(self):
         local = FakeProvider("local-openai-compatible", "local", ProviderResult("local-openai-compatible", "failed", error_code=PROVIDER_UNAVAILABLE), available_value=True)
         ollama = FakeProvider("ollama", "local", ProviderResult("ollama", output={"decision": "YES"}))
-        router = ProviderRouter([local, ollama], organizer=OrganizerSelection("READY", "local-openai-compatible", None))
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        router = ProviderRouter([local, ollama], organizer=OrganizerSelection("READY", "local-openai-compatible", None), budget_ledger=BudgetLedger(Path(tmp.name) / "ledger.json"))
         result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget(max_input_tokens=1000, max_output_tokens=1000), {"provider_order": ["local-openai-compatible", "ollama"]})
         self.assertEqual(result.provider_id, "local-openai-compatible")
         self.assertEqual(local.calls, 1)
@@ -273,10 +382,12 @@ class InferenceRouterTests(unittest.TestCase):
         other = FakeProvider(
             "subscription-cli", "subscription", ProviderResult("subscription-cli", output={"decision": "YES"})
         )
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
         router = ProviderRouter(
-            [selected, other], organizer=OrganizerSelection("READY", "ollama", None)
+            [selected, other], organizer=OrganizerSelection("READY", "ollama", None), budget_ledger=BudgetLedger(Path(tmp.name) / "ledger.json")
         )
-        result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget())
+        result = router.generate("gate", "gate-decision", {"candidate": "safe"}, InferenceBudget(max_input_tokens=1000, max_output_tokens=1000))
         self.assertEqual(result.error_code, PROVIDER_UNAVAILABLE)
         self.assertEqual(selected.calls, 1)
         self.assertEqual(other.calls, 0)
@@ -345,6 +456,40 @@ class InferenceRouterTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][0].get_header("Content-type"), "application/json")
         self.assertLessEqual(calls[0][1], 30)
+
+    def test_managed_local_attempt_is_one_capped_transport_call(self):
+        calls = []
+        timeouts = []
+        reservation_remaining = []
+        clock = [0.0]
+        def opener(request, timeout):
+            calls.append(json.loads(request.data))
+            timeouts.append(timeout)
+            return FakeHTTPResponse(b"not-json")
+        provider = LocalOpenAICompatibleProvider("http://127.0.0.1:8123/v1/chat/completions", opener=opener)
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = BudgetLedger(Path(tmp) / "ledger.json")
+            router = ProviderRouter([provider], organizer=OrganizerSelection("READY", provider.provider_id, None), budget_ledger=ledger)
+            reserve = ledger.reserve
+            def reserve_with_elapsed(*args, **kwargs):
+                start = clock[0]
+                result = reserve(*args, **kwargs)
+                clock[0] += 0.2
+                reservation_remaining.append(1000 - int((clock[0] - start) * 1000))
+                return result
+            for attempt in ("first", "next"):
+                with patch.object(router_module, "monotonic", side_effect=lambda: clock[0]), patch.object(ledger, "reserve", side_effect=reserve_with_elapsed):
+                    result = router.generate("gate", "gate-decision", {}, InferenceBudget(
+                        max_input_tokens=100, max_output_tokens=100, deadline_ms=1000, attempt_id=attempt))
+                self.assertEqual(result.error_code, MALFORMED_RESPONSE)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual([call["max_tokens"] for call in calls], [100, 100])
+            self.assertEqual(len(timeouts), 2)
+            self.assertTrue(all(timeout > 0 and timeout <= remaining / 1000
+                for timeout, remaining in zip(timeouts, reservation_remaining)))
+            result = router.generate("gate", "gate-decision", {}, InferenceBudget(max_input_tokens=100, max_output_tokens=0))
+            self.assertEqual(result.error_code, "TOKEN_CAP_EXCEEDED")
+            self.assertEqual(len(calls), 2)
 
     def test_ollama_uses_argv_without_shell_interpolation(self):
         completed = SimpleNamespace(returncode=0, stdout='{"decision":"YES"}', stderr="")

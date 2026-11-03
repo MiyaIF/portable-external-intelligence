@@ -11,7 +11,10 @@ from ei.installer import SetupSelection, UninstallOptions, setup, uninstall, upd
 from ei.skill_installer import canonical_tree_hash
 
 
-class CrossPlatformSetupAcceptanceTests(unittest.TestCase):
+from tests.support.sitecustomize import NotificationIsolationMixin
+
+
+class CrossPlatformSetupAcceptanceTests(NotificationIsolationMixin, unittest.TestCase):
     def test_public_setup_wrappers_expose_personal_and_optional_team_controls(self):
         powershell = (Path.cwd() / "scripts" / "setup.ps1").read_text(encoding="utf-8").casefold()
         posix = (Path.cwd() / "scripts" / "setup.sh").read_text(encoding="utf-8").casefold()
@@ -66,6 +69,7 @@ class CrossPlatformSetupAcceptanceTests(unittest.TestCase):
                 non_interactive=True,
                 accept_plan=True,
             )
+            self.notification_isolation.allow_notification_helper()
             first = setup(selection)
             self.assertTrue(first.ok, first.to_dict())
             self.assertEqual(first.status, "SETUP_COMPLETE")

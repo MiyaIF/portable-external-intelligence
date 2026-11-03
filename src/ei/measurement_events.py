@@ -142,11 +142,16 @@ def _reject_raw_mapping(value: Mapping[str, Any]) -> None:
         raise ValueError("MEASUREMENT_RAW_FIELD_FORBIDDEN")
 
 
-def _measurement_dir(settings: Any) -> Path:
+def _measurement_dir(settings: Any, *, budget=None) -> Path:
     paths = getattr(settings, "paths", None)
     runtime = getattr(paths, "runtime_root", None) or getattr(paths, "runtime_dir", None)
     if runtime is None:
         raise ValueError("MEASUREMENT_RUNTIME_REQUIRED")
+    if budget is not None:
+        from .safe_fs import assert_no_reparse_components
+        budget.check()
+        assert_no_reparse_components(Path(runtime))
+        budget.check()
     return Path(runtime).resolve() / _MEASUREMENT_DIR
 
 
@@ -471,67 +476,147 @@ class OutcomeRecord:
         )
 
 
+def _check_budget(budget):
+    if budget is not None:
+        budget.check()
+
+
 @contextmanager
-def _exclusive_lock(lock_path: Path):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    stream = lock_path.open("a+b")
+def _log_stream(path, mode, *, budget=None):
+    """No-follow, descriptor-bound access to existing append-only metadata."""
+    from .safe_fs import assert_safe_target, safe_ensure_directory
+    _check_budget(budget)
+    path = Path(path)
+    if mode != "r":
+        safe_ensure_directory(path.parent)
+    assert_safe_target(path.parent, path, allow_missing=mode != "r", expected_type="file")
+    _check_budget(budget)
+    flags = os.O_RDONLY if mode == "r" else os.O_RDWR | os.O_CREAT | (os.O_APPEND if mode == "a" else 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    stream = os.fdopen(fd, "rb" if mode == "r" else "r+b")
     try:
-        stream.seek(0)
-        if stream.tell() == 0:
-            stream.write(b"0")
-            stream.flush()
-        stream.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-        yield
+        assert_safe_target(path.parent, path, allow_missing=False, expected_type="file")
+        actual, opened = path.stat(follow_symlinks=False), os.fstat(stream.fileno())
+        if (actual.st_dev, actual.st_ino) != (opened.st_dev, opened.st_ino):
+            raise ValueError("MEASUREMENT_LOG_CHANGED")
+        _check_budget(budget)
+        yield stream
     finally:
+        stream.close()
+
+
+def _log_lines(path, *, budget=None):
+    """Stream metadata without materializing unbounded history or a partial ACK."""
+    import codecs
+    _check_budget(budget)
+    with _log_stream(path, "r", budget=budget) as stream:
+        initial = os.fstat(stream.fileno())
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        fragments = []
+        while True:
+            _check_budget(budget)
+            raw = stream.read(65536)
+            _check_budget(budget)
+            pieces = decoder.decode(raw, final=not raw).split("\n")
+            for position, piece in enumerate(pieces):
+                _check_budget(budget)
+                fragments.append(piece)
+                if position < len(pieces) - 1:
+                    yield "".join(fragments)
+                    fragments.clear()
+            if not raw:
+                break
+        final = Path(path).stat(follow_symlinks=False)
+        if (initial.st_dev, initial.st_ino, initial.st_size, initial.st_mtime_ns) != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns):
+            raise ValueError("MEASUREMENT_LOG_CHANGED")
+        if fragments and any(fragments):
+            _check_budget(budget)
+            yield "".join(fragments)
+        _check_budget(budget)
+
+
+def _append_log_line(path, line, *, budget=None):
+    _check_budget(budget)
+    raw = line.encode("utf-8")
+    with _log_stream(path, "a", budget=budget) as stream:
+        _check_budget(budget)
+        stream.write(raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+        _check_budget(budget)
+
+
+@contextmanager
+def _exclusive_lock(lock_path: Path, *, budget=None):
+    import errno
+    import time
+    _check_budget(budget)
+    with _log_stream(lock_path, "lock", budget=budget) as stream:
+        acquired = False
         try:
-            stream.seek(0)
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            if os.fstat(stream.fileno()).st_size == 0:
+                _check_budget(budget)
+                stream.write(b"0")
+                stream.flush()
+            while True:
+                _check_budget(budget)
+                stream.seek(0)
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK if budget is not None else msvcrt.LK_LOCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | (fcntl.LOCK_NB if budget is not None else 0))
+                    acquired = True
+                    break
+                except OSError as exc:
+                    if budget is None or exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    _check_budget(budget)
+                    time.sleep(min(0.005, budget.remaining_ms() / 1000))
+            _check_budget(budget)
+            yield
         finally:
-            stream.close()
+            if acquired:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
-def _append_unique(path: Path, record_id: str, value: Mapping[str, Any]) -> str:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _append_unique(path: Path, record_id: str, value: Mapping[str, Any], *, budget=None) -> str:
+    _check_budget(budget)
     lock_path = path.with_name(path.name + ".lock")
     line = json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
-    with _exclusive_lock(lock_path):
+    with _exclusive_lock(lock_path, budget=budget):
         if path.exists():
             try:
-                for raw in path.read_text(encoding="utf-8").splitlines():
+                for raw in _log_lines(path, budget=budget):
                     try:
                         item = json.loads(raw)
                     except json.JSONDecodeError:
                         continue
+                    _check_budget(budget)
                     if isinstance(item, Mapping) and str(item.get("exposure_id", item.get("outcome_id", ""))) == record_id:
                         return record_id
+            except TimeoutError:
+                raise
             except (OSError, UnicodeError):
                 raise ValueError("MEASUREMENT_LOG_READ_FAILED")
-        with path.open("a", encoding="utf-8", newline="\n") as stream:
-            stream.write(line)
-            stream.flush()
-            os.fsync(stream.fileno())
+        _append_log_line(path, line, budget=budget)
     return record_id
 
 
-def record_exposure(record: ExposureRecord, settings: Any) -> str:
+def record_exposure(record: ExposureRecord, settings: Any, *, budget=None) -> str:
+    _check_budget(budget)
     if not isinstance(record, ExposureRecord):
         raise TypeError("MEASUREMENT_EXPOSURE_RECORD_REQUIRED")
-    return _append_unique(_measurement_dir(settings) / "exposures.jsonl", record.exposure_id, record.to_dict())
+    return _append_unique(_measurement_dir(settings, budget=budget) / "exposures.jsonl", record.exposure_id, record.to_dict(), budget=budget)
 
 
 def record_outcome(outcome: OutcomeRecord, settings: Any) -> str:

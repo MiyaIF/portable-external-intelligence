@@ -124,7 +124,16 @@ class SubscriptionCLIProvider:
         schema_path, schema = self._schema(schema_name)
         schema_json = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         prompt = self._prompt(schema_name, schema, input_json)
+        output_schema_path = schema_path
         if self.transport == "codex-cli":
+            if schema_name == "gate-decision":
+                output_schema_path, _ = self._schema("codex-gate-decision")
+                prompt = prompt.replace(
+                    "Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.",
+                    "Return exactly one JSON object matching the Codex CLI structured-output schema. "
+                    "OUTPUT_SCHEMA_JSON is the complete semantic contract used for downstream validation. "
+                    "The trusted source_host_id and source_host_family must not be emitted; those values are supplied separately.",
+                )
             argv = self.command + (
                 "exec",
                 "--ephemeral",
@@ -136,7 +145,7 @@ class SubscriptionCLIProvider:
                 "--color",
                 "never",
                 "--output-schema",
-                str(schema_path),
+                str(output_schema_path),
                 "-",
             )
         elif self.transport == "claude-code":

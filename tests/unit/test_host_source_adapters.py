@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from ei.adapters.base import SourceRecord, scan_read_only
 from ei.adapters.claude import ClaudeAdapter, ClaudeCodeAdapter
@@ -10,9 +11,35 @@ from ei.adapters.gemini import GeminiAdapter, GeminiCliAdapter
 from ei.adapters.qwen import QwenAdapter, QwenCodeAdapter
 from ei.adapters.transcript_metadata import TranscriptMetadataAdapter
 from ei.models import Event
+from ei.host_profiles import build_host_profile
 
 
 class HostSourceAdapterTests(unittest.TestCase):
+    def test_capability_declarations_are_optional_validated_and_not_verified(self):
+        document = dict(schema_version=1, host_id="custom-codex", display_name="Custom", host_family="codex-compatible", adapter_id="codex-cli", executable_names=["custom"], hook_config_path="config.json", global_context_path="AGENTS.md", skill_roots=["skills"])
+        names = ("lifecycle", "candidate_input", "source_enumeration", "receipt_correlation", "direct_user_display")
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = build_host_profile(document, Path(tmp))
+            self.assertEqual(dict(profile.capture_capabilities), dict.fromkeys(names, "UNKNOWN"))
+            document["capture_capabilities"] = dict.fromkeys(names, "SUPPORTED")
+            profile = build_host_profile(document, Path(tmp))
+            self.assertEqual(dict(profile.capture_capabilities), document["capture_capabilities"])
+            self.assertFalse(getattr(profile, "enumeration_verified", False))
+            for capabilities in ({"source_enumeration": "SUPPORTED"}, dict.fromkeys(names, "VERIFIED"), {**document["capture_capabilities"], "provider": "ollama"}):
+                with self.subTest(capabilities=capabilities), self.assertRaises(ValueError):
+                    build_host_profile({**document, "capture_capabilities": capabilities}, Path(tmp))
+
+    def test_verified_bytes_preserve_all_host_parser_results_without_reopen(self):
+        for adapter_type, relative in ((ClaudeAdapter, "claude/stable-memory.json"), (GeminiAdapter, "gemini/session-metadata.json"), (QwenAdapter, "qwen/session-metadata.json")):
+            with self.subTest(adapter=adapter_type.__name__):
+                path = Path("tests/fixtures/sources", relative).resolve()
+                raw, metadata = path.read_bytes(), path.stat()
+                expected = list(adapter_type([]).read(path))
+                with patch.object(Path, "read_bytes", side_effect=AssertionError("reopened")), patch.object(Path, "stat", side_effect=AssertionError("restat")):
+                    actual = list(adapter_type([]).read_verified(path, raw, metadata))
+                self.assertEqual(actual, expected)
+                self.assertTrue(actual[0].stable_record_id)
+
     def test_claude_stable_memory_is_read_only_and_normalized(self):
         path = Path("tests/fixtures/sources/claude/stable-memory.json").resolve()
         before_bytes = path.read_bytes()

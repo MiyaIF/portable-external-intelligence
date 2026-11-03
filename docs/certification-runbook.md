@@ -25,6 +25,15 @@ TTL. An unbound real-looking receipt remains `private_development`; it cannot
 complete a public release. Codex App receipts are legacy/private only and do
 not satisfy this matrix.
 
+Fault-injection acceptance, fake provider/OS backends, and headless CI are
+synthetic contract evidence, not a `mode=real` receipt. An OS notification
+adapter result proves neither visible display nor that a person saw it; record
+API send, UI display, and CLI direct display separately. A `SKIP` caused by a
+host policy or unavailable test boundary remains `UNVERIFIED`, never a pass.
+The current unattended-operation candidate has no new real Host/OS receipts or
+public-CI run recorded here; keep each untested matrix pair `UNVERIFIED` until
+its own evidence is validated.
+
 ## Procedure
 
 1. Run `setup --check-only` with isolated roots.

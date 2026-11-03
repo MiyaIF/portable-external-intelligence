@@ -3,6 +3,9 @@
   "type": "object",
   "required": ["spool_id", "algorithm", "nonce", "ciphertext", "aad_sha256", "content_sha256", "classification", "created_at", "expires_at", "key_id"],
   "properties": {
+    "aad_version": {"type": "integer", "const": 2},
+    "purpose": {"enum": ["pending", "validated-result"]},
+    "capture_id": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
     "spool_id": {"type": "string", "minLength": 1},
     "algorithm": {"type": "string", "const": "AES-256-GCM"},
     "nonce": {"type": "string", "pattern": "^[A-Za-z0-9+/]{16}$", "minLength": 16, "maxLength": 16},
@@ -14,5 +17,6 @@
     "expires_at": {"type": "string", "format": "date-time"},
     "key_id": {"type": "string", "minLength": 1}
   },
+  "dependentRequired": {"aad_version": ["purpose", "capture_id"], "purpose": ["aad_version", "capture_id"], "capture_id": ["aad_version", "purpose"]},
   "additionalProperties": false
 }
