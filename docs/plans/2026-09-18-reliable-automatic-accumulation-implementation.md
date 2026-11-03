@@ -1392,6 +1392,8 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 
 **追加Files（CI依存監査の残件）:** `requirements-ci.lock`。全lockの監査で判明した`certifi`のPYSEC-2026-4320と`filelock`のCVE-2026-112940/112913/112907に対応し、この2つの間接依存をそれぞれ2026.10.19と4.2.1へ更新する。公式配布物のhashを実体と照合し、依存整合性・対応Python版・3つのlockの脆弱性監査を隔離環境で再確認する。無関係なpinやscanner設定は変えず、互換性問題が見つかった場合は記録して範囲を再検討する。
 
+**追加Files（2026-11-03 CI依存監査）:** `requirements-ci.lock` と本計画書。公開CIが `msgpack 1.2.2` の `CVE-2026-114613`（`GHSA-j586-36cw-2gc2`）を検出した。維持元の公式アドバイザリで修正版1.2.3を確認し、この間接依存のversionと公式配布物のSHA256集合だけを更新する。ほかのpin・製品runtime依存・scanner設定を変えず、hash付き導入、依存整合性、3つのlockの監査、対象テスト、固定版全件テスト、差分レビュー、同一公開SHAのCIで確認する。既知の検査を除外・成功扱いする回避はしない。
+
 **追加Files（通知試験の失敗段階の識別）:** `tests/integration/test_unattended_setup.py`。Linux/macOSのPython 3.13で失敗するno-effect通知解除の1ケースに、既存parserで読めるphase付きの有限理由コードを追加する。setup/uninstall結果の最初のerror_codeはprefix込み96文字以内の許可形式のみ採用し、それ以外はUNKNOWNとする。通知status・helper呼出し・receipt残存も固定コードで区別し、元の全assertionを維持する。生本文・絶対パス・tracebackを新しく公開せず、製品処理やskip条件は変更しない。これは原因確定の診断であり、不具合修正完了とは扱わない。
 
 **追加Files（CIジョブの実行時間枠）:** `.github/workflows/compatibility.yml`。Windowsジョブでclean-clone全件検証とhost contractは成功したが、後続acceptance中に35分のジョブ上限へ達したことをGitHubのannotationで確認した。compatibility matrixの上限のみ45分へ変更し、単体moduleのtimeout・製品budget・必須step・最終集約の成功条件は維持する。失敗結果を成功扱いせず、次の同一公開SHAで全step完了を確認する。
@@ -1434,6 +1436,10 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 **追加Files:** `tests/acceptance/test_reliable_automatic_accumulation.py`。次の公開CIで、候補中の命令文がroot・整理AI・通知設定を変更できないことを確認する1ケースが失敗した。具体的なassertionと期限原因はログからは未確定。成功が前提の候補作成にだけ有限20秒のOperationBudgetを明示し、受領・完了の結果に診断を追加する。明示30秒の保守予算、保存・プライバシー・設定不変更・通知禁止の全assertion、他ケース、製品の既定期限は維持する。対象ケース／module、レビュー、固定版全件検証、同一公開SHAのCIで再確認する。
 
 ## Windows取得・復旧の機能fixtureと期限試験の分離
+
+### 2026-11-03: pending captureの保存・再開機能fixture
+
+追加対象は `tests/integration/test_pending_capture_recovery.py` と本計画書。公開push CIのPython 3.13で、保存準備が `WAITING` となる3ケースと、意図した保存境界の故障に未到達の2ケースを確認した。ログに理由・残予算がないため元のCI原因は未確定とし、既定5秒の協調期限が機能検証を先取りする経路を限定probeで確認する。このmoduleの成功を前提とする保存・再開操作だけを、有限で進むtest-local時計により実マシン速度から分離する。製品の期限・時計・check・実I/O・暗号化・queue/receipt・所有権・排他・全assertionは維持し、実時間性能の改善とは扱わない。既存の意図的timeout/delete-deadline試験、明示budget同一性検証、実OS待機と外側300秒上限を維持する。実deadlineを跨ぐ独立ケースで未完了をSECUREDと扱わず再開できることを確認する。既存失敗ケース、対象全module、独立期限検証、差分レビューと固定版全件試験を経て、同一公開SHAのCIを確認する。秒数増加だけの変更・skip・成功条件緩和・新しい汎用fixture基盤は追加しない。
 
 ### 2026-11-03: 実時間依存を残したfixture分離の是正
 

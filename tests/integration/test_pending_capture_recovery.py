@@ -1,5 +1,7 @@
 import json
 import tempfile
+import threading
+import time as _time
 import unittest
 from dataclasses import replace
 from datetime import timedelta
@@ -19,57 +21,95 @@ from tests.unit import test_maintainer as maintenance_fixtures
 from tests.unit.test_pending_capture import observation
 
 
+FUNCTIONAL_PENDING_BUDGET_MS = 5_000
+
+
+class _AdvancingMonotonicClock:
+    """Finite test-local operation time; every read advances by one millisecond."""
+
+    def __init__(self):
+        self.value = 0.0
+
+    def __call__(self):
+        self.value += 0.001
+        return self.value
+
+    def advance_ms(self, milliseconds):
+        self.value += milliseconds / 1000
+
+
+class _OperationTimeProxy:
+    def __init__(self, clock):
+        self._clock = clock
+        self._controlled_thread = threading.get_ident()
+
+    def monotonic(self):
+        if threading.get_ident() == self._controlled_thread:
+            return self._clock()
+        return _time.monotonic()
+
+    def __getattr__(self, name):
+        return getattr(_time, name)
+
+
 class PowerLoss(BaseException):
     pass
 
 
 class PendingRecoveryTests(unittest.TestCase):
     def test_interrupted_native_admission_keeps_origin_and_retry_does_not_reclassify(self):
-        with patch.object(pending_capture, "write_spool", side_effect=SpoolError("failed")):
-            result = pending_capture.accept_candidate(self.settings, identity(), observation(), now=NOW, key_provider=self.key, origin="NATIVE_SOURCE")
+        def interrupted_admission(budget, _):
+            with patch.object(pending_capture, "write_spool", side_effect=SpoolError("failed")):
+                return pending_capture.accept_candidate(self.settings, identity(), observation(), now=NOW,
+                    key_provider=self.key, origin="NATIVE_SOURCE", budget=budget)
+        result = self._with_finite_operation_budget(interrupted_admission)
         self.assertEqual(result.state, "WAITING")
         root = self.settings.paths.runtime_dir / "state" / "capture" / "intents"
         path = next(root.rglob("pending_*.json"))
         before = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(before["phase"], "PREPARED")
         self.assertEqual(before["admission"]["origin"], "NATIVE_SOURCE")
-        recovered = self.accept()
+        recovered = self.accept_functionally()
         self.assertEqual(recovered.state, "SECURED")
         self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["admission"], before["admission"])
         self.assertEqual(len(list_queue_items(self.settings)), 1)
 
     def test_duplicate_intent_lookup_reads_receive_the_original_budget(self):
         import ei.runtime_catalog as runtime
-        from ei.operation_runtime import OperationBudget
-        self.assertEqual(self.accept().state, "SECURED")
+        self.assertEqual(self.accept_functionally().state, "SECURED")
         root = self.settings.paths.runtime_dir / "state" / "capture" / "intents"
         managed = next(root.rglob("pending_*.json"))
         (root / managed.name).write_bytes(managed.read_bytes())
-        budget = OperationBudget(5000)
         original = runtime.read_entry
-        def checked(root, path, passed=None):
-            self.assertIs(passed, budget)
-            return original(root, path, passed)
-        with patch.object(runtime, "read_entry", side_effect=checked):
-            actual = pending_capture.accept_candidate(self.settings, identity(), observation(), now=NOW, key_provider=self.key, budget=budget)
+        def accept_duplicate(budget, _):
+            def checked(root, path, passed=None):
+                self.assertIs(passed, budget)
+                return original(root, path, passed)
+            with patch.object(runtime, "read_entry", side_effect=checked):
+                return pending_capture.accept_candidate(self.settings, identity(), observation(), now=NOW,
+                    key_provider=self.key, budget=budget)
+        actual = self._with_finite_operation_budget(accept_duplicate)
         self.assertEqual(actual.state, "SECURED")
 
     def test_secured_replay_does_not_rewrite_unchanged_intent(self):
-        first = self.accept()
+        first = self.accept_functionally()
         original = capture_ledger._write_path
         def reject_unchanged_intent(root, path, encoded, **kwargs):
             if path.stem.startswith("pending_"):
                 raise AssertionError("unchanged intent rewritten")
             return original(root, path, encoded, **kwargs)
         with patch("ei.capture_ledger._write_path", side_effect=reject_unchanged_intent):
-            replay = self.accept(now=NOW + timedelta(seconds=1))
+            replay = self.accept_functionally(now=NOW + timedelta(seconds=1))
         self.assertEqual(replay.candidate_ids, first.candidate_ids)
         self.assertEqual(replay.state, "SECURED")
 
     def test_timeout_after_page_does_not_skip_its_unprocessed_suffix(self):
         for record in ("a", "b", "c"):
-            with patch("ei.pending_capture.write_spool", side_effect=OSError("full")):
-                pending_capture.accept_candidate(self.settings, identity(record), observation(), now=NOW, key_provider=self.key)
+            def unavailable_spool(budget, _):
+                with patch("ei.pending_capture.write_spool", side_effect=OSError("full")):
+                    return pending_capture.accept_candidate(self.settings, identity(record), observation(), now=NOW,
+                        key_provider=self.key, budget=budget)
+            self._with_finite_operation_budget(unavailable_spool)
         original = pending_capture._load
         visited = []
         def limited(root, path, **kwargs):
@@ -78,11 +118,11 @@ class PendingRecoveryTests(unittest.TestCase):
                 raise TimeoutError("deadline")
             return original(root, path, **kwargs)
         with patch("ei.pending_capture._load", side_effect=limited):
-            partial = pending_capture.reconcile_pending(self.settings, now=NOW, max_records=3)
+            partial = self.reconcile_functionally(max_records=3)
         self.assertFalse(partial["page_complete"])
         self.assertEqual(partial["reason_code"], "PENDING_TIME_LIMIT")
         self.assertEqual(len(partial["processed"]), 1)
-        resumed = pending_capture.reconcile_pending(self.settings, now=NOW, max_records=1)
+        resumed = self.reconcile_functionally(max_records=1)
         self.assertEqual(resumed["processed"][0]["pending_id"], visited[1])
 
     def test_absent_intent_write_retries_original_ttl_after_later_call(self):
@@ -92,18 +132,21 @@ class PendingRecoveryTests(unittest.TestCase):
                 raise OSError("full")
             return original(root, path, encoded, **kwargs)
         with patch("ei.capture_ledger._write_path", side_effect=fail_intent):
-            self.assertEqual(self.accept().state, "WAITING")
-        self.assertEqual(self.accept(now=NOW + timedelta(days=1)).state, "SECURED")
+            self.assertEqual(self.accept_functionally().state, "WAITING")
+        self.assertEqual(self.accept_functionally(now=NOW + timedelta(days=1)).state, "SECURED")
         item = list_queue_items(self.settings)[0]
         self.assertEqual(item.payload_ref.created_at, NOW.isoformat().replace("+00:00", "Z"))
         self.assertEqual(item.payload_ref.expires_at, (NOW + timedelta(days=30)).isoformat().replace("+00:00", "Z"))
 
     def test_short_suffix_never_becomes_complete_pending_aggregate(self):
         for record in ("a", "b", "c"):
-            with patch("ei.pending_capture.write_spool", side_effect=OSError("full")):
-                pending_capture.accept_candidate(self.settings, identity(record), observation(), now=NOW, key_provider=self.key)
-        first = pending_capture.reconcile_pending(self.settings, now=NOW, max_records=2)
-        second = pending_capture.reconcile_pending(self.settings, now=NOW, max_records=2)
+            def unavailable_spool(budget, _):
+                with patch("ei.pending_capture.write_spool", side_effect=OSError("full")):
+                    return pending_capture.accept_candidate(self.settings, identity(record), observation(), now=NOW,
+                        key_provider=self.key, budget=budget)
+            self._with_finite_operation_budget(unavailable_spool)
+        first = self.reconcile_functionally(max_records=2)
+        second = self.reconcile_functionally(max_records=2)
         self.assertEqual((first["waiting"], second["waiting"]), (2, 1))
         self.assertFalse(second["aggregate_complete"])
         self.assertTrue(second["inventory_complete"])
@@ -111,12 +154,14 @@ class PendingRecoveryTests(unittest.TestCase):
         self.assertEqual(len(second["processed"]), 1)
 
     def test_bounded_reconciliation_rotates_past_waiting_prefix(self):
-        from ei.operation_runtime import OperationBudget
         from ei.runtime_catalog import lookup
         identities = [replace(identity(), record_hash="sha256:" + str(number) * 64) for number in range(3)]
         for key in identities:
-            with patch("ei.pending_capture.write_spool", side_effect=OSError("full")):
-                self.assertEqual(pending_capture.accept_candidate(self.settings, key, observation(), now=NOW, key_provider=self.key).state, "WAITING")
+            def unavailable_spool(budget, _):
+                with patch("ei.pending_capture.write_spool", side_effect=OSError("full")):
+                    return pending_capture.accept_candidate(self.settings, key, observation(), now=NOW,
+                        key_provider=self.key, budget=budget)
+            self.assertEqual(self._with_finite_operation_budget(unavailable_spool).state, "WAITING")
         seen = set()
         original = pending_capture._load
         def load(root, path, **kwargs):
@@ -124,7 +169,7 @@ class PendingRecoveryTests(unittest.TestCase):
             return original(root, path, **kwargs)
         with patch("ei.pending_capture._load", side_effect=load):
             for _ in range(3):
-                pending_capture.reconcile_pending(self.settings, now=NOW, budget=OperationBudget(5000), max_records=1)
+                self.reconcile_functionally(max_records=1)
         self.assertEqual(len(seen), 3)
 
     def setUp(self):
@@ -133,12 +178,139 @@ class PendingRecoveryTests(unittest.TestCase):
         self.settings = make_settings(Path(self.tmp.name))
         self.key = InMemoryKeyProvider("restart", b"r" * 32)
 
-    def accept(self, now=NOW, item=None):
-        return pending_capture.accept_candidate(self.settings, identity(), item or observation(), now=now, key_provider=self.key)
+    def accept(self, now=NOW, item=None, budget=None):
+        return pending_capture.accept_candidate(self.settings, identity(), item or observation(), now=now,
+            key_provider=self.key, budget=budget)
 
-    def reconcile(self, now=NOW):
+    def reconcile(self, now=NOW, budget=None, max_records=64):
         with patch("ei.spool.default_key_provider", return_value=self.key):
-            return pending_capture.reconcile_pending(self.settings, now=now)
+            return pending_capture.reconcile_pending(self.settings, now=now, budget=budget, max_records=max_records)
+
+    def _with_finite_operation_budget(self, operation, *, max_ms=FUNCTIONAL_PENDING_BUDGET_MS):
+        from ei.operation_runtime import OperationBudget
+
+        clock = _AdvancingMonotonicClock()
+        controlled_time = _OperationTimeProxy(clock)
+        with patch("ei.operation_runtime.time", new=controlled_time):
+            budget = OperationBudget(max_ms)
+            return operation(budget, clock)
+
+    def accept_functionally(self, now=NOW, item=None, capture_identity=None, origin="UNKNOWN"):
+        return self._with_finite_operation_budget(
+            lambda budget, _: pending_capture.accept_candidate(self.settings,
+                capture_identity if capture_identity is not None else identity(), item or observation(), now=now,
+                key_provider=self.key, budget=budget, origin=origin))
+
+    def reconcile_functionally(self, now=NOW, max_records=64):
+        return self._with_finite_operation_budget(
+            lambda budget, _: self.reconcile(now=now, budget=budget, max_records=max_records))
+
+    def test_functional_acceptance_survives_host_clock_jump_at_real_intent_write(self):
+        from ei.operation_runtime import OperationBudget
+
+        original_save = pending_capture._save
+        host_clock = _AdvancingMonotonicClock()
+        jumps = []
+
+        def acceptance_with_host_jump(expected_budget):
+            jumped = False
+            observed_budgets = []
+
+            def save_then_jump(root, path, value, budget=None):
+                nonlocal jumped
+                observed_budgets.append(budget)
+                saved = original_save(root, path, value, budget=budget)
+                if not jumped:
+                    jumped = True
+                    jumps.append(True)
+                    host_clock.advance_ms(FUNCTIONAL_PENDING_BUDGET_MS + 1)
+                return saved
+
+            with patch("ei.pending_capture._save", side_effect=save_then_jump):
+                result = self.accept(budget=expected_budget)
+            self.assertTrue(
+                jumped,
+                f"simulated host advance must follow a real intent write; state={result.state}; reason={result.reason_code}",
+            )
+            self.assertTrue(observed_budgets)
+            self.assertTrue(all(actual is expected_budget for actual in observed_budgets))
+            return result
+
+        original_settings = self.settings
+        try:
+            with patch("ei.operation_runtime.time", new=_OperationTimeProxy(host_clock)):
+                red_budget = OperationBudget(FUNCTIONAL_PENDING_BUDGET_MS)
+                red = acceptance_with_host_jump(red_budget)
+                self.assertEqual((red.state, red.reason_code), ("WAITING", "PENDING_STORAGE_UNAVAILABLE"))
+                self.assertEqual(len(list_queue_items(self.settings)), 0)
+
+                with tempfile.TemporaryDirectory() as tmp:
+                    self.settings = make_settings(Path(tmp))
+                    green = self._with_finite_operation_budget(
+                        lambda budget, _: acceptance_with_host_jump(budget))
+                    self.assertEqual(green.state, "SECURED", msg=f"state={green.state}; reason={green.reason_code}")
+                    self.assertEqual(len(list_queue_items(self.settings)), 1)
+        finally:
+            self.settings = original_settings
+
+        self.assertEqual(len(jumps), 2)
+        resumed = self.accept_functionally()
+        self.assertEqual(resumed.state, "SECURED", msg=f"state={resumed.state}; reason={resumed.reason_code}")
+        self.assertEqual(len(list_queue_items(self.settings)), 1)
+        receipts = capture_ledger.list_receipts(self.settings)
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].state, "SECURED")
+
+    def test_actual_deadline_crossing_stays_incomplete_and_resumes_without_duplicates(self):
+        from ei.operation_runtime import OperationBudget
+
+        original_save = pending_capture._save
+        original_check = OperationBudget.check
+        crossing = {"written": False, "observed_deadline_check": False, "raised": False}
+
+        def force_deadline_after_real_intent_write(expected_budget, clock):
+            def observed_check():
+                if clock.value >= expected_budget.deadline:
+                    crossing["observed_deadline_check"] = True
+                try:
+                    return original_check(expected_budget)
+                except TimeoutError:
+                    crossing["raised"] = True
+                    raise
+
+            expected_budget.check = observed_check
+
+            def save_then_cross(root, path, value, budget=None):
+                self.assertIs(budget, expected_budget)
+                saved = original_save(root, path, value, budget=budget)
+                if not crossing["written"]:
+                    crossing["written"] = True
+                    clock.advance_ms(FUNCTIONAL_PENDING_BUDGET_MS + 1)
+                return saved
+
+            with patch("ei.pending_capture._save", side_effect=save_then_cross):
+                return self.accept(budget=expected_budget)
+
+        result = self._with_finite_operation_budget(force_deadline_after_real_intent_write)
+        self.assertTrue(crossing["written"])
+        self.assertTrue(crossing["observed_deadline_check"])
+        self.assertTrue(crossing["raised"])
+        self.assertEqual((result.state, result.reason_code), ("WAITING", "PENDING_STORAGE_UNAVAILABLE"))
+        self.assertEqual(len(list_queue_items(self.settings)), 0)
+        self.assertIsNone(capture_ledger.read_receipt(self.settings, capture_key(identity())))
+        intent_paths = list((self.settings.paths.runtime_dir / "state" / "capture" / "intents").rglob("pending_*.json"))
+        self.assertEqual(len(intent_paths), 1)
+        self.assertEqual(json.loads(intent_paths[0].read_text(encoding="utf-8"))["phase"], "PREPARED")
+
+        resumed = self.accept_functionally()
+        self.assertEqual(resumed.state, "SECURED", msg=f"state={resumed.state}; reason={resumed.reason_code}")
+        replayed = self.accept_functionally(now=NOW + timedelta(seconds=1))
+        self.assertEqual(replayed.state, "SECURED", msg=f"state={replayed.state}; reason={replayed.reason_code}")
+        self.assertEqual(replayed.candidate_ids, resumed.candidate_ids)
+        self.assertEqual(len(list_queue_items(self.settings)), 1)
+        receipts = capture_ledger.list_receipts(self.settings)
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(receipts[0].state, "SECURED")
 
     def test_process_death_at_each_persistence_boundary_converges(self):
         # Fail immediately AFTER each real durable write, keeping its effects.
@@ -162,21 +334,21 @@ class PendingRecoveryTests(unittest.TestCase):
                         raise PowerLoss()
                     return result
                 with patch(target, autospec=True, side_effect=crash_after), self.assertRaises(PowerLoss):
-                    self.accept()
-                self.reconcile()
-                result = self.accept()
-                self.assertEqual(result.state, "SECURED")
+                    self.accept_functionally()
+                self.reconcile_functionally()
+                result = self.accept_functionally()
+                self.assertEqual(result.state, "SECURED", msg=f"state={result.state}; reason={result.reason_code}")
                 self.assertEqual(len(list_queue_items(self.settings)), 1)
                 self.assertEqual(result.candidate_ids, (list_queue_items(self.settings)[0].queue_id,))
 
     def test_prepared_without_body_waits_without_synthesizing_content(self):
         with patch("ei.pending_capture.write_spool", side_effect=OSError("disk full")):
-            result = self.accept()
+            result = self.accept_functionally()
         self.assertEqual(result.state, "WAITING")
-        self.assertEqual(self.reconcile()["waiting"], 1)
+        self.assertEqual(self.reconcile_functionally()["waiting"], 1)
         self.assertEqual(list_queue_items(self.settings), ())
         self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
-        self.assertEqual(self.accept().state, "SECURED")
+        self.assertEqual(self.accept_functionally().state, "SECURED")
 
     def interrupted_consumer_completion(self, state, waiting=False):
         if waiting:
@@ -186,7 +358,7 @@ class PendingRecoveryTests(unittest.TestCase):
             original(*args, **kwargs)
             raise PowerLoss()
         with patch("ei.queue._atomic_json", side_effect=crash_after_queue), self.assertRaises(PowerLoss):
-            self.accept()
+            self.accept_functionally()
         item = queue.claim_queue_item("consumer", self.settings, now=NOW)
         self.assertIsNotNone(item)
         spool.read_spool(item.payload_ref, self.settings, now=NOW, key_provider=self.key)
@@ -202,7 +374,7 @@ class PendingRecoveryTests(unittest.TestCase):
                 key = InMemoryKeyProvider("restart", b"r" * 32)
                 settings = maintenance_fixtures.make_settings(tmp)
                 self.settings, self.key = settings, key
-                self.accept()
+                self.accept_functionally()
                 accepted = list_queue_items(settings)[0]
                 provider = maintenance_fixtures.YesProvider()
                 original_store = queue._store
@@ -281,8 +453,8 @@ class PendingRecoveryTests(unittest.TestCase):
                         self.assertEqual(old.state if old else None, "WAITING" if waiting else None)
                         with patch("ei.pending_capture.write_spool", side_effect=AssertionError("must not recreate body")), patch("ei.pending_capture.read_spool", side_effect=AssertionError("body already consumed")):
                             if route == "reconcile":
-                                self.assertEqual(self.reconcile()["secured"], 1)
-                            result = self.accept()
+                                self.assertEqual(self.reconcile_functionally()["secured"], 1)
+                            result = self.accept_functionally()
                         self.assertEqual(result.state, "SECURED")
                         self.assertEqual(result.candidate_ids, (terminal.queue_id,))
                         self.assertEqual(result.candidate_hashes, ((terminal.queue_id, ref.content_hash),))
@@ -299,8 +471,8 @@ class PendingRecoveryTests(unittest.TestCase):
         value = json.loads(path.read_text(encoding="utf-8"))
         value["source_hash"] = "sha256:" + "f" * 64
         path.write_text(json.dumps(value), encoding="utf-8")
-        self.assertEqual(self.reconcile()["waiting"], 1)
-        self.assertEqual(self.accept().state, "WAITING")
+        self.assertEqual(self.reconcile_functionally()["waiting"], 1)
+        self.assertEqual(self.accept_functionally().state, "WAITING")
         self.assertIsNone(capture_ledger.read_receipt(self.settings, capture_key(identity())))
         self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
 
@@ -309,8 +481,8 @@ class PendingRecoveryTests(unittest.TestCase):
             with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
                 self.settings = make_settings(Path(tmp))
                 self.interrupted_consumer_completion(state)
-                self.assertEqual(self.reconcile(NOW + timedelta(days=31))["secured"], 1)
-                self.assertEqual(self.accept(now=NOW + timedelta(days=31)).state, "SECURED")
+                self.assertEqual(self.reconcile_functionally(NOW + timedelta(days=31))["secured"], 1)
+                self.assertEqual(self.accept_functionally(now=NOW + timedelta(days=31)).state, "SECURED")
                 self.assertEqual(list_queue_items(self.settings)[0].state, state)
                 self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
 
@@ -320,15 +492,16 @@ class PendingRecoveryTests(unittest.TestCase):
                 self.settings = make_settings(Path(tmp))
                 terminal, ref = self.interrupted_consumer_completion(QueueState.NO_DISCARDED)
                 with patch(target, side_effect=OSError("synthetic storage error")):
-                    self.assertEqual(self.accept().state, "WAITING")
-                self.assertEqual(self.reconcile()["secured"], 1)
-                result = self.accept()
+                    self.assertEqual(self.accept_functionally().state, "WAITING")
+                self.assertEqual(self.reconcile_functionally()["secured"], 1)
+                result = self.accept_functionally()
                 self.assertEqual(result.candidate_hashes, ((terminal.queue_id, ref.content_hash),))
                 self.assertEqual(result.state, "SECURED")
                 self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
 
     def test_owned_temporary_cleanup_retries_after_expiry_receipt(self):
-        self.assertEqual(self.accept().state, "SECURED")
+        accepted = self.accept_functionally()
+        self.assertEqual(accepted.state, "SECURED", msg=f"state={accepted.state}; reason={accepted.reason_code}")
         ref = list_queue_items(self.settings)[0].payload_ref
         body = spool.lookup(self.settings.paths.spool_dir, ref.spool_id)
         orphan = body.with_name(body.name + ".12345678.1234abcd.tmp")
@@ -338,12 +511,12 @@ class PendingRecoveryTests(unittest.TestCase):
             self.assertEqual((receipt.state, receipt.reason_code), ("UNAVAILABLE", "PENDING_EXPIRED"))
             raise OSError("denied")
         with patch("ei.spool._pid_state", return_value=False), patch("ei.spool.safe_unlink", side_effect=denied):
-            failed = self.reconcile(NOW + timedelta(days=30))
+            failed = self.reconcile_functionally(NOW + timedelta(days=30))
         self.assertEqual(failed["cleanup_failed_capture_ids"], [capture_key(identity())])
         self.assertTrue(body.exists())
         self.assertTrue(orphan.exists())
         with patch("ei.spool._pid_state", return_value=False):
-            recovered = self.reconcile(NOW + timedelta(days=30, seconds=1))
+            recovered = self.reconcile_functionally(NOW + timedelta(days=30, seconds=1))
         self.assertEqual(recovered["cleanup_confirmed_capture_ids"], [capture_key(identity())])
         self.assertFalse(body.exists())
         self.assertFalse(orphan.exists())
@@ -353,10 +526,10 @@ class PendingRecoveryTests(unittest.TestCase):
         orphan = self.settings.paths.spool_dir / ("pending_" + "b" * 64 + ".json.12345678.1234abcd.tmp")
         orphan.write_bytes(b"synthetic encrypted fragment")
         with patch("ei.spool._pid_state", return_value=False, create=True), patch("ei.spool.safe_unlink", side_effect=OSError("denied"), create=True):
-            self.assertEqual(self.accept().state, "WAITING")
+            self.assertEqual(self.accept_functionally().state, "WAITING")
         self.assertEqual(list_queue_items(self.settings), ())
         with patch("ei.spool._pid_state", return_value=False, create=True), patch("ei.spool.safe_unlink", side_effect=OSError("denied"), create=True):
-            self.reconcile(NOW + timedelta(days=30))
+            self.reconcile_functionally(NOW + timedelta(days=30))
         receipt = capture_ledger.read_receipt(self.settings, capture_key(identity()))
         self.assertEqual((receipt.state, receipt.reason_code), ("UNAVAILABLE", "PENDING_EXPIRED"))
         self.assertTrue(orphan.exists())
@@ -371,26 +544,27 @@ class PendingRecoveryTests(unittest.TestCase):
         for owner in (True, None):
             with self.subTest(owner=owner), tempfile.TemporaryDirectory() as tmp:
                 self.settings = make_settings(Path(tmp))
-                self.assertEqual(self.accept().state, "SECURED")
+                accepted = self.accept_functionally()
+                self.assertEqual(accepted.state, "SECURED", msg=f"state={accepted.state}; reason={accepted.reason_code}")
                 ref = list_queue_items(self.settings)[0].payload_ref
                 body = spool.lookup(self.settings.paths.spool_dir, ref.spool_id)
                 orphan = body.with_name(body.name + ".12345678.1234abcd.tmp")
                 orphan.write_bytes(b"synthetic encrypted fragment")
                 with patch("ei.spool._pid_state", return_value=owner), patch("ei.spool.safe_unlink", wraps=spool.safe_unlink) as unlink:
-                    result = self.reconcile(NOW + timedelta(days=30))
+                    result = self.reconcile_functionally(NOW + timedelta(days=30))
                 self.assertEqual(result["cleanup_failed_capture_ids"], [capture_key(identity())])
                 self.assertTrue(body.exists())
                 self.assertTrue(orphan.exists())
                 self.assertEqual(unlink.call_count, 0)
 
     def test_key_unavailable_during_recovery_preserves_ciphertext(self):
-        self.accept()
+        self.accept_functionally()
         path = next(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_"))
         before = path.read_bytes()
         with patch.object(self.key, "get", side_effect=KeyProviderError("UNAVAILABLE")):
-            self.assertEqual(self.reconcile()["waiting"], 1)
+            self.assertEqual(self.reconcile_functionally()["waiting"], 1)
         self.assertEqual(path.read_bytes(), before)
-        self.assertEqual(self.reconcile()["secured"], 1)
+        self.assertEqual(self.reconcile_functionally()["secured"], 1)
 
     def test_crash_after_queue_before_receipt_then_expiry_marks_queue_failed(self):
         original = queue._atomic_json
@@ -398,21 +572,21 @@ class PendingRecoveryTests(unittest.TestCase):
             original(*args, **kwargs)
             raise PowerLoss()
         with patch("ei.queue._atomic_json", side_effect=crash), self.assertRaises(PowerLoss):
-            self.accept()
-        self.reconcile(NOW + timedelta(days=30))
+            self.accept_functionally()
+        self.reconcile_functionally(NOW + timedelta(days=30))
         self.assertEqual(list_queue_items(self.settings)[0].state, QueueState.FAILED_NEEDS_ATTENTION)
 
     def test_terminal_no_replay_never_recreates_deleted_body(self):
-        first = self.accept()
+        first = self.accept_functionally()
         item = list_queue_items(self.settings)[0]
         transition_queue_item(item, QueueState.NO_DISCARDED, self.settings, now=NOW)
-        replay = self.accept()
+        replay = self.accept_functionally()
         self.assertEqual(replay.state, "SECURED")
         self.assertEqual(replay.candidate_ids, first.candidate_ids)
         self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
 
     def test_no_cleanup_retries_outside_queue_lock_and_retains_ref_on_failure(self):
-        self.accept()
+        self.accept_functionally()
         item = list_queue_items(self.settings)[0]
         def fail(*args, **kwargs):
             self.assertFalse((self.settings.paths.queue_dir / ".queue.lock").exists())
@@ -426,34 +600,34 @@ class PendingRecoveryTests(unittest.TestCase):
         self.assertIsNone(result.payload_ref)
 
     def test_reconcile_retries_interrupted_no_cleanup(self):
-        self.accept()
+        self.accept_functionally()
         item = list_queue_items(self.settings)[0]
         with patch("ei.queue.delete_spool", side_effect=SpoolError("SPOOL_DELETE_FAILED")), self.assertRaises(SpoolError):
             transition_queue_item(item, QueueState.NO_DISCARDED, self.settings, now=NOW)
-        self.reconcile()
+        self.reconcile_functionally()
         self.assertIsNone(list_queue_items(self.settings)[0].payload_ref)
         self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
 
     def test_reconcile_existing_queue_does_not_enqueue_again(self):
-        self.accept()
+        self.accept_functionally()
         with patch("ei.pending_capture.enqueue_receipt", side_effect=AssertionError("existing queue must be reused")):
-            self.assertEqual(self.reconcile()["secured"], 1)
+            self.assertEqual(self.reconcile_functionally()["secured"], 1)
 
     def test_reconcile_never_recreates_body_deleted_after_authenticated_read(self):
-        self.accept()
+        self.accept_functionally()
         original = pending_capture.read_spool
         def remove_after_read(ref, *args, **kwargs):
             result = original(ref, *args, **kwargs)
             spool.delete_spool(ref, self.settings)
             return result
         with patch("ei.pending_capture.read_spool", side_effect=remove_after_read):
-            self.assertEqual(self.reconcile()["waiting"], 1)
+            self.assertEqual(self.reconcile_functionally()["waiting"], 1)
         self.assertFalse(list(runtime_inventory(self.settings.paths.spool_dir, prefix="pending_")))
 
     def test_stale_transition_cannot_delete_another_candidates_body(self):
-        self.accept()
+        self.accept_functionally()
         first = list_queue_items(self.settings)[0]
-        self.accept(item=replace(observation(), title="独立候補"))
+        self.accept_functionally(item=replace(observation(), title="独立候補"))
         second = next(item for item in list_queue_items(self.settings) if item.queue_id != first.queue_id)
         # A stale caller-supplied ref must never be used as deletion authority.
         stale = replace(first, payload_ref=second.payload_ref)
@@ -465,8 +639,8 @@ class PendingRecoveryTests(unittest.TestCase):
         path = self.settings.capture_policy_path
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"pending": {"max_items": 1}}), encoding="utf-8")
-        self.assertEqual(self.accept().state, "SECURED")
-        self.assertEqual(self.accept(item=replace(observation(), title="別候補")).state, "WAITING")
+        self.assertEqual(self.accept_functionally().state, "SECURED")
+        self.assertEqual(self.accept_functionally(item=replace(observation(), title="別候補")).state, "WAITING")
         self.assertEqual(len(list_queue_items(self.settings)), 1)
 
     def test_disk_full_is_sanitized_and_never_acknowledged(self):
@@ -474,9 +648,9 @@ class PendingRecoveryTests(unittest.TestCase):
             with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
                 self.settings = make_settings(Path(tmp))
                 with patch(target, side_effect=OSError("body and paths must not escape")):
-                    result = self.accept()
+                    result = self.accept_functionally()
                 self.assertEqual((result.state, result.reason_code), ("WAITING", "PENDING_STORAGE_UNAVAILABLE"))
-                self.assertEqual(self.accept().state, "SECURED")
+                self.assertEqual(self.accept_functionally().state, "SECURED")
 
 
 if __name__ == "__main__":
