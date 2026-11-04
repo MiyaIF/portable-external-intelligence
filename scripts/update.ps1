@@ -6,6 +6,8 @@ param(
   [string]$TeamKnowledgeRoot,
   [string]$TeamMemberId,
   [switch]$NoTeamKnowledge,
+  [switch]$SkillAutoApply,
+  [switch]$NoSkillAutoApply,
   [string]$RuntimeRoot,
   [string]$ManifestPath,
   [string]$PythonExe,
@@ -17,6 +19,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 if ($ManifestPath -and ($EngineRoot -or $KnowledgeRoot -or $PersonalKnowledgeRoot -or $TeamKnowledgeRoot -or $TeamMemberId -or $NoTeamKnowledge)) { throw "ROOT_OPTIONS_CONFLICT_WITH_MANIFEST" }
+if ($SkillAutoApply -and $NoSkillAutoApply) { throw "SKILL_AUTO_APPLY_SELECTION_CONFLICT" }
 if ($KnowledgeRoot -and $PersonalKnowledgeRoot) { throw "PERSONAL_KNOWLEDGE_ROOT_CONFLICT" }
 if ($KnowledgeRoot -and -not $EngineRoot) { throw "ENGINE_ROOT_REQUIRED" }
 if ($TeamMemberId -and -not $TeamKnowledgeRoot) { throw "TEAM_KNOWLEDGE_ROOT_REQUIRED" }
@@ -42,6 +45,8 @@ if ($PersonalKnowledgeRoot) { $args += @("--personal-knowledge-root", $PersonalK
 if ($TeamKnowledgeRoot) { $args += @("--team-knowledge-root", $TeamKnowledgeRoot) }
 if ($TeamMemberId) { $args += @("--team-member-id", $TeamMemberId) }
 if ($NoTeamKnowledge) { $args += "--no-team-knowledge" }
+if ($SkillAutoApply) { $args += "--skill-auto-apply" }
+if ($NoSkillAutoApply) { $args += "--no-skill-auto-apply" }
 if ($RuntimeRoot) { $args += @("--runtime-root", $RuntimeRoot) }
 foreach ($item in $Hosts) { $args += @("--hosts", $item) }
 foreach ($item in $HostHome) { $args += @("--host-home", $item) }

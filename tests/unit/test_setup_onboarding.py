@@ -37,15 +37,18 @@ class SetupOnboardingTests(NotificationIsolationMixin, unittest.TestCase):
             )
             output = io.StringIO()
             questions = []
+            answers = iter(("yes", "ollama", "yes"))
 
             def respond():
                 question = output.getvalue().splitlines()[-1]
                 questions.append(question)
-                return "ollama" if len(questions) == 1 else "yes"
+                return next(answers)
 
             with contextlib.redirect_stdout(output), patch("builtins.input", side_effect=respond):
                 selected = _guided_interactive_selection(args)
             self.assertFalse(selected.scheduler)
+            self.assertTrue(selected.skill_auto_apply)
+            self.assertIn("自動保存しますか", questions[0])
             self.assertFalse(any("scheduler" in question for question in questions))
             self.assertFalse((root / "runtime").exists())
 

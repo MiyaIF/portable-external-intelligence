@@ -516,6 +516,22 @@ def _rank_patterns(
             budget.check()
         return (-round(item[0], 12), str(item[1].get("pattern_id", "")), str(item[1].get("cluster_id", "")))
     ranked = sorted(checked(best_by_cluster.values()), key=sort_key)
+    active_claims = {
+        _claim_fingerprint(pattern)
+        for _, pattern in checked(scored)
+        if pattern.get("knowledge_kind") != "project-reference"
+    }
+    filtered_ranked = []
+    seen_references: set[str] = set()
+    for entry in checked(ranked):
+        pattern = entry[1]
+        if pattern.get("knowledge_kind") == "project-reference":
+            claim_key = _claim_fingerprint(pattern)
+            if claim_key in active_claims or claim_key in seen_references:
+                continue
+            seen_references.add(claim_key)
+        filtered_ranked.append(entry)
+    ranked = filtered_ranked
     if result_limit is not None:
         ranked = ranked[:result_limit]
     result: list[RetrievalHit] = []
@@ -536,6 +552,9 @@ def _rank_patterns(
                 supersedes=_values(pattern, "supersedes", "superseded_by"),
                 precondition=str(pattern.get("precondition", "") or ""),
                 failure_mode=str(pattern.get("failure_mode", "") or ""),
+                exceptions=_values(pattern, "exceptions", "exception"),
+                version_constraint=str(pattern.get("version_constraint") or "") or None,
+                knowledge_kind="project-reference" if pattern.get("knowledge_kind") == "project-reference" else "pattern",
             )
         )
     return result
@@ -556,9 +575,14 @@ def rank_patterns(
 def search_index(index: KnowledgeIndex, query: RetrievalQuery, policy: RetrievalPolicy | None = None, *, budget=None) -> list[RetrievalHit]:
     if not isinstance(index, KnowledgeIndex):
         raise TypeError("KNOWLEDGE_INDEX_REQUIRED")
-    from .index import read_index_items
+    from .index import read_recall_items
 
-    patterns = read_index_items(index, list(index.active_pattern_ids) or None, budget=budget)
+    patterns = read_recall_items(
+        index,
+        query.effective_cwd,
+        include_references=bool(query.text.strip()),
+        budget=budget,
+    )
     selected_policy = policy or RetrievalPolicy.defaults()
     return _rank_patterns(query, patterns, selected_policy, result_limit=selected_policy.max_results, budget=budget)
 
@@ -575,9 +599,13 @@ def search_index_candidates(
     if not isinstance(index, KnowledgeIndex):
         raise TypeError("KNOWLEDGE_INDEX_REQUIRED")
     selected_policy = policy or RetrievalPolicy.defaults()
-    from .index import read_index_items
+    from .index import read_recall_items
 
-    patterns = read_index_items(index, list(index.active_pattern_ids) or None)
+    patterns = read_recall_items(
+        index,
+        query.effective_cwd,
+        include_references=knowledge_scope == "personal" and bool(query.text.strip()),
+    )
     return _rank_patterns(
         query,
         patterns,
@@ -687,6 +715,7 @@ def merge_retrieval_hits(
             min(
                 group,
                 key=lambda hit: (
+                    1 if hit.knowledge_kind == "project-reference" else 0,
                     -round(float(hit.score), 12),
                     0 if hit.knowledge_scope == "personal" else 1,
                     str(hit.pattern_id),

@@ -742,6 +742,7 @@ class SetupSelection:
     team_knowledge_root: Path | str | None = None
     team_member_id: str | None = None
     team_knowledge: bool | None = None
+    skill_auto_apply: bool | None = None
     # Internal update-only escape hatch: an existing team descriptor may be
     # retained while its external shared root is temporarily unavailable.
     defer_team_validation: bool = False
@@ -761,6 +762,8 @@ class SetupSelection:
                 raise ValueError("PERSONAL_KNOWLEDGE_ROOT_CONFLICT")
         if self.team_knowledge is not None and type(self.team_knowledge) is not bool:
             raise ValueError("TEAM_KNOWLEDGE_SELECTION_INVALID")
+        if self.skill_auto_apply is not None and type(self.skill_auto_apply) is not bool:
+            raise ValueError("SKILL_AUTO_APPLY_SELECTION_INVALID")
         if self.team_member_id is not None:
             if not isinstance(self.team_member_id, str) or not _TEAM_MEMBER_ID_RE.fullmatch(self.team_member_id):
                 raise ValueError("TEAM_MEMBER_ID_INVALID")
@@ -2057,6 +2060,7 @@ def _normalise_selection(selection: SetupSelection | Mapping[str, Any]) -> Setup
         team_member_id=selected.team_member_id,
         team_knowledge=team_enabled,
         defer_team_validation=selected.defer_team_validation,
+        skill_auto_apply=selected.skill_auto_apply,
     )
 
 
@@ -2181,6 +2185,7 @@ def _manifest_state(manifest: Mapping[str, Any]) -> dict[str, Any]:
         "organizer": copy.deepcopy(normalized.get("organizer")),
         "work_hosts": copy.deepcopy(normalized.get("work_hosts", [])),
         "privacy_profile": normalized.get("privacy_profile"),
+        "skill_auto_apply": normalized.get("skill_auto_apply", False) is True,
         "sync_enabled": normalized.get("sync_enabled"),
         "experiment_enabled": normalized.get("experiment_enabled"),
         "hosts": copy.deepcopy(normalized.get("hosts", {})),
@@ -2411,6 +2416,7 @@ def _desired_setup_state(selected: SetupSelection, current: Mapping[str, Any], s
             "organizer": organizer.to_dict(),
             "work_hosts": list(selected.work_hosts),
             "privacy_profile": selected.privacy_profile,
+            "skill_auto_apply": bool(selected.skill_auto_apply),
             "sync_enabled": bool(selected.sync),
             "experiment_enabled": bool(selected.experiment),
             "hosts": desired_hosts,
@@ -3589,6 +3595,7 @@ def _build_manifest(
         "managed_hook_ids": sorted(managed_ids),
         "providers": _manifest_providers(organizer),
         "privacy_profile": selection.privacy_profile,
+        "skill_auto_apply": bool(selection.skill_auto_apply),
         "sync_enabled": selection.sync,
         "experiment_enabled": selection.experiment,
         "scheduler_requested": selection.scheduler,
@@ -4159,6 +4166,8 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
         raise ValueError("SETUP_PLAN_ACCEPTANCE_REQUIRED")
     runtime = _resolve(selected.runtime_root)
     previous = _previous_manifest_for_selection(runtime, selected, repo)
+    if selected.skill_auto_apply is None:
+        selected = replace(selected, skill_auto_apply=previous.get("skill_auto_apply") is True)
     selected = _effective_team_selection(selected, previous)
     continuity_notice = _team_member_continuity_notice(selected, previous)
     if continuity_notice is not None:
@@ -5223,6 +5232,7 @@ def update(settings: Settings | SetupSelection | Mapping[str, Any], check_only: 
             team_knowledge_root=team_root,
             team_member_id=team_member,
             team_knowledge=team_enabled,
+            skill_auto_apply=settings.skill_auto_apply,
             defer_team_validation=True,
         )
     elif isinstance(settings, SetupSelection):
@@ -5480,6 +5490,13 @@ def _guided_interactive_selection(args: argparse.Namespace) -> SetupSelection:
         or _resolve(manifest_engine) != expected_engine
     ):
         previous = {}
+    skill_auto_apply = getattr(args, "skill_auto_apply", None)
+    if skill_auto_apply is None:
+        if previous:
+            skill_auto_apply = previous.get("skill_auto_apply") is True
+        else:
+            write_utf8("検証済みの再利用知識を、毎回の確認なしに個人ナレッジへ保存します。生会話・秘密情報は保存しません。")
+            skill_auto_apply = prompt_bool("Skillの検証済み知識を個人ナレッジへ自動保存しますか", True)
     previous_hosts, previous_homes, previous_organizer = previous_values(previous)
     requested_homes = {**previous_homes, **requested_homes}
 
@@ -5740,6 +5757,7 @@ def _guided_interactive_selection(args: argparse.Namespace) -> SetupSelection:
         organizer_provider=organizer_provider,
         organizer_host=organizer_host,
         privacy_profile=privacy_profile,
+        skill_auto_apply=skill_auto_apply,
         sync=sync,
         experiment=experiment,
         scheduler=scheduler,
@@ -5907,6 +5925,7 @@ def _interactive_selection(args: argparse.Namespace) -> SetupSelection:
         organizer_provider=organizer_provider,
         organizer_host=organizer_host,
         privacy_profile=privacy_profile,
+        skill_auto_apply=getattr(args, "skill_auto_apply", None),
         sync=sync_enabled,
         experiment=experiment_enabled,
         scheduler=scheduler_enabled,
@@ -5986,6 +6005,10 @@ def _main() -> int:
     parser.add_argument("--organizer-provider")
     parser.add_argument("--organizer-host")
     parser.add_argument("--privacy-profile", default="private-reusable")
+    skill_auto_apply_group = parser.add_mutually_exclusive_group()
+    skill_auto_apply_group.add_argument("--skill-auto-apply", dest="skill_auto_apply", action="store_true")
+    skill_auto_apply_group.add_argument("--no-skill-auto-apply", dest="skill_auto_apply", action="store_false")
+    parser.set_defaults(skill_auto_apply=None)
     parser.add_argument("--knowledge-mode", choices=("local", "github-new", "github-existing"))
     parser.add_argument("--github-repository")
     parser.add_argument("--github-executable", default="gh")

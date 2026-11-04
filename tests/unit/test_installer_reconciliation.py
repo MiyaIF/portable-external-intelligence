@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from ei.installer import SetupResult, already_current_setup_result, blocked_setup_result, check_only_setup_result
-from ei.setup_reconciliation import SetupReconciliationPlan
+from ei.setup_reconciliation import SetupReconciliationPlan, _settings_changes
 
 
 def _plan(status: str = "ALREADY_CURRENT") -> SetupReconciliationPlan:
@@ -51,6 +51,12 @@ class InstallerReconciliationTests(unittest.TestCase):
         self.assertEqual(result.status, "SETUP_BLOCKED")
         self.assertEqual(result.changed_paths, ())
         self.assertEqual(result.errors[0]["error_code"], "PERSONAL_ROOT_CHANGE_REQUIRES_MIGRATION")
+
+    def test_consent_only_setting_change_is_not_reported_as_already_current(self) -> None:
+        self.assertEqual(
+            _settings_changes({"skill_auto_apply": False}, {"skill_auto_apply": True}),
+            ["skill_auto_apply"],
+        )
 
 
 if __name__ == "__main__":

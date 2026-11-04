@@ -342,6 +342,7 @@ class Settings:
     curation_retry_delay_seconds: int
     schema_version: str
     machine_id_hash: str
+    skill_auto_apply: bool = False
 
     def __init__(
         self,
@@ -358,8 +359,11 @@ class Settings:
         experiment_policy_path: Path | None = None,
         schema_version: str | int = "1",
         machine_id_hash: str | None = None,
+        skill_auto_apply: bool = False,
         **legacy: Any,
     ) -> None:
+        if type(skill_auto_apply) is not bool:
+            raise ValueError("SKILL_AUTO_APPLY_SELECTION_INVALID")
         known_legacy = {
             "retrieval_max_chars",
             "retrieval_max_results",
@@ -428,6 +432,7 @@ class Settings:
         object.__setattr__(self, "experiment_policy_path", _resolve_path(experiment_policy_path or policy_root / "experiment-policy.json"))
         object.__setattr__(self, "schema_version", str(schema_version))
         object.__setattr__(self, "machine_id_hash", machine_id_hash or _machine_id_hash())
+        object.__setattr__(self, "skill_auto_apply", skill_auto_apply)
 
         defaults = {
             "retrieval_max_chars": 5000,
@@ -1145,6 +1150,7 @@ def load_settings(
         curation_retry_delay_seconds=retry_delay_seconds,
         schema_version=str(defaults.get("schema_version", 1)),
         machine_id_hash=_machine_id_hash(),
+        skill_auto_apply=active_manifest.get("skill_auto_apply", False) if active_manifest is not None else False,
         retrieval_max_chars=int(retrieval.get("max_chars", 5000)),
         retrieval_max_results=int(retrieval.get("max_results", 5)),
         retrieval_min_score=float(retrieval.get("min_score", 0.35)),

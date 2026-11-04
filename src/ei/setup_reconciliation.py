@@ -655,7 +655,7 @@ def _host_action_changes(
 
 def _settings_changes(current: Mapping[str, Any], desired: Mapping[str, Any]) -> list[str]:
     changed: list[str] = []
-    for key in ("providers", "privacy_profile", "experiment_enabled", "engine_root", "sync_enabled"):
+    for key in ("providers", "privacy_profile", "experiment_enabled", "engine_root", "sync_enabled", "skill_auto_apply"):
         if _without_volatile(_field(current, key)) != _without_volatile(_field(desired, key)):
             changed.append(key)
     current_team = _team_store(current)

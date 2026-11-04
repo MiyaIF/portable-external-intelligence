@@ -122,6 +122,244 @@ class SafeFilesystemTests(unittest.TestCase):
             self.assertTrue(all(not follows for _, follows in calls))
             self.assertTrue(all(count == 1 for count in Counter(path for path, _ in calls).values()))
 
+    def test_safe_target_rechecks_root_once_before_and_once_after_canonicalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            target = root / "nested" / "missing"
+            target.parent.mkdir(parents=True)
+            original = Path.stat
+            calls = []
+
+            def probe(path, *, follow_symlinks=True):
+                if not follow_symlinks:
+                    calls.append(Path(path))
+                return original(path, follow_symlinks=follow_symlinks)
+
+            def components(path):
+                current = Path(path.anchor)
+                result = []
+                for index, part in enumerate(path.parts):
+                    if index == 0 and path.anchor:
+                        continue
+                    current = current / part
+                    result.append(current)
+                return result
+
+            with patch.object(Path, "stat", probe):
+                self.assertEqual(assert_safe_target(root, target), target)
+
+            root_components = components(root)
+            expected = Counter({component: 2 for component in root_components})
+            expected.update(component for component in components(target) if component not in root_components)
+            expected[target] = 2
+            self.assertEqual(Counter(calls), expected, f"actual no-follow probes={Counter(calls)!r}")
+
+    def test_safe_target_rejects_a_root_denial_during_the_target_walk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            target = root / "nested" / "missing"
+            target.parent.mkdir(parents=True)
+            original_canonical_path = safe_fs.canonical_path
+            original_reparse_components = safe_fs._reparse_components
+            original_stat = Path.stat
+            state = {"canonicalized": False, "target_walk": False}
+
+            def canonicalize(value, *, require_exists=False):
+                result = original_canonical_path(value, require_exists=require_exists)
+                if Path(value) == root:
+                    state["canonicalized"] = True
+                return result
+
+            def traverse(path, *, allow_final_reparse=False):
+                if state["canonicalized"] and Path(path) == target:
+                    state["target_walk"] = True
+                return original_reparse_components(path, allow_final_reparse=allow_final_reparse)
+
+            def probe(path, *, follow_symlinks=True):
+                if (
+                    state["canonicalized"]
+                    and state["target_walk"]
+                    and Path(path) == root
+                    and not follow_symlinks
+                ):
+                    raise PermissionError("simulated post-canonicalization root denial")
+                return original_stat(path, follow_symlinks=follow_symlinks)
+
+            with patch("ei.safe_fs.canonical_path", side_effect=canonicalize), patch(
+                "ei.safe_fs._reparse_components", side_effect=traverse
+            ), patch.object(Path, "stat", probe):
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, target)
+
+            self.assertTrue(state["target_walk"])
+
+    def test_safe_target_uses_full_root_walk_when_canonical_root_differs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            target = root / "missing"
+            canonical_root = root.parent
+            original_canonical_path = safe_fs.canonical_path
+            original_stat = Path.stat
+            calls = []
+
+            def canonicalize(value, *, require_exists=False):
+                if Path(value) == root:
+                    return canonical_root
+                return original_canonical_path(value, require_exists=require_exists)
+
+            def probe(path, *, follow_symlinks=True):
+                if not follow_symlinks:
+                    calls.append(Path(path))
+                return original_stat(path, follow_symlinks=follow_symlinks)
+
+            with patch("ei.safe_fs.canonical_path", side_effect=canonicalize), patch.object(Path, "stat", probe):
+                self.assertEqual(assert_safe_target(root, target), target)
+
+            self.assertEqual(Counter(calls)[canonical_root], 4)
+
+    def test_safe_target_rechecks_differently_spelled_canonical_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "Root"
+            target = root / "nested" / "missing"
+            target.parent.mkdir(parents=True)
+            canonical_root = root.with_name("root")
+            original_canonical_path = safe_fs.canonical_path
+            original_stat = Path.stat
+            canonicalized = False
+
+            def canonicalize(value, *, require_exists=False):
+                nonlocal canonicalized
+                if Path(value) == root:
+                    result = canonical_root
+                else:
+                    result = original_canonical_path(value, require_exists=require_exists)
+                if Path(value) == root:
+                    canonicalized = True
+                return result
+
+            def probe(path, *, follow_symlinks=True):
+                if (
+                    canonicalized
+                    and not follow_symlinks
+                    and Path(path).parts == canonical_root.parts
+                ):
+                    raise PermissionError("simulated canonical-root denial")
+                return original_stat(path, follow_symlinks=follow_symlinks)
+
+            with patch("ei.safe_fs.canonical_path", side_effect=canonicalize), patch.object(Path, "stat", probe):
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, target)
+
+    def test_safe_target_keeps_anchor_root_probe_on_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(Path.cwd().anchor)
+            target = root / f"__safe_fs_missing_{Path(tmp).name}__"
+            original_canonical_path = safe_fs.canonical_path
+            original_stat = Path.stat
+            canonicalized = False
+
+            def canonicalize(value, *, require_exists=False):
+                nonlocal canonicalized
+                result = original_canonical_path(value, require_exists=require_exists)
+                if Path(value) == root:
+                    canonicalized = True
+                return result
+
+            def probe(path, *, follow_symlinks=True):
+                if canonicalized and not follow_symlinks and Path(path).parts == root.parts:
+                    raise PermissionError("simulated anchor-root denial")
+                return original_stat(path, follow_symlinks=follow_symlinks)
+
+            with patch("ei.safe_fs.canonical_path", side_effect=canonicalize), patch.object(Path, "stat", probe):
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, target)
+
+    def test_safe_target_does_not_skip_root_when_target_is_root_and_final_link_is_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            original_canonical_path = safe_fs.canonical_path
+            original_is_reparse = safe_fs._is_reparse
+            canonicalized = False
+
+            def canonicalize(value, *, require_exists=False):
+                nonlocal canonicalized
+                result = original_canonical_path(value, require_exists=require_exists)
+                if Path(value) == root:
+                    canonicalized = True
+                return result
+
+            def probe_reparse(path):
+                if canonicalized and Path(path) == root:
+                    return True
+                return original_is_reparse(path)
+
+            with patch("ei.safe_fs.canonical_path", side_effect=canonicalize), patch(
+                "ei.safe_fs._is_reparse", side_effect=probe_reparse
+            ):
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(
+                        root,
+                        root,
+                        allow_root=True,
+                        allow_missing=False,
+                        allow_final_symlink=True,
+                    )
+
+    def test_safe_target_rejects_reparse_parent_and_target_probes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            outside = Path(tmp) / "outside"
+            root.mkdir()
+            outside.mkdir()
+            parent = root / "parent"
+            parent.mkdir()
+            parent_target = parent / "missing"
+            target = root / "target"
+            original = Path.stat
+            reparse_path = parent
+
+            def probe(path, *, follow_symlinks=True):
+                if not follow_symlinks and Path(path) == reparse_path:
+                    return SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0, st_reparse_tag=0)
+                return original(path, follow_symlinks=follow_symlinks)
+
+            with patch.object(Path, "stat", probe):
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, parent_target)
+                reparse_path = target
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, target)
+
+                reparse_path = None
+                with self.assertRaisesRegex(SafeFilesystemError, "SAFE_PATH_OUTSIDE_ROOT"):
+                    assert_safe_target(root, outside / "missing")
+
+    def test_safe_target_rechecks_changed_target_and_root_on_later_calls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "root"
+            root.mkdir()
+            target = root / "entry"
+            original = Path.stat
+            reparse_path = None
+
+            def probe(path, *, follow_symlinks=True):
+                if not follow_symlinks and Path(path) == reparse_path:
+                    return SimpleNamespace(st_mode=stat.S_IFLNK, st_file_attributes=0, st_reparse_tag=0)
+                return original(path, follow_symlinks=follow_symlinks)
+
+            with patch.object(Path, "stat", probe):
+                self.assertEqual(assert_safe_target(root, target), target)
+
+                reparse_path = target
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, target)
+
+                reparse_path = root
+                with self.assertRaisesRegex(SafeFilesystemError, "UNSAFE_REPARSE_POINT"):
+                    assert_safe_target(root, target)
+
     def test_dangling_symlink_is_still_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

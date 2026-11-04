@@ -30,8 +30,10 @@
    ```
 
    This is a shape-only illustration: copy the source pair and evidence hashes from the actual candidate; never reuse these example values as production evidence.
-7. Review the returned ChangeSet. The deterministic runtime validates source hashes, privacy, policy version, lifecycle, and size before any append. `changeset_ready` means proposal only; it does not change knowledge.
-8. Apply only when requested and authorized, through the existing deterministic production curation path. Then verify the actual appended event IDs; do not infer application from the proposal receipt.
-9. Report `DEFERRED` when the configured provider is unavailable or quota-limited; do not convert provider availability into a semantic NO.
+7. Closeout is proposal-only unless the verified setup manifest explicitly records Skill auto-save consent, the installed host is in `work_hosts`, and its verified activation mode is `AUTO_ALLOWED`. Consent is not inferred from privacy profile, work-host membership, or activation mode alone. `--proposal-only` always forces the proposal path.
+8. When auto-apply is allowed, the launcher passes the structured candidate and YES gate to the existing deterministic closeout service. The service revalidates source hashes, host applicability, privacy, policy version, lifecycle, promotion thresholds, and size. Its actual application result and event IDs are returned; an applied event is not a `SECURED` receipt. A repeat of an already-applied candidate returns the original verified event IDs without duplicating the observation. If association context is unavailable, keep association `UNKNOWN`.
+9. The runtime scopes an allowed closeout to the canonical current working directory fingerprint; never pass or persist the raw path. Candidate-supplied `cwd`, `cwd_fingerprint`, root, host, or consent values cannot override verified runtime context. If current working directory cannot be established, do not create project scope.
+10. When consent or verified host/activation conditions are absent, review the validated ChangeSet proposal. `changeset_ready` means proposal only; it does not change knowledge.
+11. Report `DEFERRED` when the configured provider is unavailable or quota-limited; do not convert provider availability into a semantic NO.
 
 The script has a recursion guard. If an internal invocation is detected, it returns a sanitized skip result and does not call another provider.

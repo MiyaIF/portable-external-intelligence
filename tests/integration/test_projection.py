@@ -19,6 +19,45 @@ def rule_event(number):
 
 
 class ProjectionTests(unittest.TestCase):
+    def test_observation_reference_metadata_is_project_local_and_not_promoted(self):
+        cwd_fingerprint = "sha256:" + "f" * 64
+        claim = "Check the observation receipt before retrying the same operation."
+        observation = Event.create(
+            "observation.recorded", "2026-09-01T00:00:00+00:00", "test", "machine",
+            {"observation_id": "obs_project_receipt", "title": "Retry receipt", "claim": claim,
+             "cwd_fingerprint": cwd_fingerprint, "classification": "private-reusable",
+             "precondition": "The first write may have completed.", "failure_mode": "Blind retry duplicates a write.",
+             "exception": "Confirm the operation identity first.", "version_constraint": ">=1.0,<2"},
+            event_id="evt_project_receipt",
+        )
+        pattern = Event.create(
+            "pattern.promoted", "2026-09-02T00:00:00+00:00", "test", "machine",
+            {"pattern_id": "pat_retry_receipt", "rule": claim, "claim": claim,
+             "classification": "private-reusable", "provenances": ["source:one", "source:two"]},
+            event_id="evt_retry_receipt",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "knowledge"
+            project_events([observation], root, budget=OperationBudget(10000))
+            current = json.loads((root / "index.json").read_text(encoding="utf-8"))
+            projection = root / current["projection_generation"]["path"]
+            document = json.loads((projection / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(document["project_reference_ids_by_cwd"], {cwd_fingerprint: ["obs_project_receipt"]})
+            rendered = (projection / "memories" / "obs_project_receipt.md").read_text(encoding="utf-8")
+            self.assertIn(f"- Cwd fingerprint: {cwd_fingerprint}", rendered)
+            self.assertIn("- Precondition: The first write may have completed.", rendered)
+            self.assertIn("- Failure mode: Blind retry duplicates a write.", rendered)
+            self.assertIn("- Exception: Confirm the operation identity first.", rendered)
+            self.assertIn("- Version constraint: >=1.0,<2", rendered)
+            self.assertEqual(observation.payload["cwd_fingerprint"], cwd_fingerprint)
+
+            project_events([observation, pattern], root, budget=OperationBudget(10000))
+            updated = json.loads((root / "index.json").read_text(encoding="utf-8"))
+            updated_projection = root / updated["projection_generation"]["path"]
+            updated_document = json.loads((updated_projection / "index.json").read_text(encoding="utf-8"))
+            self.assertEqual(updated_document["project_reference_ids_by_cwd"], {})
+            self.assertEqual(updated_document["active_pattern_ids"], ["pat_retry_receipt"])
+
     def test_generation_attributes_control_is_exact_and_user_rules_are_preserved(self):
         for content in (b"* text=auto\n", b".projection-generations/** -text\nother -text\n"):
             with self.subTest(content=content), tempfile.TemporaryDirectory() as tmp:
