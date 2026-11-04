@@ -66,6 +66,7 @@
     "experiment_enabled": {"type": "boolean"},
     "scheduler_requested": {"type": "boolean"},
     "skill_source": {"type": "string", "minLength": 1},
+    "skill_auto_apply": {"type": "boolean"},
     "skill_source_hash": {"$ref": "#/$defs/nullableDigest"},
     "hook_schema_hash": {"$ref": "#/$defs/nullableDigest"},
     "skip_venv": {"type": "boolean"},

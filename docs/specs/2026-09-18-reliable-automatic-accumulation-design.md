@@ -311,6 +311,20 @@ Task10のfault-injection testsは、一時rootとfake provider/通知境界を�
 
 実行時の確認: Task11の対象binding/context検証は対象33テストと限定レビューに合格した。Task12では、同内容から同じchangeset IDが生成されてもgenerated_atの差でfingerprintが変わり、既存適用処理がALREADY_APPLIEDと空のevent IDsだけを返すことを再現した。2026-10-01、利用者は新しい索引を追加せず、既存適用処理から元の保存記録を検証側へ渡すAPI拡張を承認した。Task12Aの受け渡しは実装・対象17テスト・独立した仕様/品質レビューまで完了した。参照の存在は保存証拠ではない。2026-10-05、参照先を直接読む検証処理も対象26テスト（25成功・環境依存1スキップ）と独立した仕様/品質レビューに合格した。Task12の耐障害association、Task13、最終全体検証・公開は完了していない。
 
+### 2026-11-04 承認済み追加: 自動保存と同一案件の参考情報
+
+利用者は、設定済みの保存許可の範囲でSkillの保存案を検証後に自動保存し、1回の経験もその案件限定の参考情報として次回取得する変更を承認した。本節は、下記の「Skillは提案のみ」という従来の既定動作を置き換える。提案状態と適用状態、対象関連付けの証明は引き続き別である。
+
+- 有効なインストールbinding・選択済み作業Host・保存可能なprivacy設定と、setupの保存許可 `skill_auto_apply=true` を確認してから、構造化YES候補を既存のdeterministic closeout/changeset適用経路へ渡す。既存manifestにはこの専用許可がないため、欠落はfalseとして扱い、`work_hosts` や `AUTO_ALLOWED` だけを保存許可へ読み替えない。初回対話setupで用途を説明して一度だけ選択し、非対話は明示flagで指定する。updateは保存済みのtrue/falseを維持する。既に与えられたgate判定を再推論しない。候補本文から自動保存許可を作らず、無効・未承認・不明な設定では自動適用しない。明示的な提案専用操作は維持する。
+- 個人journalへの実保存結果とevent IDを返す。再実行で重複保存せず、privacy・source・policy・size・append-only検証を維持する。trusted target contextがない場合はassociation UNKNOWNのままとし、知識保存だけからSECUREDや全turn取得完了を作らない。
+- Skillの実際の呼出しcwdを保存・取得の案件識別に使う。候補の自由文やlauncherのエンジン用subprocess cwdを根拠にしない。案件不明の旧記録を推測で割り当てず、既存journalを変更しない。
+- 未昇格の観察記録は、保存時と取得時のcwd fingerprintが完全一致する個人storeの検索だけに参加する。queryなし、scope不明、不一致、他storeでは返さない。domain・scope tag・Host一致だけを案件一致の代用にしない。
+- 参考情報は有効化済みルールと型・表示を区別し、未昇格・案件限定であることをcontextに明記する。適用前提、失敗条件、例外、version、Host applicability、privacyを検査し、既存の件数・文字数上限を共有する。別案件・チームへの自動展開やalways-on昇格には使わない。
+- 複数案件に通用するルールの昇格条件（独立provenance 2、異なるscope 2、benefit 1、未解決矛盾0）は変更しない。既存のexperiment設定も勝手に変更せず、controlではcontextを注入しない。
+- 新しい索引ファイル・DB・永続cacheは追加しない。既存projection/indexの案件metadataを拡張して候補を絞り、検索で全観察本文を走査しない。検索のread-only経路は、generation・manifest・index・選択した項目のhash連鎖とpath/identityを確認してから返す。保守・同期の全ファイル検証は維持する。
+
+完成判定は、通常の実CLI作業で保存の追加許可を求めずにeventが残り、通常の保守処理で索引更新が完了し、別セッションの同一案件で参考情報が取得でき、別案件では取得されないこと。CI・mock・明示的な手動保存だけをこの実証の代用にしない。
+
 ### 12.1 現状と変更しないもの
 
 - エンジンの `ei closeout` は候補を評価し、YESの場合はcurator・changeset検証・journal適用を行う。一方、配布Skillの `scripts/closeout.py` は `changeset_ready` を返す提案経路であり、それだけで適用完了にはならない。

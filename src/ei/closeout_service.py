@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 from uuid import uuid4
 
-from .changeset import apply_changeset, validate_changeset
+from .changeset import apply_changeset, read_application_proof, validate_changeset
 from .ids import fingerprint, machine_id, stable_hash
 from .index import build_index
 from .inference.router import ProviderSelectionError
-from .journal import append_event
+from .journal import JournalIntegrityError, append_event, read_event
 from .models import Event, ObservationInput, validate_host_label
 from .privacy import inspect_observation
 
@@ -57,6 +57,7 @@ def _event_audit(
     trusted_record_hash: str | None = None,
     semantic_content_hash: str | None = None,
     unique_attempt: bool = False,
+    idempotent_replay: bool = False,
 ) -> None:
     payload = {
         "decision": decision.decision,
@@ -97,6 +98,19 @@ def _event_audit(
         payload,
         event_id=event_id,
     )
+    if idempotent_replay:
+        for path in Path(settings.paths.event_dir).rglob(f"{event.event_id}.json"):
+            existing = read_event(path)
+            same_audit = (
+                existing.event_id == event.event_id
+                and existing.event_type == event.event_type
+                and existing.actor == event.actor
+                and existing.machine_id == event.machine_id
+                and existing.payload == event.payload
+            )
+            if same_audit:
+                return
+            raise JournalIntegrityError(f"EVENT_ID_COLLISION:{event.event_id}")
     append_event(event, settings.paths.event_dir)
 
 
@@ -192,12 +206,22 @@ def _curator_input(candidate: Mapping[str, Any], decision: Any) -> dict[str, Any
     }
 
 
-def _team_result(settings: Any, *, applied: bool, changeset: Any, event_ids: tuple[str, ...], candidate: Mapping[str, Any]) -> dict[str, Any]:
+def _team_result(
+    settings: Any,
+    *,
+    applied: bool,
+    changeset: Any,
+    event_ids: tuple[str, ...],
+    candidate: Mapping[str, Any],
+    route_team: bool = True,
+) -> dict[str, Any]:
     team_store = getattr(getattr(settings, "knowledge_stores", None), "team", None)
     if team_store is None:
         return {"status": "DISABLED", "reason_code": "TEAM_DISABLED"}
     if not applied:
         return {"status": "SKIPPED", "reason_code": "PERSONAL_APPLY_NOT_SUCCESS"}
+    if not route_team:
+        return {"status": "SKIPPED", "reason_code": "TEAM_ROUTING_NOT_REQUESTED"}
     from .team_routing import route_applied_personal_knowledge
 
     change_hash = getattr(changeset, "fingerprint", None)
@@ -390,12 +414,18 @@ def _associated_payload(decision: Any, candidate: Mapping[str, Any], settings: A
 
 
 def process_closeout(payload: Mapping[str, Any], settings: Any, *, validation: ContextValidation | None = None,
-                     now: datetime | None = None, budget: OperationBudget | None = None) -> CloseoutResult:
+                     now: datetime | None = None, budget: OperationBudget | None = None,
+                     route_team: bool = True) -> CloseoutResult:
     """Evaluate and apply one closeout, optionally binding it to adapter targets."""
     if budget is not None:
         budget.check()
     if not isinstance(payload, Mapping):
         raise InputError("CLOSEOUT_OBJECT_REQUIRED")
+    if type(route_team) is not bool:
+        raise InputError("CLOSEOUT_TEAM_ROUTING_POLICY_INVALID")
+    if not route_team and validation is not None:
+        raise InputError("CLOSEOUT_TEAM_ROUTING_POLICY_UNSUPPORTED_FOR_TRUSTED_CONTEXT")
+    structured_gate_decision = isinstance(payload.get("gate_decision"), Mapping)
     nested_candidate = payload.get("candidate")
     if nested_candidate is not None and not isinstance(nested_candidate, Mapping):
         raise InputError("CLOSEOUT_CANDIDATE_OBJECT_REQUIRED")
@@ -488,7 +518,12 @@ def process_closeout(payload: Mapping[str, Any], settings: Any, *, validation: C
         if trusted_entry and getattr(validation, "valid", False) and privacy_rejected_no:
             _event_audit(settings, decision, candidate, unique_attempt=True)
         elif not (trusted_entry and getattr(validation, "valid", False)):
-            _event_audit(settings, decision, candidate)
+            _event_audit(
+                settings,
+                decision,
+                candidate,
+                idempotent_replay=structured_gate_decision and decision.decision == "YES",
+            )
 
     if decision.decision in {"NO", "DEFERRED", "FAILED"}:
         if decision.decision == "NO" and trusted_entry and getattr(validation, "valid", False) and not privacy_rejected_no:
@@ -530,8 +565,21 @@ def process_closeout(payload: Mapping[str, Any], settings: Any, *, validation: C
             raise PrivacyRejected(code)
         raise InputError(code)
     applied = apply_changeset(changeset, settings, budget=budget)
+    applied_event_ids = tuple(applied.event_ids)
+    if applied.applied and applied.already_applied:
+        if applied.application_ref is None:
+            raise InputError("APPLICATION_PROOF_INVALID")
+        proof = read_application_proof(
+            changeset,
+            settings,
+            application_ref=applied.application_ref,
+            budget=budget,
+        )
+        if not proof.applied:
+            raise InputError("APPLICATION_PROOF_INVALID")
+        applied_event_ids = tuple(proof.event_ids)
     team = _team_result(settings, applied=applied.applied, changeset=changeset,
-                        event_ids=tuple(applied.event_ids), candidate=curator_input)
+                        event_ids=applied_event_ids, candidate=curator_input, route_team=route_team)
     value = {
         "status": "applied" if applied.applied else "failed",
         "gate": decision.to_dict(),
@@ -539,7 +587,7 @@ def process_closeout(payload: Mapping[str, Any], settings: Any, *, validation: C
             "changeset": changeset.to_dict(),
             "applied": applied.applied,
             "reason_code": applied.reason_code,
-            "event_ids": list(applied.event_ids),
+            "event_ids": list(applied_event_ids),
             "already_applied": applied.already_applied,
         },
         "personal": {"status": "READY" if applied.applied else "FAILED", "reason_code": applied.reason_code},

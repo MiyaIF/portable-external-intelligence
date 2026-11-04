@@ -16,6 +16,47 @@ from ei.retrieve import (
 
 
 class RetrievalTests(unittest.TestCase):
+    def test_merge_prefers_active_over_personal_project_reference_for_same_claim(self):
+        from ei.models import RetrievalHit
+        from ei.retrieve import merge_retrieval_hits
+
+        claim = "Check the bound receipt before repeating a write."
+        personal_reference = RetrievalHit(
+            pattern_id="obs_project_receipt",
+            cluster_id="obs_project_receipt",
+            score=0.95,
+            rule=claim,
+            applicability=(),
+            evidence_count=1,
+            updated_at="2026-09-01T00:00:00+00:00",
+            knowledge_kind="project-reference",
+        )
+        team_active = RetrievalHit(
+            pattern_id="pat_active_receipt",
+            cluster_id="pat_active_receipt",
+            score=0.75,
+            rule=claim,
+            applicability=(),
+            evidence_count=3,
+            updated_at="2026-09-01T00:00:00+00:00",
+            knowledge_kind="pattern",
+        )
+        other_active = RetrievalHit(
+            pattern_id="pat_other_claim",
+            cluster_id="pat_other_claim",
+            score=0.85,
+            rule="Inspect the separate operation result before retrying.",
+            applicability=(),
+            evidence_count=2,
+            updated_at="2026-09-01T00:00:00+00:00",
+            knowledge_kind="pattern",
+        )
+
+        merged = merge_retrieval_hits([personal_reference], [team_active, other_active])
+
+        self.assertEqual([hit.pattern_id for hit in merged], ["pat_other_claim", "pat_active_receipt"])
+        self.assertEqual(merged[1].knowledge_scope, "team")
+
     def test_shared_deadline_covers_iteration_scoring_and_exposure_append(self):
         from ei.operation_runtime import OperationBudget
         from tests.integration.test_unattended_operation import RemainingBudget
@@ -136,6 +177,24 @@ class RetrievalTests(unittest.TestCase):
             policy,
         )
         self.assertEqual(result, [])
+
+    def test_project_reference_keeps_version_guard_and_active_claim_priority(self):
+        reference = self._host_pattern(
+            pattern_id="obs_reference",
+            cluster_id="obs_reference",
+            rule="Check the receipt before retrying.",
+            knowledge_kind="project-reference",
+            version_constraint=">=1.0,<2",
+        )
+        active = self._host_pattern(
+            pattern_id="pat_active_receipt",
+            cluster_id="pat_active_receipt",
+            rule="Check the receipt before retrying.",
+        )
+        self.assertEqual(rank_patterns(RetrievalQuery(prompt="receipt retry"), [reference]), [])
+        self.assertEqual(rank_patterns(RetrievalQuery(prompt="receipt retry", version="2.0"), [reference]), [])
+        result = rank_patterns(RetrievalQuery(prompt="receipt retry", version="1.5"), [reference, active])
+        self.assertEqual([hit.pattern_id for hit in result], ["pat_active_receipt"])
 
     def test_current_scope_requires_complete_source_pair(self):
         pattern = self._host_pattern(

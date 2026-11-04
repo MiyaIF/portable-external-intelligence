@@ -11,6 +11,8 @@ from unittest.mock import patch
 import ei.hook_entry as hook_entry
 from ei.hook_status import HookStatus
 from ei.hook_entry import _read_stdin_bounded, handle_hook, handle_normalized_hook, normalize_hook_event, run_hook
+from ei.models import Event
+from ei.project import project_events
 from tests.helpers import make_hook_settings
 
 
@@ -56,6 +58,54 @@ class HookEntryTests(unittest.TestCase):
             self.assertEqual(hook_entry._recall(event, "reuse rule", settings, "prompt", 5000), ([], ""))
         self.assertEqual(captured["query"].host_id, event.source_host_id)
         self.assertEqual(captured["query"].host_family, event.source_host_family)
+
+    def test_normal_hook_retrieves_only_exact_project_reference_with_warning_label(self):
+        settings = make_hook_settings(self.root)
+        prompt = "check receipt before retrying"
+        event = normalize_hook_event(
+            "codex-cli",
+            {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "t1", "cwd": "C:/work/project", "prompt": prompt},
+            settings,
+        )
+        observation = Event.create(
+            "observation.recorded", "2026-09-01T00:00:00+00:00", "test", "machine",
+            {"observation_id": "obs_hook_reference", "title": "Retry receipt", "claim": "Check receipt before retrying the same operation.",
+             "cwd_fingerprint": event.cwd_hash, "classification": "private-reusable"},
+            event_id="evt_hook_reference",
+        )
+        project_events([observation], settings.paths.knowledge_dir)
+
+        hits, context = hook_entry._recall(event, prompt, settings, "prompt", 5000)
+
+        self.assertEqual([hit.pattern_id for hit in hits], ["obs_hook_reference"])
+        self.assertEqual(hits[0].knowledge_kind, "project-reference")
+        self.assertIn("Project-only reference (unpromoted; verify applicability)", context)
+        self.assertNotIn("C:/work/project", context)
+
+    def test_experiment_recall_exposes_observation_id_without_changing_control(self):
+        from ei.experiment import assign_variant
+
+        settings = replace(make_hook_settings(self.root), experiment_enabled=True, experiment_id="retrieval-v1")
+        session = next(f"reference-treatment-{index}" for index in range(1000) if assign_variant(f"reference-treatment-{index}", "retrieval-v1").value == "treatment")
+        prompt = "check receipt before retrying"
+        event = normalize_hook_event(
+            "codex-cli",
+            {"hook_event_name": "UserPromptSubmit", "session_id": session, "turn_id": "t1", "cwd": "C:/work/project", "prompt": prompt},
+            settings,
+        )
+        observation = Event.create(
+            "observation.recorded", "2026-09-01T00:00:00+00:00", "test", "machine",
+            {"observation_id": "obs_experiment_reference", "title": "Retry receipt", "claim": "Check receipt before retrying the same operation.",
+             "cwd_fingerprint": event.cwd_hash, "classification": "private-reusable"},
+            event_id="evt_experiment_reference",
+        )
+        project_events([observation], settings.paths.knowledge_dir)
+
+        result = handle_normalized_hook(event, settings)
+
+        self.assertIn("Project-only reference (unpromoted; verify applicability)", result.additional_context)
+        exposure_path = settings.paths.runtime_dir / "experiment-exposures.jsonl"
+        self.assertIn("obs_experiment_reference", exposure_path.read_text(encoding="utf-8"))
 
     def test_structured_index_failure_does_not_fall_back_to_markdown_recall(self):
         settings = make_hook_settings(self.root)

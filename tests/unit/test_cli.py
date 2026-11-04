@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import ei.installer as installer_module
 import ei.cli as cli_module
@@ -264,6 +264,34 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             )
         self.assertNotEqual(code, 0)
         self.assertEqual(json.loads(output.getvalue())["error_code"], "ARGUMENTS_INVALID")
+
+    def test_setup_skill_auto_apply_flags_reach_selection_and_are_mutually_exclusive(self) -> None:
+        for flag, expected in ((None, None), ("--skill-auto-apply", True), ("--no-skill-auto-apply", False)):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                arguments = [*self._setup_arguments(root), "--non-interactive", "--accept-plan", "--json"]
+                if flag is not None:
+                    arguments.append(flag)
+                result = Mock()
+                result.ok = True
+                result.to_dict.return_value = {"ok": True, "status": "SETUP_COMPLETE"}
+                with patch("ei.cli.installer_setup", return_value=result) as install, contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(main(arguments), 0)
+                self.assertIs(install.call_args.args[0].skill_auto_apply, expected)
+
+        output = io.StringIO()
+        with patch("ei.cli.installer_setup") as install, contextlib.redirect_stdout(output):
+            code = main(
+                [
+                    *self._setup_arguments(Path("unused")),
+                    "--skill-auto-apply",
+                    "--no-skill-auto-apply",
+                    "--json",
+                ]
+            )
+        self.assertNotEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue())["error_code"], "ARGUMENTS_INVALID")
+        install.assert_not_called()
 
     def test_team_knowledge_is_tri_state_and_member_requires_enablement(self) -> None:
         omitted = SetupSelection()
@@ -636,6 +664,7 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             fake_result.ok = True
             fake_result.to_dict.return_value = {"ok": True, "status": "SETUP_COMPLETE"}
             answers = [
+                "yes",     # Skill auto-save consent
                 "1",       # organizer provider: subscription CLI
                 "1",       # organizer host: Codex CLI
                 "1,2",     # work hosts: Codex CLI and Claude Code
@@ -679,6 +708,7 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             self.assertEqual(selection.organizer_provider, "subscription-cli")
             self.assertEqual(selection.organizer_host, "codex-cli")
             self.assertEqual(selection.work_hosts, ("codex-cli", "claude-code"))
+            self.assertTrue(selection.skill_auto_apply)
             self.assertTrue(selection.accept_plan)
 
     def test_status_separates_one_organizer_from_all_work_hosts_and_queue(self):
@@ -730,7 +760,7 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             result.ok = True
             result.to_dict.return_value = {"ok": True, "status": "SETUP_COMPLETE"}
             answers = [
-                "1", "1", "1", "yes", "1", "1", "Test Compatible CLI",
+                "yes", "1", "1", "1", "yes", "1", "1", "Test Compatible CLI",
                 "test-compatible", str(root / "custom-home"),
                 ".config/test/settings.json", ".config/test/context.md", ".config/test/skills",
                 "local", str(root / "knowledge"), str(root / "runtime"), "no", "no", "no", "yes",
@@ -752,6 +782,7 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             self.assertEqual(code, 0, output.getvalue())
             selection = install.call_args.args[0]
             self.assertEqual(selection.work_hosts, ("codex-cli", "test-compatible-cli"))
+            self.assertTrue(selection.skill_auto_apply)
             self.assertEqual(selection.host_profile_documents["test-compatible-cli"]["adapter_id"], "codex-cli")
             self.assertFalse((root / "runtime" / "host-profiles").exists())
 
@@ -770,7 +801,7 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             team = root / "team-knowledge"
             default_runtime = user_home / ".external-intelligence" / "runtime"
             first_answers = [
-                "1", "1", "1", "yes", "new", "1", "Test Compatible CLI",
+                "yes", "1", "1", "1", "yes", "new", "1", "Test Compatible CLI",
                 "test-compatible", str(custom_home), ".config/test/settings.json",
                 ".config/test/context.md", ".config/test/skills", "1", str(personal),
                 "", "yes", str(team), "member-a", "no", "no", "yes", "no", "",
@@ -801,6 +832,7 @@ class CliTests(NotificationIsolationMixin, unittest.TestCase):
             self.assertEqual(manifest["knowledge_root"], str(personal.resolve()))
             self.assertEqual(manifest["work_hosts"], ["codex-cli", "test-compatible-cli"])
             self.assertEqual(manifest["organizer"]["provider_id"], "subscription-cli")
+            self.assertTrue(manifest["skill_auto_apply"])
             self.assertTrue(manifest["knowledge_stores"]["team"]["enabled"])
             self.assertEqual(manifest["knowledge_stores"]["team"]["team_member_id"], "member-a")
             self.assertTrue((default_runtime / "host-profiles" / "test-compatible-cli.json").is_file())

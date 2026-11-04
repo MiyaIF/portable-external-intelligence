@@ -12,9 +12,11 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 from types import SimpleNamespace
 
+from ei.config import load_settings
 import ei.installer as installer_module
 from ei.installer import (
     SetupSelection,
@@ -29,6 +31,7 @@ from ei.installer import (
     _uninstall_from_manifest,
     _windows_notification_locations,
     setup,
+    update,
     UninstallOptions,
 )
 
@@ -126,6 +129,42 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             non_interactive=True,
             accept_plan=True,
         )
+
+    def test_skill_auto_apply_defaults_off_and_update_preserves_explicit_choice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            runtime = Path(temporary) / "runtime"
+            selection = self._selection_for_runtime(runtime)
+            helper_env = self._windows_notification_environment(Path(temporary))
+
+            def helper(action: str, target: Path, **kwargs: object) -> dict[str, object]:
+                return self._fake_notification_helper(action, target, **kwargs)
+
+            with patch.dict(os.environ, helper_env, clear=False), _patch_installer_platform("win32"), patch(
+                "ei.installer._run_windows_notification_registration", side_effect=helper, create=True
+            ):
+                initial = setup(selection)
+                self.assertTrue(initial.ok, initial.to_dict())
+                manifest_path = runtime / "install-manifest.json"
+                self.assertFalse(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+                enabled = setup(replace(selection, skill_auto_apply=True))
+                self.assertTrue(enabled.ok, enabled.to_dict())
+                self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+                # An update selection with no choice and an update from loaded settings
+                # both preserve the existing opt-in instead of silently clearing it.
+                preserved_selection = update(selection)
+                self.assertTrue(preserved_selection.ok, preserved_selection.to_dict())
+                self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+                loaded = load_settings(engine_root=REPOSITORY, runtime_root=runtime)
+                self.assertTrue(loaded.skill_auto_apply)
+                preserved_settings = update(loaded)
+                self.assertTrue(preserved_settings.ok, preserved_settings.to_dict())
+                self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+                disabled = update(replace(selection, skill_auto_apply=False))
+                self.assertTrue(disabled.ok, disabled.to_dict())
+                self.assertFalse(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
 
     def test_windows_registration_is_recorded_and_reused_only_with_owned_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

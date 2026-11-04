@@ -28,6 +28,8 @@ sync_disabled=0
 experiment=0
 scheduler=0
 no_scheduler=0
+skill_auto_apply=0
+no_skill_auto_apply=0
 install_prerequisites=0
 check_only=0
 verify_operation=0
@@ -67,6 +69,8 @@ while [ "$#" -gt 0 ]; do
     --experiment) experiment=1; shift ;;
     --scheduler) scheduler=1; shift ;;
     --no-scheduler) no_scheduler=1; shift ;;
+    --skill-auto-apply) skill_auto_apply=1; shift ;;
+    --no-skill-auto-apply) no_skill_auto_apply=1; shift ;;
     --install-prerequisites) install_prerequisites=1; shift ;;
     --check-only) check_only=1; shift ;;
     --verify-operation) verify_operation=1; shift ;;
@@ -91,6 +95,10 @@ fi
 
 if [ "$scheduler" -eq 1 ] && [ "$no_scheduler" -eq 1 ]; then
   echo "SCHEDULER_SELECTION_CONFLICT" >&2
+  exit 2
+fi
+if [ "$skill_auto_apply" -eq 1 ] && [ "$no_skill_auto_apply" -eq 1 ]; then
+  echo "SKILL_AUTO_APPLY_SELECTION_CONFLICT" >&2
   exit 2
 fi
 bootstrap_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -129,6 +137,8 @@ fi
 [ "$experiment" -eq 1 ] && set -- "$@" --experiment
 [ "$scheduler" -eq 1 ] && set -- "$@" --scheduler
 [ "$no_scheduler" -eq 1 ] && set -- "$@" --no-scheduler
+[ "$skill_auto_apply" -eq 1 ] && set -- "$@" --skill-auto-apply
+[ "$no_skill_auto_apply" -eq 1 ] && set -- "$@" --no-skill-auto-apply
 [ "$check_only" -eq 1 ] && set -- "$@" --check-only
 [ "$verify_operation" -eq 1 ] && set -- "$@" --verify-operation
 [ "$allow_model_test" -eq 1 ] && set -- "$@" --allow-model-test
