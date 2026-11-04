@@ -124,7 +124,7 @@ class SafeFilesystemTests(unittest.TestCase):
 
     def test_safe_target_rechecks_root_once_before_and_once_after_canonicalization(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "root"
+            root = safe_fs.canonical_path(Path(tmp) / "root")
             target = root / "nested" / "missing"
             target.parent.mkdir(parents=True)
             original = Path.stat
@@ -198,7 +198,7 @@ class SafeFilesystemTests(unittest.TestCase):
             root = Path(tmp) / "root"
             root.mkdir()
             target = root / "missing"
-            canonical_root = root.parent
+            canonical_root = safe_fs.canonical_path(root.parent)
             original_canonical_path = safe_fs.canonical_path
             original_stat = Path.stat
             calls = []
@@ -279,6 +279,7 @@ class SafeFilesystemTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "root"
             root.mkdir()
+            canonical_root = safe_fs.canonical_path(root)
             original_canonical_path = safe_fs.canonical_path
             original_is_reparse = safe_fs._is_reparse
             canonicalized = False
@@ -291,7 +292,7 @@ class SafeFilesystemTests(unittest.TestCase):
                 return result
 
             def probe_reparse(path):
-                if canonicalized and Path(path) == root:
+                if canonicalized and Path(path) == canonical_root:
                     return True
                 return original_is_reparse(path)
 

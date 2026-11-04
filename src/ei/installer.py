@@ -6083,6 +6083,7 @@ def _main() -> int:
                 args.privacy_profile = manifest.get("privacy_profile", "private-reusable")
                 args.experiment = manifest.get("experiment_enabled") is True
                 args.scheduler = manifest.get("scheduler_requested") is True
+                args.skip_venv = manifest.get("skip_venv") is True or args.skip_venv
                 stores = manifest.get("knowledge_stores") if isinstance(manifest.get("knowledge_stores"), Mapping) else {}
                 team = stores.get("team") if isinstance(stores, Mapping) else None
                 if isinstance(team, Mapping):

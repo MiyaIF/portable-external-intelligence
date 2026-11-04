@@ -161,10 +161,49 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                 preserved_settings = update(loaded)
                 self.assertTrue(preserved_settings.ok, preserved_settings.to_dict())
                 self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
-
                 disabled = update(replace(selection, skill_auto_apply=False))
                 self.assertTrue(disabled.ok, disabled.to_dict())
                 self.assertFalse(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+    def test_cli_manifest_update_preserves_venv_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            manifest_path = runtime / "install-manifest.json"
+            host_home = root / "host"
+            manifest_path.parent.mkdir(parents=True)
+            base_manifest = {
+                "repo_root": str(REPOSITORY),
+                "engine_root": str(REPOSITORY),
+                "knowledge_root": str(root / "knowledge"),
+                "runtime_root": str(runtime),
+                "work_hosts": ["codex-cli"],
+                "hosts": {"codex-cli": {"home": str(host_home)}},
+                "python_exe": str(Path(sys.executable).resolve()),
+            }
+            cases = (
+                ("stored_true", {"skip_venv": True}, (), True),
+                ("stored_false", {"skip_venv": False}, (), False),
+                ("legacy_missing", {}, (), False),
+                ("explicit_skip_overrides_stored_false", {"skip_venv": False}, ("--skip-venv",), True),
+            )
+            for name, manifest_update, extra_args, expected in cases:
+                with self.subTest(name=name):
+                    manifest = {**base_manifest, **manifest_update}
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    captured: list[SetupSelection] = []
+
+                    def capture_update(selection: SetupSelection, check_only: bool = False) -> installer_module.SetupResult:
+                        captured.append(selection)
+                        return installer_module.SetupResult(True, "TEST_CAPTURED")
+
+                    argv = ["ei.installer", "--update", "--manifest", str(manifest_path), "--json", *extra_args]
+                    with patch("sys.argv", argv), patch("ei.installer.update", side_effect=capture_update), contextlib.redirect_stdout(io.StringIO()):
+                        code = _main()
+
+                    self.assertEqual(code, 0)
+                    self.assertEqual(len(captured), 1)
+                    self.assertEqual(captured[0].skip_venv, expected)
 
     def test_windows_registration_is_recorded_and_reused_only_with_owned_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1105,6 +1144,7 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
             ("duplicate", setup_prefix + ["--python-exe", str(shim.resolve()), "--python-exe", str(shim.resolve())] + valid_setup_tail),
             ("mismatched", setup_prefix + ["--python-exe", sys.executable] + valid_setup_tail),
             ("unknown", setup_prefix + ["--python-exe", str(shim.resolve())] + valid_setup_tail + ["--unexpected-test-option"]),
+            ("conflicting-skill-consent", setup_prefix + ["--python-exe", str(shim.resolve())] + valid_setup_tail + ["--skill-auto-apply", "--no-skill-auto-apply"]),
         )
         for case, arguments in malformed_setup_arguments:
             with self.subTest(case=case):
@@ -1121,9 +1161,9 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
                     env=case_environment,
                     check=False,
                 )
+                self.assertFalse(case_trace.exists())
                 self.assertEqual(malformed.returncode, 64, malformed.stdout + malformed.stderr)
                 self.assertIn("EI_TEST_PYTHON_SHIM_ARGV_INVALID", malformed.stderr)
-                self.assertFalse(case_trace.exists())
 
         missing_manifest = private_root / "missing-uninstall-manifest.json"
         uninstall_arguments = [
@@ -1168,6 +1208,38 @@ class UnattendedSetupIntegrationTests(NotificationIsolationMixin, unittest.TestC
         )
         self.assertEqual(uninstall_unknown.returncode, 64, uninstall_unknown.stdout + uninstall_unknown.stderr)
         self.assertIn("EI_TEST_PYTHON_SHIM_ARGV_INVALID", uninstall_unknown.stderr)
+
+        update_arguments = [
+            "-B", "-m", "ei.installer", "--update", "--python-exe", str(shim.resolve()),
+            "--repo", str(REPOSITORY), "--runtime-root", str(private_root / "update-runtime"),
+            "--json", "--skill-auto-apply",
+        ]
+        malformed_update_arguments = (
+            ("missing-update", update_arguments[:3] + update_arguments[4:]),
+            ("duplicate-update", update_arguments + ["--update"]),
+            ("duplicate-skill-consent", update_arguments + ["--skill-auto-apply"]),
+            ("conflicting-skill-consent", update_arguments + ["--no-skill-auto-apply"]),
+            ("mismatched-python", [*update_arguments[:5], sys.executable, *update_arguments[6:]]),
+            ("unknown", update_arguments + ["--unexpected-test-option"]),
+        )
+        for case, arguments in malformed_update_arguments:
+            with self.subTest(update_case=case):
+                case_environment = dict(environment)
+                case_trace = private_root / f"invalid-update-{case}-argv.json"
+                case_environment["EI_TEST_PYTHON_SHIM_TRACE"] = str(case_trace)
+                malformed = subprocess.run(
+                    [powershell, "-NoProfile", "-NonInteractive", "-File", str(shim), *arguments],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=15,
+                    env=case_environment,
+                    check=False,
+                )
+                self.assertEqual(malformed.returncode, 64, malformed.stdout + malformed.stderr)
+                self.assertIn("EI_TEST_PYTHON_SHIM_ARGV_INVALID", malformed.stderr)
+                self.assertFalse(case_trace.exists())
 
     def test_isolated_python_interpreter_installs_guard_before_engine_bootstrap(self) -> None:
         python_exe = self.isolated_python_executable()

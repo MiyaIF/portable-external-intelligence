@@ -504,14 +504,26 @@ class MaintainerTests(unittest.TestCase):
                 ttl_seconds=1,
                 key_provider=InMemoryKeyProvider("maintainer-test-key", b"m" * 32),
             )
-            result = run_maintenance(
-                settings,
-                source_paths=(valid, invalid),
-                provider=YesProvider(),
-                time_budget_ms=5000,
-                sync_policy="disabled",
-                now=datetime(2020, 1, 2, tzinfo=timezone.utc),
-            )
+            logical_time = [0.0]
+
+            def advance_clock():
+                logical_time[0] += 0.0001
+                return logical_time[0]
+
+            controlled_time = SimpleNamespace(monotonic=advance_clock)
+            with patch("ei.operation_runtime.time", new=controlled_time), \
+                    patch("ei.maintainer.time", new=controlled_time), \
+                    patch("ei.capture_recovery.time", new=controlled_time):
+                result = run_maintenance(
+                    settings,
+                    source_paths=(valid, invalid),
+                    provider=YesProvider(),
+                    time_budget_ms=5000,
+                    sync_policy="disabled",
+                    now=datetime(2020, 1, 2, tzinfo=timezone.utc),
+                )
+            self.assertGreater(logical_time[0], 0.0, "TEST_CLOCK_DID_NOT_ADVANCE")
+            self.assertLess(logical_time[0], 5.0, "TEST_CLOCK_EXCEEDED_MAINTENANCE_BUDGET")
             self.assertEqual(result.status, "partial", "MAINTENANCE_STATUS_UNEXPECTED")
             self.assertGreaterEqual(result.expired_spool, 1, "EXPIRED_SPOOL_NOT_COLLECTED")
             self.assertGreaterEqual(result.ingest_sources, 2, "INGEST_SOURCE_COUNT_INCOMPLETE")

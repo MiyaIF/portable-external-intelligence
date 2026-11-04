@@ -260,8 +260,9 @@ import ei.installer
     @unittest.skipUnless(os.name == "nt", "PowerShell wrapper contract is Windows-specific")
     def test_setup_and_update_wrappers_forward_and_preserve_skill_auto_apply(self):
         repo = Path.cwd()
+        powershell = shutil.which("pwsh") or "powershell.exe"
         python_exe = self.powershell_python_shim()
-        environment = self._outer_powershell_environment()
+        environment = self._outer_powershell_environment(allow_notification_helper=True)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             codex_home = root / "codex-home"
@@ -269,7 +270,7 @@ import ei.installer
             knowledge = root / "knowledge"
             setup = subprocess.run(
                 [
-                    "powershell.exe", "-NoProfile", "-File", str(repo / "scripts" / "setup.ps1"),
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "setup.ps1"),
                     "-Repo", str(repo), "-RuntimeRoot", str(runtime), "-KnowledgeMode", "local",
                     "-KnowledgeRoot", str(knowledge), "-Hosts", "codex-cli",
                     "-OrganizerProvider", "subscription-cli", "-OrganizerHost", "codex-cli",
@@ -287,15 +288,35 @@ import ei.installer
             manifest_path = runtime / "install-manifest.json"
             self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
 
-            preserved = subprocess.run(
+            enabled = subprocess.run(
                 [
-                    "powershell.exe", "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
-                    "-Repo", str(repo), "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe), "-Json",
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
+                    "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
+                    "-ManifestPath", str(manifest_path),
+                    "-Json", "-NonInteractive", "-SkillAutoApply",
                 ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=60,
+                env=environment,
+            )
+            self._skip_if_execution_policy_refused(enabled, "update.ps1 -SkillAutoApply")
+            self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+            self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+            preserved = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
+                    "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
+                    "-ManifestPath", str(manifest_path), "-Json", "-NonInteractive",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
                 env=environment,
             )
             self._skip_if_execution_policy_refused(preserved, "update.ps1 without consent flag")
@@ -304,14 +325,16 @@ import ei.installer
 
             disabled = subprocess.run(
                 [
-                    "powershell.exe", "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
-                    "-Repo", str(repo), "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
-                    "-Json", "-NoSkillAutoApply",
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
+                    "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
+                    "-ManifestPath", str(manifest_path),
+                    "-Json", "-NonInteractive", "-NoSkillAutoApply",
                 ],
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                timeout=60,
                 env=environment,
             )
             self._skip_if_execution_policy_refused(disabled, "update.ps1 -NoSkillAutoApply")
