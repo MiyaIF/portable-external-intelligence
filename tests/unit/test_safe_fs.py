@@ -195,7 +195,7 @@ class SafeFilesystemTests(unittest.TestCase):
 
     def test_safe_target_uses_full_root_walk_when_canonical_root_differs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "root"
+            root = safe_fs.canonical_path(Path(tmp) / "root")
             root.mkdir()
             target = root / "missing"
             canonical_root = safe_fs.canonical_path(root.parent)

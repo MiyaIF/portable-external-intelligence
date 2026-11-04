@@ -1569,3 +1569,7 @@ closeoutの保存証跡からの復旧1ケースは、共通fixtureの既定5秒
 安全性テストは、同一表記を意図するfixtureだけ正規化し、異なる表記・canonical root・root自身・reparse・権限拒否の独立した検証を残す。実際の短縮名が利用可能な環境では両表記の通常検証も行う。安全検査の回数assertionを削除するだけ、例外を許容するだけ、製品のcontainment/no-follow/期限の緩和は行わない。製品修正が必要と判明した場合は、根拠と追加Filesを先に示す。対象試験、限定Astraレビュー、新しい固定候補の全件試験、同一公開SHAのCIを通して既存PRを更新する。
 
 同一公開SHAのpush側Python 3.11では、既存 `test_maintenance_continues_after_independent_source_failure_and_gcs_expired_spool` の `expired_spool == 0` も確認した。CIログだけでは失敗段階・原因は未確定である。5秒の実時間予算が独立ソース失敗後の回収機能検証を先取りする経路か、別原因かを最小probeで区別する。機能fixtureの時間依存と再現できた場合のみ、当該1ケースの呼出しを有限で進むtest-local時計へ分離し、実I/O・全assertion・期限check・外側300秒上限を維持する。既存の独立期限試験を併走させ、時計停止・時間上限の引上げ・skip・製品修正で隠さない。原因未確定の点と実運用性能を改善したわけではないことを報告する。
+
+### 2026-11-04: canonical-root fallback fixtureの短縮TEMP再現
+
+追加対象は `tests/unit/test_safe_fs.py` と本計画書のみ。修正版の公開Windows CIで、`test_safe_target_uses_full_root_walk_when_canonical_root_differs` の正規化済み親へのprobe回数が期待4に対して2となった。未正規化の一時rootと正規化済み親で同じディレクトリの表記が分離する仮説を、可能な限り実8.3別名のTEMPで再現する。意図した「元rootと異なるcanonical root」のfallbackを保ったまま、同一表記を前提とするfixture構築だけを修正する。回数assertionの緩和・削除、製品のcontainment/no-follow/root再検証の変更、OS設定変更やskipはしない。通常名と利用可能な実短縮名で変更前RED／変更後GREEN、対象全module、限定レビュー、新固定版の全件試験、公開CIを確認する。
