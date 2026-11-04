@@ -1555,3 +1555,17 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 公開CIの詳細ログで、fallbackの故障分類が既定300msのStop期限に先取りされること、直接取得の準備が5秒で期限切れになるケースを確認した。fallback内の機能Hook試験と直接取得に有限20秒を明示する。catchupで失敗した3つの成功回収経路だけoptional引数で20秒にし、初回の回収成功と理由を検査する。共通10秒、ロック保持中の拒否、byte上限500の試験は維持する。
 
 closeoutの保存証跡からの復旧1ケースは、共通fixtureの既定5秒を変えずoptional引数で準備だけ20秒、適用だけ30秒とする。削除10秒、復旧30秒と既存の保存・証跡・再試行回数のassertionは維持する。scheduler復旧とprovider故障の分離1ケースの `service_cli_start` 2呼出しだけ20秒を明示する。原因不明のケースは安定化仮説として扱い、有限の状態・理由・件数を診断へ追加する。製品期限、意図的な期限切れ試験、安全検査、成功条件、認証・送信許可は変更しない。影響対象の全moduleと固定版全件試験、レビュー、同一公開SHAのCIで確認する。
+
+### 2026-11-04: 実Windows CIの引数隔離と短縮パスfixture
+
+**Files:** `src/ei/installer.py`、`tests/support/sitecustomize.py`、`tests/integration/test_install_scripts.py`、`tests/integration/test_unattended_setup.py`、`tests/unit/test_safe_fs.py`、`tests/unit/test_maintainer.py`、本計画書。
+
+公開CIで、Skill自動保存のsetup/update回帰がテスト専用Python中継の `EI_TEST_PYTHON_SHIM_ARGV_INVALID` で拒否され、安全なパス検証3ケースがWindowsの短縮名と正規化済みの長い名前を同じ表記と仮定して失敗した。製品コードの不具合かfixtureの不備かを実ログと再現で分離する。中継は新しい2つの同意switchと通常update形だけを厳格に受理し、未知・重複・競合・不正形の拒否、引数保持、通知隔離を維持する。実際のsetup→update保持→明示無効化を通常の利用可能なPowerShellで検証し、実行ポリシーの変更・Bypass・成功扱いのskipは追加しない。
+
+更新の保持検証は、生成した実manifestを通常の `-ManifestPath` で読み戻す経路を使う。`-Repo/-RuntimeRoot` の明示設定モードは必要なwork-host指定がなく `SETUP_WORK_HOSTS_REQUIRED`、保存先を補った呼出しでは `ACTIVE_MANIFEST_KNOWLEDGE_MISMATCH` となったため、この不完全な呼出しにhost/homeを再指定して保持成功の代用とはしない。生成済み設定から対象CLI・保存先を復元し、保存同意の明示ON・未指定時保持・明示OFFを検証する。
+
+通常PowerShellの実更新で、setup時に保存した `skip_venv=true` がCLIのmanifest復元時に失われる不具合を確認した。同意ON・未指定は変更なしで通ったが、OFF変更だけ依存取得へ進みDNSエラーとなった。`src/ei/installer.py` の当該復元に限定して既存の仮想環境選択を保持する。保存済みtrue・false・旧manifestでの欠落と、既存の明示 `--skip-venv` の意味を回帰で確認する。依存検証や製品の既定値を緩めず、通常更新の実OFF保存まで確認する。テストをCheckOnlyへ置換したり、manifestの手編集で成功扱いにはしない。
+
+安全性テストは、同一表記を意図するfixtureだけ正規化し、異なる表記・canonical root・root自身・reparse・権限拒否の独立した検証を残す。実際の短縮名が利用可能な環境では両表記の通常検証も行う。安全検査の回数assertionを削除するだけ、例外を許容するだけ、製品のcontainment/no-follow/期限の緩和は行わない。製品修正が必要と判明した場合は、根拠と追加Filesを先に示す。対象試験、限定Astraレビュー、新しい固定候補の全件試験、同一公開SHAのCIを通して既存PRを更新する。
+
+同一公開SHAのpush側Python 3.11では、既存 `test_maintenance_continues_after_independent_source_failure_and_gcs_expired_spool` の `expired_spool == 0` も確認した。CIログだけでは失敗段階・原因は未確定である。5秒の実時間予算が独立ソース失敗後の回収機能検証を先取りする経路か、別原因かを最小probeで区別する。機能fixtureの時間依存と再現できた場合のみ、当該1ケースの呼出しを有限で進むtest-local時計へ分離し、実I/O・全assertion・期限check・外側300秒上限を維持する。既存の独立期限試験を併走させ、時計停止・時間上限の引上げ・skip・製品修正で隠さない。原因未確定の点と実運用性能を改善したわけではないことを報告する。
