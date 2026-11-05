@@ -23,6 +23,15 @@ from ei.remote_assurance import (
 
 
 class RemoteAssuranceTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows console suppression is platform-specific")
+    def test_github_visibility_probe_suppresses_console_window(self):
+        from ei.remote_assurance import _probe_github_visibility
+
+        completed = subprocess.CompletedProcess([], 0, "private\n", "")
+        with patch("ei.remote_assurance.subprocess.run", return_value=completed) as process:
+            self.assertEqual(_probe_github_visibility("example", "knowledge"), ("private", "github_api"))
+        self.assertEqual(process.call_args.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+
     def test_zero_budget_does_not_probe_or_promote_visibility(self):
         with patch("ei.remote_assurance.subprocess.run", side_effect=AssertionError("no process")):
             with self.assertRaises(TimeoutError):

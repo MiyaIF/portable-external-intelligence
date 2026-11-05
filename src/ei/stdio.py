@@ -8,6 +8,8 @@ def write_utf8(value: Any, *, end: str = "\n", stream: Any | None = None) -> Non
     """Write Unicode deterministically to a console, pipe, or redirected text stream."""
 
     target = sys.stdout if stream is None else stream
+    if target is None:
+        return
     text = str(value) + end
     raw = getattr(target, "buffer", None)
     if raw is not None:

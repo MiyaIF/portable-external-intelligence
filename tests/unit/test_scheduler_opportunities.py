@@ -38,22 +38,28 @@ class SchedulerOpportunityTests(unittest.TestCase):
                 with self.subTest(change=change):
                     self.assertNotEqual(self.inspect(settings, {**current, **change}, previous=previous)["reason_code"], "SCHEDULER_EXECUTION_RESUMED")
 
-    def native_fixture(self, root):
+    def native_fixture(self, root, *, platform_name):
         from ei.config import RuntimePaths, Settings
         engine, knowledge = root / "engine", root / "knowledge"
         engine.mkdir()
         knowledge.mkdir()
-        executable = root / "python"
+        if platform_name.casefold() == "windows":
+            executable = root / ".venv" / "Scripts" / "python.exe"
+            executable.parent.mkdir(parents=True)
+            executable.with_name("pythonw.exe").write_bytes(b"fake windowless executable - must never run")
+        else:
+            executable = root / "python"
         executable.write_bytes(b"fake executable - must never run")
         settings = Settings(paths=RuntimePaths(engine, knowledge, root / "runtime"))
-        action = scheduler.build_maintenance_action(settings, executable)
+        with patch("ei.task_scheduler.platform.system", return_value=platform_name):
+            action = scheduler.build_maintenance_action(settings, executable)
         scheduler.write_scheduler_state(settings, action, True)
         return settings, action
 
     def test_linux_native_arrays_action_and_property_types_are_checked(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            settings, action = self.native_fixture(root)
+            settings, action = self.native_fixture(root, platform_name="Linux")
             units = root / "units"
             units.mkdir()
             (units / f"{scheduler.TASK_NAME}.service").write_text(scheduler.build_systemd_user_unit(action), encoding="utf-8")
@@ -95,7 +101,7 @@ class SchedulerOpportunityTests(unittest.TestCase):
     def test_macos_native_read_keeps_exit_but_does_not_infer_override_enablement(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            settings, action = self.native_fixture(root)
+            settings, action = self.native_fixture(root, platform_name="Darwin")
             agents = root / "agents"
             agents.mkdir()
             (agents / f"{scheduler.TASK_NAME}.plist").write_text(scheduler.build_launchd_plist(action), encoding="utf-8")
@@ -110,7 +116,7 @@ class SchedulerOpportunityTests(unittest.TestCase):
 
     def test_windows_native_read_retains_logon_and_battery_conditions_without_eligibility(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action = self.native_fixture(Path(tmp))
+            settings, action = self.native_fixture(Path(tmp), platform_name="Windows")
             fields = action.to_dict()
             xml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Actions><Exec>' + ''.join(f'<{tag}>{escape(fields[key])}</{tag}>' for tag, key in (("Command", "executable"), ("Arguments", "arguments"), ("WorkingDirectory", "working_directory"))) + '</Exec></Actions><Principals><Principal><LogonType>InteractiveToken</LogonType></Principal></Principals><Settings><DisallowStartIfOnBatteries>true</DisallowStartIfOnBatteries><RunOnlyIfIdle>false</RunOnlyIfIdle></Settings></Task>'
             native = {"xml": xml, "enabled": True, "state": "Ready", "last_exit": 2147943726, "last_run": NOW.isoformat(), "next_run": NOW.isoformat(), "native_missed_runs": 5, "boot": NOW.isoformat()}

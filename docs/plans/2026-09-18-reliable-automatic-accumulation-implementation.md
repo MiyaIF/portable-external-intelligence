@@ -33,6 +33,21 @@
 
 ## 現状・実行境界
 
+### 2026-11-04: 通常closeoutの呼出しを設定どおりにする
+
+- **Files:** `skills/external-intelligence/SKILL.md`, `skills/external-intelligence/workflows/closeout.md`, この計画。
+- 実CLIで、設定済みの保存同意があるにもかかわらず作業AIが自分で `--proposal-only` を付け、保存せず提案で終了する事例を確認した。通常のcloseoutは追加flagなしで呼び、保存可否は既存ランチャーの検証済み設定に委ねる、と呼出し手順を明確にする。
+- 利用者が提案のみ・ナレッジ保存禁止を明示した場合はその指定を優先する。実装ファイルを変更しない依頼だけから、設定済みのナレッジ保存を無効化しない。許可のない保存、hostや取得元の推測、追加の確認・機能・索引・実装APIは増やさない。
+- Codex CLIでは、現CLIの `CODEX_THREAD_ID` のhashが既存Hook記録の2つのsession hashと一致することを実機確認した。信頼済みsource pairをそこから取得する手順を明記する。状態照会・直近record・親threadからの推測は使わず、一致しない場合は保存を見送る。
+- 既存の許可有無・明示proposal-onlyの対象試験を維持し、通常の実CLIで保存を個別指定しない再検証を行う。変更は手順文のみとし、commit前に全件試験を行う。
+
+### 2026-11-04: 実機での同一文章の重複計算を削減
+
+- **Files:** `src/ei/dedup.py`, `tests/unit/test_dedup.py`, この計画。既存の未commit差分 `tests/integration/test_multi_host_lifecycle.py` は保持する。
+- 実機の保守処理が5分以内に索引更新へ到達しない原因として、同一claimの正規化が繰り返されることを計測した。型検査を公開入口に保持したまま、純粋な正規化結果だけを上限付きのプロセス内キャッシュで再利用する。
+- 永続索引、保存形式、クラスタ判定、セキュリティ検査、処理期限は変更しない。新しい機能を追加しない。
+- 重複計算の回数、出力の一致、不正入力、上限超過時の再計算を対象テストで確認し、差分レビュー後に変更後のcomplete unittest suiteを1回実行する。実機への反映後、通常の保守と次回取得を確認する。
+
 ### 2026-11-04: 自動保存と案件限定の次回利用（承認済み）
 
 利用者承認により、設計12節の追加に従いTask14/15を実装する。既存の安全層高速化パッチと合わせ、対象テスト・差分レビュー後の固定ソースでcomplete unittest suiteを1回実行し、全件成功前にはcommitしない。既存の2つの個人draft、journal、backup、stashを保持する。過去のTask完了をやり直さず、新差分だけを公開export・CI・main・PC更新へ進める。
@@ -1573,3 +1588,27 @@ closeoutの保存証跡からの復旧1ケースは、共通fixtureの既定5秒
 ### 2026-11-04: canonical-root fallback fixtureの短縮TEMP再現
 
 追加対象は `tests/unit/test_safe_fs.py` と本計画書のみ。修正版の公開Windows CIで、`test_safe_target_uses_full_root_walk_when_canonical_root_differs` の正規化済み親へのprobe回数が期待4に対して2となった。未正規化の一時rootと正規化済み親で同じディレクトリの表記が分離する仮説を、可能な限り実8.3別名のTEMPで再現する。意図した「元rootと異なるcanonical root」のfallbackを保ったまま、同一表記を前提とするfixture構築だけを修正する。回数assertionの緩和・削除、製品のcontainment/no-follow/root再検証の変更、OS設定変更やskipはしない。通常名と利用可能な実短縮名で変更前RED／変更後GREEN、対象全module、限定レビュー、新固定版の全件試験、公開CIを確認する。
+
+### 2026-11-05: 自動候補化と非表示定期実行の要件追加
+
+今回の記録対象は本計画書と `docs/specs/2026-09-18-reliable-automatic-accumulation-design.md` 第13節のみ。利用者は作業記録から設定済み整理AIへの候補化を承認し、定期処理でcmd等を表示しないことを追加要求した。新しい索引・常駐サービスや対象Hostの拡大は行わない。製品コード・インストール設定はまだ変更していない。
+
+実PCの登録済みタスクはconsole版Pythonを直接起動していた。修正設計では非表示の親プロセスだけでなく、整理AI・Git等の子プロセスを対象にする。ログと終了状態を保持し、実行ポリシーは変更しない。具体的な製品コードの所有ファイルと回帰テストは起動経路の確認後に固定し、適用前のレビュー・試験と実機確認を行う。既存ナレッジとcanonical checkoutの利用者の文書差分は維持する。
+
+#### Windowsの文字コード・非表示起動修正（同日承認）
+
+関連fixtureの追加対象は `tests/unit/test_scheduler_installer_production_defects.py`、`tests/unit/test_scheduler_opportunities.py`、`tests/unit/test_setup_onboarding.py`。既存の拡張子なしfake Pythonや他OS想定のactionが実行ホストのWindows判定に依存する箇所だけ、対象OSと実行ファイルを明示する。Windowsの非表示Python必須条件や既存assertionを緩めず、製品側へfixture専用の可視起動例外を追加しない。
+
+利用者の実エラー報告と明示承認に基づき、対象の定期タスク1件だけを一時無効化した。今回の製品修正に自動候補化は含めない。合成したUTF-8日本語をcp932のtext pipeで読むと、2つのreader threadが失敗し、子の終了コード0でもstdout/stderrがNoneとなることを再現した。
+
+**Files:** `src/ei/task_scheduler.py`、`src/ei/stdio.py`、`src/ei/inference/cli_subscription.py`、`src/ei/inference/ollama.py`、`src/ei/sync.py`、`src/ei/remote_assurance.py`、`tests/unit/test_task_scheduler.py`、`tests/unit/test_stdio.py`、`tests/unit/test_inference_router.py`、`tests/integration/test_git_sync.py`、`tests/unit/test_remote_assurance.py`、本計画書。前項で承認された要件記録の仕様書も保持する。製品・テストはLuna、文書と反映作業は親が所有する。
+
+Provider/Gitの入出力を既定localeから独立させ、不正出力を欠落した成功結果へ変換しない。Provider入力の日本語もUTF-8で送る。生出力のログ保存や黙った文字置換は追加しない。Windowsの定期実行は同じ仮想環境の非表示Pythonを選び、UTF-8 modeを明示する。手動・登録時のJSON取得にはconsole Pythonを使う。非表示Pythonがなければ可視起動へ戻さない。関連するProvider・Git・remote確認・scheduler照会の子プロセスにはWindows限定の表示抑止を付け、非Windows・既存のdeadline・認証・所有検証を保つ。標準出力がない実行時も正常終了と異常終了を判別できるようにする。
+
+回帰RED→最小修正GREEN→対象module→固定差分レビュー→固定ソースの全unittestの順に確認する。通常updateで実PCへ反映し、登録値・実プロセス・出力読み取りを確認してから定期処理を再開する。既存ナレッジ、利用者の文書差分、実行ポリシーは変更せず、公開exportやpushは別の未解決条件を迂回しない。
+
+### 2026-11-04: Skill取得機能と実時間期限の分離
+
+追加対象は `tests/integration/test_multi_host_lifecycle.py` と本計画書のみ。公開HEAD6803709のpush CI/Python3.11で、`test_skill_uses_verified_namespace_and_original_budget_without_plaintext_journal` の期待 `PENDING_SECURED` が `CAPTURE_BUDGET_EXHAUSTED` となった。全182module中この1moduleだけ失敗し、Python3.13側は合格した。前回の短縮パス検証は合格している。当該成功経路は暗黙の製品5秒に依存しており、実CIログだけでは内部の消費段階は確定しない。
+
+機能確認には有限で進むtest-local時計を使い、実namespace検証・暗号化・queue保存・平文journal不在のassertionと実deadline checkを維持する。別の確定的な期限超過ケースで、渡した元予算が途中でリセットされず、未確保の処理を成功扱いしないことを検証する。既存のゼロ予算拒否も残す。製品の時計・既定5秒・安全検査・module外側300秒は変更せず、個別秒数増加・skip・再試行による成功扱いは行わない。最小再現、対象moduleと独立期限試験、限定Astraレビュー、新固定版全件試験、同一公開HEADのCIを通す。これは機能試験の時間依存の分離であり、実運用性能改善の証拠とは扱わない。

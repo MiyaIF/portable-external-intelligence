@@ -22,6 +22,12 @@ class LegacyEncodedStdout:
 
 
 class Utf8StandardOutputTests(unittest.TestCase):
+    def test_missing_stdout_is_safe_for_windowless_quiet_processes(self):
+        import ei.stdio as stdio_module
+
+        with patch.object(stdio_module.sys, "stdout", None):
+            stdio_module.write_utf8("quiet")
+
     def test_cli_text_bypasses_a_legacy_text_encoding(self) -> None:
         stream = LegacyEncodedStdout()
         with patch.object(cli_module.sys, "stdout", stream):
