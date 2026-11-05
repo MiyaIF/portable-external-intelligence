@@ -33,6 +33,110 @@
 
 ## 現状・実行境界
 
+### 2026-11-04: 通常closeoutの呼出しを設定どおりにする
+
+- **Files:** `skills/external-intelligence/SKILL.md`, `skills/external-intelligence/workflows/closeout.md`, この計画。
+- 実CLIで、設定済みの保存同意があるにもかかわらず作業AIが自分で `--proposal-only` を付け、保存せず提案で終了する事例を確認した。通常のcloseoutは追加flagなしで呼び、保存可否は既存ランチャーの検証済み設定に委ねる、と呼出し手順を明確にする。
+- 利用者が提案のみ・ナレッジ保存禁止を明示した場合はその指定を優先する。実装ファイルを変更しない依頼だけから、設定済みのナレッジ保存を無効化しない。許可のない保存、hostや取得元の推測、追加の確認・機能・索引・実装APIは増やさない。
+- Codex CLIでは、現CLIの `CODEX_THREAD_ID` のhashが既存Hook記録の2つのsession hashと一致することを実機確認した。信頼済みsource pairをそこから取得する手順を明記する。状態照会・直近record・親threadからの推測は使わず、一致しない場合は保存を見送る。
+- 既存の許可有無・明示proposal-onlyの対象試験を維持し、通常の実CLIで保存を個別指定しない再検証を行う。変更は手順文のみとし、commit前に全件試験を行う。
+
+### 2026-11-04: 実機での同一文章の重複計算を削減
+
+- **Files:** `src/ei/dedup.py`, `tests/unit/test_dedup.py`, この計画。既存の未commit差分 `tests/integration/test_multi_host_lifecycle.py` は保持する。
+- 実機の保守処理が5分以内に索引更新へ到達しない原因として、同一claimの正規化が繰り返されることを計測した。型検査を公開入口に保持したまま、純粋な正規化結果だけを上限付きのプロセス内キャッシュで再利用する。
+- 永続索引、保存形式、クラスタ判定、セキュリティ検査、処理期限は変更しない。新しい機能を追加しない。
+- 重複計算の回数、出力の一致、不正入力、上限超過時の再計算を対象テストで確認し、差分レビュー後に変更後のcomplete unittest suiteを1回実行する。実機への反映後、通常の保守と次回取得を確認する。
+
+### 2026-11-04: 自動保存と案件限定の次回利用（承認済み）
+
+利用者承認により、設計12節の追加に従いTask14/15を実装する。既存の安全層高速化パッチと合わせ、対象テスト・差分レビュー後の固定ソースでcomplete unittest suiteを1回実行し、全件成功前にはcommitしない。既存の2つの個人draft、journal、backup、stashを保持する。過去のTask完了をやり直さず、新差分だけを公開export・CI・main・PC更新へ進める。
+
+#### Task14/15 preflight
+
+| 組合せ | 接続 | 判定 |
+|---|---|---|
+| Task14 → Task15 | 実cwdのfingerprintを含むobservation → 同一fingerprintのreference検索 | cwdは候補自由文でなく実呼出しから取得。旧scope不明は除外 |
+| Task15 index → Hook/CLI/Skill | manifestに結び付いた既存indexと選択項目のhash検証 | 新索引なし。検索read-onlyと保守全検証を分離 |
+| Task14既存closeout契約 | proposal-only → 設定許可時auto-apply | 承認済み設計追加が優先。明示proposal-onlyとassociation UNKNOWNは維持 |
+| Task15既存昇格契約 | 参考情報は未昇格のまま | promotion閾値とactive-only既定readerは変更しない |
+| 既存safe_fs修正 → 両Task | path安全検査 | 独立レビュー済みの凍結差分は変更しない |
+
+### Task 14: setupで許可されたSkill closeoutの自動保存
+
+**設定差分の接続Files:** `src/ei/setup_reconciliation.py`。`_settings_changes` の比較対象に同意設定を含める。設定だけの更新を `ALREADY_CURRENT` と誤認しないことを既存の `test_installer_reconciliation.py` で確認する。
+
+**全件検証でのCLI接続Files:** `tests/unit/test_cli.py`、`tests/unit/test_setup_onboarding.py`、既存所有の `src/ei/cli.py`。新規対話時の保存同意質問に旧wizard fixtureの回答列を対応させ、同意値と再実行時の保持も確認する。公開の `ei setup` 入口についても明示的な許可・不許可の相互排他flagsが既存installer選択へ渡ることを検証する。既存のHost・team・保存先・最終確認・明示的なscheduler無効の検証を削除せず、同意質問や本番の確認を省略してテストを通さない。
+
+**再送境界の接続Files:** `src/ei/closeout_service.py`。実launcher試験で、初回保存後の同一YES再送が監査eventの固定IDと新timestampの衝突で失敗したため、その監査経路を必要最小限で修正する。journalの衝突検出・既存event内容・trusted associationの検証を緩めず、観察の重複排除を維持する。既存の `test_skill_runtime_boundary.py` の再送試験と関連closeout試験で確認する。
+
+**最終統合レビューの接続Files:** `src/ei/changeset.py`、`src/ei/journal.py`、`schemas/observation.schema.json`、`tests/unit/test_journal.py` をTask14 worker所有へ追加する。curatorが検証したCREATE_OBSERVATION payloadの `precondition` / `failure_mode` / `exception` / `version_constraint` を実際の観察eventへ保持し、Task15のprojection・適用条件検査に渡す。journalの独立validatorと公開schemaはこの4項目だけをoptionalな型付き情報として一致させ、既存event byte上限・禁止内容・Host・未知field拒否を維持する。新しい許可・根拠・scopeを作らず、既存eventを書き換えない。既存 `tests/integration/test_skill_runtime_boundary.py` で実auto-apply event→projection→同一cwd recallの往復を検証し、version外の取得拒否と再送の互換性を確認する。併せてactual cwd取得失敗は未知scopeとして明示し、caller scopeを復活させず製品ソース監査を通す。
+
+**追加AIなしの接続境界:** Skillの今回の自動保存は個人保存だけを対象とする。チーム設定が有効でも、この自動呼出しから保存後のチーム用Providerを起動しない。既存の手動closeout・チーム共有経路と永続設定は変更しない。
+
+既存serviceへ `process_closeout(..., route_team: bool = True)` を追加し、Skill自動経路だけFalseを渡す。team未設定は既存の `DISABLED / TEAM_DISABLED`、個人適用が成功していなければ `SKIPPED / PERSONAL_APPLY_NOT_SUCCESS` を優先する。それ以外のFalseのteam結果は `SKIPPED / TEAM_ROUTING_NOT_REQUESTED`。いずれも追加AIを起動しない。別分岐でflagを無視して追加AIを起動しない。既存trusted処理へのFalse伝搬が対応外なら、副作用前に明示拒否する境界を試験・文書化する。
+
+**Files:** `src/ei/config.py`, `src/ei/install_manifest.py`, `src/ei/installer.py`, `schemas/install-manifest.schema.json`, `skills/external-intelligence/scripts/_trusted_runtime.py`, `skills/external-intelligence/scripts/closeout.py`, `skills/external-intelligence/SKILL.md`, `skills/external-intelligence/workflows/closeout.md`, `tests/unit/test_config.py`, `tests/unit/test_install_manifest.py`, `tests/unit/test_installer_reconciliation.py`, `tests/integration/test_skill_runtime_boundary.py`, `tests/integration/test_unattended_setup.py`, `docs/unattended-operation.md`、本計画書と設計書。親はdocs/配下とledgerを所有、workerは残りの指定製品/Skill/testを所有する。接続に別fileが必要なら変更前に親へ報告する。
+
+**Interfaces:** install manifest v8へoptional bool `skill_auto_apply` を追加（欠落=false、非bool拒否）。設定は追加の末尾default fieldとして互換に導入する。CLIは `--skill-auto-apply` / `--no-skill-auto-apply` の相互排他、未指定Noneで既存値維持。bindingに検証済みhost/保存許可だけを渡し、候補stdin・環境変数で許可を上書きさせない。構造化YESは既存 `process_closeout(payload, settings)` を使い、既存のcurate/validate/applyを再利用する。新しいjournal writerやProvider呼出しは作らない。
+
+**追加Files（通常入口への接続）:** `scripts/setup.ps1`, `scripts/update.ps1`, `scripts/setup.sh`, `scripts/update.sh`, `tests/integration/test_install_scripts.py`。Windows wrapperに `-SkillAutoApply` / `-NoSkillAutoApply`、POSIX wrapperに同名のCLI flagsを追加し、同時指定拒否と未指定維持を確認する。Pythonを直接呼ぶ利用者だけが設定できる機能にしない。execution policy・prerequisites・OS登録方法は変更しない。
+
+- [ ] RED: 既存 `test_skill_runtime_boundary` のreal installed fixtureを用い、許可trueのlauncher closeout呼出しが実observation eventを残すこと、再送で同じ記録が1つだけであることを先に検証する。false/欠落/明示 `--proposal-only` は提案のままeventを残さない。設定testsでは欠落=false、true/false維持、非bool拒否、explicit flag優先を固定値でassertする。
+- [ ] manifest/schema/config/installerに `skill_auto_apply` を接続する。初回対話setupでは「検証済みの再利用知識を、毎回の確認なしに個人ナレッジへ保存する。生会話・秘密情報は保存しない」と説明して一度選択（提示既定yes）。既存updateで未指定なら質問・無断有効化せず保存値維持。非対話新規setupで未指定はfalse、明示flagで許可。選択値はdesired state/reconciliationにも含め、updateが設定変更を見落とさない。既存manifestのバージョン・root・Host・Skill hash検証を緩めない。
+- [ ] `_trusted_runtime.load_binding` で既に検証したmanifestとhost recordから、host ID、`skill_auto_apply`、作業Host該当/activation状態を受け渡す。許可不明・work_hosts対象外・CONSENT_REQUIRED/UNVERIFIEDはauto-apply不可。`AUTO_ALLOWED` 単独では不可。Programmatic binding constructorの既存引数を壊さない。
+- [ ] `closeout.py` は許可時だけdeterministic serviceに構造化candidate/gateを渡す。呼出し元hostはbindingと一致するsource pairを検証し、勝手な別Hostへの変更を拒否する。現在のSkill呼出し `Path.cwd()` をcanonical化してfingerprintへ保存し、候補のcwd/cwd_fingerprintの自己申告で別案件を指定させない。本文の実cwdは永続化しない。cwdが得られなければ案件scopeを作らない。既存のcontent/privacy/size/Host applicability検証は維持する。
+- [ ] 完了はserviceの実結果/event IDsを返す。association contextがなければUNKNOWNのまま。実際の知識保存とSECUREDを混同しない。既に適用済みは元記録を返し重複保存しない。入力NOは既存の非保存/集計方針を維持する。自動適用不可または `--proposal-only` は既存の検証済みChangeSet proposalだけ返す。
+- [ ] GREEN: real filesystem/launcherで許可・拒否・旧manifest・設定更新・input spoof・別Host・privacy拒否・再送・現在cwdを確認する。外部Providerの再呼出しなしをassertし、候補の任意制御キーがroot/保存許可を変更しないことを確認する。Skill文章はAPI referenceとして変更し、既知の旧CLI proposal-only失敗をbaselineに、後続の実CLIで追加許可なしの保存が行われるか検証する。
+- [ ] 対象tests、diff self-review、コマンド/出力/SHAのreportを作りfreeze。full suite/commit/push/live操作は親がまとめて行う。
+
+主要分岐（既存input検証の後に接続し、許可はbinding由来）:
+
+```python
+if binding.skill_auto_apply and not args.proposal_only:
+    result = process_closeout({"candidate": candidate, "gate_decision": gate}, settings)
+    return _emit(result.payload, result.exit_code)
+# Otherwise retain deterministic proposal validation without applying it.
+```
+
+### Task 15: 既存索引による案件限定の参考情報と有界取得
+
+最終統合レビューで、選択本文の各file制限だけでは従来の合計byte上限を維持できないことを確認した。`src/ei/index.py` と `tests/unit/test_index.py` の既存所有範囲で、検索する本文だけの実raw byte合計に64MiB上限を適用し、超過は既存 `PROJECTION_STORAGE_LIMIT` で拒否する。無関係本文の読込み・hash/no-follow/identity/deadlineの省略はせず、各fileは上限内で合計だけ超過する回帰を追加する。
+
+**Files:** `src/ei/project.py`, `src/ei/index.py`, `src/ei/retrieve.py`, `src/ei/models.py`, `src/ei/context.py`, `src/ei/cli.py`, `src/ei/hook_entry.py`, `skills/external-intelligence/scripts/recall.py`, `skills/external-intelligence/workflows/recall.md`, `tests/unit/test_index.py`, `tests/unit/test_retrieve.py`, `tests/unit/test_context.py`, `tests/integration/test_projection.py`, `tests/integration/test_skill_runtime_boundary.py`, `tests/unit/test_hook_entry.py`, `tests/acceptance/test_global_scope_boundary.py`, `docs/unattended-operation.md`、本計画書と設計書。親が文書とledgerを所有し、workerは指定した製品・対象testのみを所有する。
+
+**Interfaces:** 既存 `project_events(events, knowledge_dir, *, budget=None)` が生成する同じ `index.json` とmanifestへ、観察IDをcwd fingerprint別に参照するmetadataを追加する。`read_index_items(index)` は引き続きactive-only。新しい `load_recall_index(knowledge_dir, index_path, *, budget=None)` と `read_recall_items(index, cwd_fingerprint, *, include_references=True, budget=None)` を `index.py` に追加する。`RetrievalHit.knowledge_kind` は末尾default `pattern`、参考情報は `project-reference`。呼出し間cache・別索引・常駐processなし。
+
+- [ ] RED: real temporary projectionで、同一cwd/queryの単発観察がproject-referenceとして返り、別cwd・空cwd・空query・team storeでは返らないことを先に試験する。既定active readerは空のまま、昇格イベントも作らない。
+- [ ] 同じ既存indexのmetadataに、有効なsha256 cwdを持つ観察だけを登録する。観察本文projectionへcwd/classification/precondition/failure/exception/version/recorded dateを必要最小限で保存する。過去journalは触らない。既知のactive・deprecated・superseded・tombstonedまたはcontradictionありpatternと同じclaim/provenanceの観察をreferenceで復活させない。
+- [ ] 検索用loaderはread-onlyでpointer/generation/manifest/index hashを結び付け、schema・path・byte/count・deadline制限を維持する。選択した各項目に必須のmanifest/file hashとno-follow/identity検査を行う。欠落hash・改変・link・置換・失効generationでは返さない。検索しない全本文を毎回読まない一方、既存 `build_index` と保守/同期の全ファイル検証は変更しない。legacy indexは検証可能な同一bindingだけ受け付け、metadataがない観察は返さない。
+- [ ] `read_recall_items` はactive itemsと完全一致cwdのreference候補だけを返す。reference本文のcwdもindex値と照合する。型混同せず、relevance/Host/version/privacy検査と既存max_results/max_chars内で順位付けする。referenceは空query時に除外する。参考情報のcontextには `Project-only reference (unpromoted; verify applicability)` を付け、independent evidenceの確定ルールと誤表示しない。
+- [ ] CLIとHookの通常・experiment両経路へ接続し、controlでは注入しない。Skill recallはCLI用subprocessへ移る前の実cwdを `--cwd` として渡す。任意のdomain/scopeだけで別cwdを許可しない。team検索はreferenceを含めない。例外は既存fail-open/deferred境界を維持する。
+- [ ] GREEN: 対象moduleに加え、同一観察の正常取得、他案件除外、host/version不一致、機密除外、未知scope、既知反例、改変・link・期限・generation更新、文字数/件数上限、active優先dedupを確認する。大きな別案件fixtureの本文を読まずに対象だけを得る実I/O境界試験を行う。mockした戻り値だけを成功証拠にしない。
+- [ ] self-review後にsource/test hashes・RED/GREENのコマンド/出力をreportへ保存しfreeze。親のAstra差分レビューと固定版全件gateまでcommitしない。
+
+最小動作例（既存fixtureの観察payloadとsettingsを使い、各ケースの期待値は固定する）:
+
+```python
+index = project_events(events, knowledge_dir)
+query = RetrievalQuery(prompt="safe retry receipt", cwd_fingerprint="sha256:" + "a" * 64)
+hits = search_index(index, query)
+assert [hit.pattern_id for hit in hits] == ["obs_project_reference"]
+assert hits[0].knowledge_kind == "project-reference"
+assert read_index_items(index) == ()
+assert search_index(index, RetrievalQuery(prompt=query.prompt, cwd_fingerprint="sha256:" + "b" * 64)) == []
+assert search_index(index, RetrievalQuery(prompt=query.prompt)) == []
+assert search_index(index, RetrievalQuery(prompt="", cwd_fingerprint=query.cwd_fingerprint)) == []
+```
+
+Task14のauto-save receiptとTask15の取得は、別process/別sessionで受入検証する。実保存event ID、projection generation、次sessionの取得IDを照合し、設定したexperiment armも記録する。単発の成功を全Host/OSの実証に拡大しない。
+
+### 2026-11-04: 同一呼出し内の重複祖先検査の削減
+
+対象は `src/ei/safe_fs.py`、`tests/unit/test_safe_fs.py` と本計画書のみ。実機の有界journal読取で、同一のroot祖先を `assert_safe_target` 内で繰り返し調べる処理が主要な負荷と判明した。canonical化前後のroot各成分の綴りが完全一致し、targetのprefixも同じ綴りの厳密な子である場合だけ、中間のroot検査を、直後のtarget全祖先検査で満たす。canonical化前のroot検査、canonical化後のtarget全祖先検査、containment、末端のreparse・存在・型検査、変更前後の検査は維持する。root自体の操作、drive・UNC share・filesystemのanchor、異なるcanonical path、その他のケースは従来経路を使う。呼出し間cache、永続索引、期限延長、検査無効化は追加しない。
+
+修正前に重複検査の回帰を再現し、rootのcanonical化中の変更、target/親のreparse、canonical path差、root自体・末端linkの特例、呼出し間での変更検知を確認する。安全層・journalの対象試験、独立レビュー、固定版全件試験を通す。同じ読取条件で負荷減少を測定し、単独benchmarkを自動運用全体の完了証拠と混同しない。
+
 計画作成時点の基点は設計commit `1bead27`。この計画自身は機能の実装結果ではない。既存の保守文書に合わせて`docs/plans/`へ置く。`docs/superpowers/`は公開exportから除外されるため使用しない。
 
 確認した接続点:
@@ -1466,3 +1570,45 @@ macOSでの一時ディレクトリの字句パスとcanonical pathの違いが�
 公開CIの詳細ログで、fallbackの故障分類が既定300msのStop期限に先取りされること、直接取得の準備が5秒で期限切れになるケースを確認した。fallback内の機能Hook試験と直接取得に有限20秒を明示する。catchupで失敗した3つの成功回収経路だけoptional引数で20秒にし、初回の回収成功と理由を検査する。共通10秒、ロック保持中の拒否、byte上限500の試験は維持する。
 
 closeoutの保存証跡からの復旧1ケースは、共通fixtureの既定5秒を変えずoptional引数で準備だけ20秒、適用だけ30秒とする。削除10秒、復旧30秒と既存の保存・証跡・再試行回数のassertionは維持する。scheduler復旧とprovider故障の分離1ケースの `service_cli_start` 2呼出しだけ20秒を明示する。原因不明のケースは安定化仮説として扱い、有限の状態・理由・件数を診断へ追加する。製品期限、意図的な期限切れ試験、安全検査、成功条件、認証・送信許可は変更しない。影響対象の全moduleと固定版全件試験、レビュー、同一公開SHAのCIで確認する。
+
+### 2026-11-04: 実Windows CIの引数隔離と短縮パスfixture
+
+**Files:** `src/ei/installer.py`、`tests/support/sitecustomize.py`、`tests/integration/test_install_scripts.py`、`tests/integration/test_unattended_setup.py`、`tests/unit/test_safe_fs.py`、`tests/unit/test_maintainer.py`、本計画書。
+
+公開CIで、Skill自動保存のsetup/update回帰がテスト専用Python中継の `EI_TEST_PYTHON_SHIM_ARGV_INVALID` で拒否され、安全なパス検証3ケースがWindowsの短縮名と正規化済みの長い名前を同じ表記と仮定して失敗した。製品コードの不具合かfixtureの不備かを実ログと再現で分離する。中継は新しい2つの同意switchと通常update形だけを厳格に受理し、未知・重複・競合・不正形の拒否、引数保持、通知隔離を維持する。実際のsetup→update保持→明示無効化を通常の利用可能なPowerShellで検証し、実行ポリシーの変更・Bypass・成功扱いのskipは追加しない。
+
+更新の保持検証は、生成した実manifestを通常の `-ManifestPath` で読み戻す経路を使う。`-Repo/-RuntimeRoot` の明示設定モードは必要なwork-host指定がなく `SETUP_WORK_HOSTS_REQUIRED`、保存先を補った呼出しでは `ACTIVE_MANIFEST_KNOWLEDGE_MISMATCH` となったため、この不完全な呼出しにhost/homeを再指定して保持成功の代用とはしない。生成済み設定から対象CLI・保存先を復元し、保存同意の明示ON・未指定時保持・明示OFFを検証する。
+
+通常PowerShellの実更新で、setup時に保存した `skip_venv=true` がCLIのmanifest復元時に失われる不具合を確認した。同意ON・未指定は変更なしで通ったが、OFF変更だけ依存取得へ進みDNSエラーとなった。`src/ei/installer.py` の当該復元に限定して既存の仮想環境選択を保持する。保存済みtrue・false・旧manifestでの欠落と、既存の明示 `--skip-venv` の意味を回帰で確認する。依存検証や製品の既定値を緩めず、通常更新の実OFF保存まで確認する。テストをCheckOnlyへ置換したり、manifestの手編集で成功扱いにはしない。
+
+安全性テストは、同一表記を意図するfixtureだけ正規化し、異なる表記・canonical root・root自身・reparse・権限拒否の独立した検証を残す。実際の短縮名が利用可能な環境では両表記の通常検証も行う。安全検査の回数assertionを削除するだけ、例外を許容するだけ、製品のcontainment/no-follow/期限の緩和は行わない。製品修正が必要と判明した場合は、根拠と追加Filesを先に示す。対象試験、限定Astraレビュー、新しい固定候補の全件試験、同一公開SHAのCIを通して既存PRを更新する。
+
+同一公開SHAのpush側Python 3.11では、既存 `test_maintenance_continues_after_independent_source_failure_and_gcs_expired_spool` の `expired_spool == 0` も確認した。CIログだけでは失敗段階・原因は未確定である。5秒の実時間予算が独立ソース失敗後の回収機能検証を先取りする経路か、別原因かを最小probeで区別する。機能fixtureの時間依存と再現できた場合のみ、当該1ケースの呼出しを有限で進むtest-local時計へ分離し、実I/O・全assertion・期限check・外側300秒上限を維持する。既存の独立期限試験を併走させ、時計停止・時間上限の引上げ・skip・製品修正で隠さない。原因未確定の点と実運用性能を改善したわけではないことを報告する。
+
+### 2026-11-04: canonical-root fallback fixtureの短縮TEMP再現
+
+追加対象は `tests/unit/test_safe_fs.py` と本計画書のみ。修正版の公開Windows CIで、`test_safe_target_uses_full_root_walk_when_canonical_root_differs` の正規化済み親へのprobe回数が期待4に対して2となった。未正規化の一時rootと正規化済み親で同じディレクトリの表記が分離する仮説を、可能な限り実8.3別名のTEMPで再現する。意図した「元rootと異なるcanonical root」のfallbackを保ったまま、同一表記を前提とするfixture構築だけを修正する。回数assertionの緩和・削除、製品のcontainment/no-follow/root再検証の変更、OS設定変更やskipはしない。通常名と利用可能な実短縮名で変更前RED／変更後GREEN、対象全module、限定レビュー、新固定版の全件試験、公開CIを確認する。
+
+### 2026-11-05: 自動候補化と非表示定期実行の要件追加
+
+今回の記録対象は本計画書と `docs/specs/2026-09-18-reliable-automatic-accumulation-design.md` 第13節のみ。利用者は作業記録から設定済み整理AIへの候補化を承認し、定期処理でcmd等を表示しないことを追加要求した。新しい索引・常駐サービスや対象Hostの拡大は行わない。製品コード・インストール設定はまだ変更していない。
+
+実PCの登録済みタスクはconsole版Pythonを直接起動していた。修正設計では非表示の親プロセスだけでなく、整理AI・Git等の子プロセスを対象にする。ログと終了状態を保持し、実行ポリシーは変更しない。具体的な製品コードの所有ファイルと回帰テストは起動経路の確認後に固定し、適用前のレビュー・試験と実機確認を行う。既存ナレッジとcanonical checkoutの利用者の文書差分は維持する。
+
+#### Windowsの文字コード・非表示起動修正（同日承認）
+
+関連fixtureの追加対象は `tests/unit/test_scheduler_installer_production_defects.py`、`tests/unit/test_scheduler_opportunities.py`、`tests/unit/test_setup_onboarding.py`。既存の拡張子なしfake Pythonや他OS想定のactionが実行ホストのWindows判定に依存する箇所だけ、対象OSと実行ファイルを明示する。Windowsの非表示Python必須条件や既存assertionを緩めず、製品側へfixture専用の可視起動例外を追加しない。
+
+利用者の実エラー報告と明示承認に基づき、対象の定期タスク1件だけを一時無効化した。今回の製品修正に自動候補化は含めない。合成したUTF-8日本語をcp932のtext pipeで読むと、2つのreader threadが失敗し、子の終了コード0でもstdout/stderrがNoneとなることを再現した。
+
+**Files:** `src/ei/task_scheduler.py`、`src/ei/stdio.py`、`src/ei/inference/cli_subscription.py`、`src/ei/inference/ollama.py`、`src/ei/sync.py`、`src/ei/remote_assurance.py`、`tests/unit/test_task_scheduler.py`、`tests/unit/test_stdio.py`、`tests/unit/test_inference_router.py`、`tests/integration/test_git_sync.py`、`tests/unit/test_remote_assurance.py`、本計画書。前項で承認された要件記録の仕様書も保持する。製品・テストはLuna、文書と反映作業は親が所有する。
+
+Provider/Gitの入出力を既定localeから独立させ、不正出力を欠落した成功結果へ変換しない。Provider入力の日本語もUTF-8で送る。生出力のログ保存や黙った文字置換は追加しない。Windowsの定期実行は同じ仮想環境の非表示Pythonを選び、UTF-8 modeを明示する。手動・登録時のJSON取得にはconsole Pythonを使う。非表示Pythonがなければ可視起動へ戻さない。関連するProvider・Git・remote確認・scheduler照会の子プロセスにはWindows限定の表示抑止を付け、非Windows・既存のdeadline・認証・所有検証を保つ。標準出力がない実行時も正常終了と異常終了を判別できるようにする。
+
+回帰RED→最小修正GREEN→対象module→固定差分レビュー→固定ソースの全unittestの順に確認する。通常updateで実PCへ反映し、登録値・実プロセス・出力読み取りを確認してから定期処理を再開する。既存ナレッジ、利用者の文書差分、実行ポリシーは変更せず、公開exportやpushは別の未解決条件を迂回しない。
+
+### 2026-11-04: Skill取得機能と実時間期限の分離
+
+追加対象は `tests/integration/test_multi_host_lifecycle.py` と本計画書のみ。公開HEAD6803709のpush CI/Python3.11で、`test_skill_uses_verified_namespace_and_original_budget_without_plaintext_journal` の期待 `PENDING_SECURED` が `CAPTURE_BUDGET_EXHAUSTED` となった。全182module中この1moduleだけ失敗し、Python3.13側は合格した。前回の短縮パス検証は合格している。当該成功経路は暗黙の製品5秒に依存しており、実CIログだけでは内部の消費段階は確定しない。
+
+機能確認には有限で進むtest-local時計を使い、実namespace検証・暗号化・queue保存・平文journal不在のassertionと実deadline checkを維持する。別の確定的な期限超過ケースで、渡した元予算が途中でリセットされず、未確保の処理を成功扱いしないことを検証する。既存のゼロ予算拒否も残す。製品の時計・既定5秒・安全検査・module外側300秒は変更せず、個別秒数増加・skip・再試行による成功扱いは行わない。最小再現、対象moduleと独立期限試験、限定Astraレビュー、新固定版全件試験、同一公開HEADのCIを通す。これは機能試験の時間依存の分離であり、実運用性能改善の証拠とは扱わない。

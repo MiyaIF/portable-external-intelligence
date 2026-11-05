@@ -28,7 +28,7 @@ from .context import build_context
 from .doctor import maintenance_status, run_doctor
 from .experiment import ExperimentConfig, render_experiment_report, summarize_experiment
 from .ids import fingerprint, machine_id, stable_hash
-from .index import build_index
+from .index import build_index, load_recall_index
 from .ingest import ingest_sources
 from .install_agents import _marker_bounds
 from .installer import (
@@ -440,6 +440,14 @@ def _index(settings: Any):
     if not index_path.is_file():
         return None
     return build_index(knowledge, index_path)
+
+
+def _recall_index(settings: Any):
+    knowledge = Path(settings.paths.knowledge_dir)
+    index_path = knowledge / "index.json"
+    if not index_path.is_file():
+        return None
+    return load_recall_index(knowledge, index_path)
 
 
 def _team_enabled(settings: Any) -> bool:
@@ -871,7 +879,7 @@ def _recall(args: argparse.Namespace) -> int:
         max_chars=policy.max_chars,
     )
     started = __import__("time").monotonic()
-    personal_index = _index(args.settings)
+    personal_index = _recall_index(args.settings)
     team_index, team_projection = _team_projection_for_recall(args.settings)
     personal_store = {
         "status": "READY" if personal_index is not None else "NOT_READY",
@@ -1689,6 +1697,10 @@ def _build_parser() -> argparse.ArgumentParser:
     setup.add_argument("--organizer-host")
     common("resume-organizer")
     setup.add_argument("--privacy-profile", default="private-reusable")
+    skill_auto_apply_group = setup.add_mutually_exclusive_group()
+    skill_auto_apply_group.add_argument("--skill-auto-apply", dest="skill_auto_apply", action="store_true")
+    skill_auto_apply_group.add_argument("--no-skill-auto-apply", dest="skill_auto_apply", action="store_false")
+    setup.set_defaults(skill_auto_apply=None)
     setup.add_argument("--knowledge-mode", choices=("local", "github-new", "github-existing"))
     setup.add_argument("--github-repository")
     setup.add_argument("--github-executable", default="gh")

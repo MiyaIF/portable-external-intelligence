@@ -266,14 +266,16 @@ class SubscriptionCLIProvider:
             return ProviderResult(self.provider_id, "failed", error_code="TOKEN_CAP_EXCEEDED", input_tokens=input_tokens, schema_name=schema_name)
         timeout = min(self.timeout_seconds, max(0.001, current_budget.deadline_ms / 1000))
         runner_options: dict[str, Any] = {
-            "input": request,
-            "text": True,
+            "input": request.encode("utf-8", "strict"),
+            "text": False,
             "capture_output": True,
             "timeout": timeout,
             "check": False,
             "shell": False,
             "env": {**os.environ, "EI_INTERNAL": "1"},
         }
+        if os.name == "nt":
+            runner_options["creationflags"] = subprocess.CREATE_NO_WINDOW
         if self.working_directory is not None:
             runner_options["cwd"] = str(self.working_directory)
         try:
@@ -283,11 +285,24 @@ class SubscriptionCLIProvider:
         except (OSError, ValueError) as exc:
             del exc
             return ProviderResult(self.provider_id, "failed", error_code="PROVIDER_UNAVAILABLE", input_tokens=input_tokens, schema_name=schema_name)
-        stdout = getattr(completed, "stdout", "")
-        stderr = getattr(completed, "stderr", "")
-        if not isinstance(stdout, str) or not isinstance(stderr, str):
+        raw_stdout = getattr(completed, "stdout", b"")
+        raw_stderr = getattr(completed, "stderr", b"")
+        if isinstance(raw_stdout, bytes) and isinstance(raw_stderr, bytes):
+            try:
+                stdout = raw_stdout.decode("utf-8", "strict")
+                stderr = raw_stderr.decode("utf-8", "strict")
+            except UnicodeError:
+                return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
+        elif isinstance(raw_stdout, str) and isinstance(raw_stderr, str):
+            stdout, stderr = raw_stdout, raw_stderr
+        else:
             return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
-        if len(stdout.encode("utf-8", "replace")) > min(self.max_output_bytes, current_budget.max_response_bytes) or len(stderr.encode("utf-8", "replace")) > self.max_output_bytes:
+        try:
+            stdout_size = len(stdout.encode("utf-8", "strict"))
+            stderr_size = len(stderr.encode("utf-8", "strict"))
+        except UnicodeError:
+            return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
+        if stdout_size > min(self.max_output_bytes, current_budget.max_response_bytes) or stderr_size > self.max_output_bytes:
             return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
         return_code = getattr(completed, "returncode", 1)
         decoded: Any = None

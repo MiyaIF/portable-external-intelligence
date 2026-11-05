@@ -8,6 +8,8 @@ personal_knowledge_root=""
 team_knowledge_root=""
 team_member_id=""
 no_team_knowledge=0
+skill_auto_apply=0
+no_skill_auto_apply=0
 runtime_root=""
 manifest=""
 python_exe=""
@@ -26,6 +28,8 @@ while [ "$#" -gt 0 ]; do
     --team-knowledge-root) team_knowledge_root=$2; shift 2 ;;
     --team-member-id) team_member_id=$2; shift 2 ;;
     --no-team-knowledge) no_team_knowledge=1; shift ;;
+    --skill-auto-apply) skill_auto_apply=1; shift ;;
+    --no-skill-auto-apply) no_skill_auto_apply=1; shift ;;
     --runtime-root) runtime_root=$2; shift 2 ;;
     --manifest|--manifest-path) manifest=$2; shift 2 ;;
     --python-exe) python_exe=$2; shift 2 ;;
@@ -37,6 +41,11 @@ while [ "$#" -gt 0 ]; do
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
+
+if [ "$skill_auto_apply" -eq 1 ] && [ "$no_skill_auto_apply" -eq 1 ]; then
+  echo "SKILL_AUTO_APPLY_SELECTION_CONFLICT" >&2
+  exit 2
+fi
 
 if [ -n "$manifest" ] && { [ -n "$engine_root" ] || [ -n "$knowledge_root" ] || [ -n "$personal_knowledge_root" ] || [ -n "$team_knowledge_root" ] || [ -n "$team_member_id" ] || [ "$no_team_knowledge" -eq 1 ]; }; then
   echo "ROOT_OPTIONS_CONFLICT_WITH_MANIFEST" >&2
@@ -77,6 +86,8 @@ fi
 [ -n "$team_knowledge_root" ] && set -- "$@" --team-knowledge-root "$team_knowledge_root"
 [ -n "$team_member_id" ] && set -- "$@" --team-member-id "$team_member_id"
 [ "$no_team_knowledge" -eq 1 ] && set -- "$@" --no-team-knowledge
+[ "$skill_auto_apply" -eq 1 ] && set -- "$@" --skill-auto-apply
+[ "$no_skill_auto_apply" -eq 1 ] && set -- "$@" --no-skill-auto-apply
 [ -n "$runtime_root" ] && set -- "$@" --runtime-root "$runtime_root"
 [ -n "$hosts" ] && set -- "$@" --hosts "$hosts"
 [ -n "$host_homes" ] && set -- "$@" --host-home "$host_homes"

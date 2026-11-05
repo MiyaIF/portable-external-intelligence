@@ -678,6 +678,7 @@ def _event_payload(changeset: ChangeSet, operation: ChangeOperation, state: Mapp
             "cwd_fingerprint": _persisted_identifier(str(source.get("cwd_fingerprint", "")), "cwd", allow_empty=True),
             "domain": str(source.get("domain", "general")), "outcome_status": str(source.get("outcome_status", "unknown")),
             "benefit": str(source.get("benefit", "")), "applicability": _items(source, "applicability"),
+            **{field: source[field] for field in ("precondition", "failure_mode", "exception", "version_constraint") if field in source},
             "record_fingerprint": "sha256:" + hashlib.sha256((observation_id + source_hash).encode()).hexdigest(),
         }
     if operation.operation == "ATTACH_EVIDENCE":

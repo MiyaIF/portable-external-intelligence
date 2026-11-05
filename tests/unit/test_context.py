@@ -34,6 +34,24 @@ class ContextTests(unittest.TestCase):
         self.assertIn("Scope: personal", context)
         self.assertIn("Scope: team", context)
 
+    def test_project_reference_context_is_explicitly_unpromoted_and_bounded(self):
+        hit = make_retrieval_hit(
+            pattern_id="obs_project_reference",
+            knowledge_kind="project-reference",
+            rule="Check the receipt before retrying.",
+            precondition="The original write may have completed.",
+            failure_mode="Blind retry can duplicate the write.",
+            exceptions=("Only for the same operation.",),
+            version_constraint=">=1.0,<2",
+        )
+        context = build_context([hit], max_chars=800)
+        self.assertIn("Project-only reference (unpromoted; verify applicability)", context)
+        self.assertIn("Precondition: The original write may have completed.", context)
+        self.assertIn("Failure mode: Blind retry can duplicate the write.", context)
+        self.assertIn("Exception: Only for the same operation.", context)
+        self.assertIn("Version constraint: >=1.0,<2", context)
+        self.assertLessEqual(len(context), 800)
+
     def test_invalid_budget_and_layer_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "CONTEXT_BUDGET_INVALID"):
             build_context([], 0)

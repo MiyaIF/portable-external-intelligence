@@ -29,16 +29,22 @@ from tests.support.sitecustomize import NotificationIsolationMixin
 
 
 class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unittest.TestCase):
-    def _scheduler_fixture(self, root: Path):
+    def _scheduler_fixture(self, root: Path, *, platform_name: str):
         engine = root / "engine source"
         knowledge = root / "private knowledge"
         runtime = root / "machine runtime"
         engine.mkdir(parents=True)
         knowledge.mkdir(parents=True)
-        python = root / "python executable"
+        if platform_name.casefold() == "windows":
+            python = root / ".venv" / "Scripts" / "python.exe"
+            python.parent.mkdir(parents=True)
+            python.with_name("pythonw.exe").write_bytes(b"stable-pythonw-content")
+        else:
+            python = root / "python executable"
         python.write_bytes(b"stable-python-content")
         settings = Settings(paths=RuntimePaths(engine, knowledge, runtime))
-        action = build_maintenance_action(settings, python)
+        with patch("ei.task_scheduler.platform.system", return_value=platform_name):
+            action = build_maintenance_action(settings, python)
         write_scheduler_state(settings, action, True)
         return settings, action, python
 
@@ -48,7 +54,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_macos_inspection_rejects_successful_status_without_persisted_plist(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, _, _ = self._scheduler_fixture(Path(tmp))
+            settings, _, _ = self._scheduler_fixture(Path(tmp), platform_name="Darwin")
             agents = Path(tmp) / "launch agents override"
             agents.mkdir()
             with (
@@ -64,7 +70,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_macos_inspection_requires_exact_plist_argv_working_directory_and_content_identity(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, python = self._scheduler_fixture(Path(tmp))
+            settings, action, python = self._scheduler_fixture(Path(tmp), platform_name="Darwin")
             agents = Path(tmp) / "launch agents override"
             agents.mkdir()
             plist_path = agents / f"{TASK_NAME}.plist"
@@ -88,7 +94,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_linux_inspection_reads_override_unit_files_and_requires_exact_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, _ = self._scheduler_fixture(Path(tmp))
+            settings, action, _ = self._scheduler_fixture(Path(tmp), platform_name="Linux")
             unit_dir = Path(tmp) / "systemd user override"
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
@@ -116,7 +122,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_linux_inspection_rejects_status_only_when_executable_content_changes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, python = self._scheduler_fixture(Path(tmp))
+            settings, action, python = self._scheduler_fixture(Path(tmp), platform_name="Linux")
             unit_dir = Path(tmp) / "systemd user override"
             unit_dir.mkdir()
             (unit_dir / f"{TASK_NAME}.service").write_bytes(build_systemd_user_unit(action).encode("utf-8"))
@@ -135,7 +141,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_linux_inspection_requires_sync_flag_to_match_current_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, _ = self._scheduler_fixture(Path(tmp))
+            settings, action, _ = self._scheduler_fixture(Path(tmp), platform_name="Linux")
             unit_dir = Path(tmp) / "systemd user override"
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
@@ -159,7 +165,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_inspection_reports_malformed_state_as_contract_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, _, _ = self._scheduler_fixture(Path(tmp))
+            settings, _, _ = self._scheduler_fixture(Path(tmp), platform_name="Linux")
             state_path = settings.paths.runtime_root / "scheduler-state.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
             state["action"]["executable"] = "\u0000invalid"
@@ -173,7 +179,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_unregister_linux_verifies_and_removes_job_owned_artifacts_and_state(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, _ = self._scheduler_fixture(Path(tmp))
+            settings, action, _ = self._scheduler_fixture(Path(tmp), platform_name="Linux")
             unit_dir = Path(tmp) / "systemd user override"
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
@@ -197,7 +203,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_unregister_preserves_mismatched_linux_job_and_owned_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, _ = self._scheduler_fixture(Path(tmp))
+            settings, action, _ = self._scheduler_fixture(Path(tmp), platform_name="Linux")
             unit_dir = Path(tmp) / "systemd user override"
             unit_dir.mkdir()
             service_path = unit_dir / f"{TASK_NAME}.service"
@@ -220,7 +226,7 @@ class SchedulerInstallerProductionDefectTests(NotificationIsolationMixin, unitte
 
     def test_unregister_windows_verifies_live_action_before_removing_state(self):
         with tempfile.TemporaryDirectory() as tmp:
-            settings, action, _ = self._scheduler_fixture(Path(tmp))
+            settings, action, _ = self._scheduler_fixture(Path(tmp), platform_name="Windows")
             live = {
                 "TaskName": TASK_NAME,
                 "Execute": str(action.executable),

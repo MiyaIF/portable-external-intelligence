@@ -13,6 +13,10 @@
     "outcome_status": {"type": "string", "minLength": 1},
     "benefit": {"type": "string", "minLength": 1},
     "classification": {"type": "string", "minLength": 1},
+    "precondition": {"type": "string"},
+    "failure_mode": {"type": "string"},
+    "exception": {"type": "string"},
+    "version_constraint": {"type": ["string", "null"]},
     "source_hash": {
       "anyOf": [
         {"type": "string", "const": ""},

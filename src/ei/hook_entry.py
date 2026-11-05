@@ -81,15 +81,30 @@ def _record_error(settings: Settings, reason_code: str, event_name: str, *, budg
         return
 
 
-def _parse_patterns(settings: Settings, *, budget=None) -> list[dict[str, Any]]:
+def _parse_patterns(
+    settings: Settings,
+    *,
+    budget=None,
+    cwd_fingerprint: str = "",
+    include_references: bool = True,
+) -> list[dict[str, Any]]:
     if budget is not None:
         budget.check()
     knowledge = settings.paths.knowledge_dir
     index_json = knowledge / "index.json"
     if index_json.exists() or index_json.is_symlink():
         try:
-            from .index import build_index, read_index_items
-            return [dict(item) for item in read_index_items(build_index(knowledge, index_json, budget=budget), budget=budget)]
+            from .index import load_recall_index, read_recall_items
+            index = load_recall_index(knowledge, index_json, budget=budget)
+            return [
+                dict(item)
+                for item in read_recall_items(
+                    index,
+                    cwd_fingerprint,
+                    include_references=include_references,
+                    budget=budget,
+                )
+            ]
         except TimeoutError:
             raise
         except (OSError, ValueError, KeyError, TypeError):
@@ -185,7 +200,12 @@ def _record_exposure(event: NormalizedHookEvent, prompt: str, hit_ids: list[str]
 
 
 def _recall(event: NormalizedHookEvent, prompt: str, settings: Settings, layer: str, max_chars: int, *, budget=None) -> tuple[list[Any], str]:
-    patterns = _parse_patterns(settings, budget=budget)
+    patterns = _parse_patterns(
+        settings,
+        budget=budget,
+        cwd_fingerprint=event.cwd_hash,
+        include_references=bool(prompt.strip()),
+    )
     query = RetrievalQuery(
         prompt=prompt,
         cwd_hash=event.cwd_hash,
@@ -304,7 +324,12 @@ def _handle_normalized_hook(event: NormalizedHookEvent, settings: Settings, *, b
         prompt = event.transient_input or ""
         budget.check()
         if getattr(settings, "experiment_enabled", False) and event.session_id_hash:
-            patterns = _parse_patterns(settings, budget=budget)
+            patterns = _parse_patterns(
+                settings,
+                budget=budget,
+                cwd_fingerprint=event.cwd_hash,
+                include_references=bool(prompt.strip()),
+            )
             exposure = prepare_exposure(event.session_id_hash, getattr(settings, "experiment_id", "retrieval-v1"), prompt, patterns, cwd_fingerprint=event.cwd_hash, record_path=settings.paths.runtime_dir / "experiment-exposures.jsonl", observed_at=datetime.now(timezone.utc).isoformat(), host_id=event.source_host_id, host_family=event.source_host_family, budget=budget)
             hit_ids = list(exposure.candidate_ids)
             context = exposure.additional_context

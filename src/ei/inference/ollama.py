@@ -87,28 +87,45 @@ class OllamaProvider:
             return ProviderResult(self.provider_id, "failed", error_code="DEADLINE_EXCEEDED", schema_name=schema_name)
         request = json.dumps({"schema_name": schema_name, "input": dict(input_json)}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         timeout = min(self.timeout_seconds, max(0.001, current_budget.deadline_ms / 1000))
+        runner_options = {
+            "input": request.encode("utf-8", "strict"),
+            "text": False,
+            "capture_output": True,
+            "timeout": timeout,
+            "check": False,
+            "shell": False,
+            "env": {**os.environ, "EI_INTERNAL": "1"},
+        }
+        if os.name == "nt":
+            runner_options["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             completed = self._runner(
                 self.build_argv(),
-                input=request,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-                shell=False,
-                env={**os.environ, "EI_INTERNAL": "1"},
+                **runner_options,
             )
         except subprocess.TimeoutExpired:
             return ProviderResult(self.provider_id, "failed", error_code=PROVIDER_TIMEOUT, input_tokens=input_tokens, schema_name=schema_name)
         except (OSError, ValueError) as exc:
             del exc
             return unavailable_result(self.provider_id, schema_name=schema_name)
-        stdout = getattr(completed, "stdout", "")
-        stderr = getattr(completed, "stderr", "")
-        if not isinstance(stdout, str) or not isinstance(stderr, str):
+        raw_stdout = getattr(completed, "stdout", b"")
+        raw_stderr = getattr(completed, "stderr", b"")
+        if isinstance(raw_stdout, bytes) and isinstance(raw_stderr, bytes):
+            try:
+                stdout = raw_stdout.decode("utf-8", "strict")
+                stderr = raw_stderr.decode("utf-8", "strict")
+            except UnicodeError:
+                return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
+        elif isinstance(raw_stdout, str) and isinstance(raw_stderr, str):
+            stdout, stderr = raw_stdout, raw_stderr
+        else:
             return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
-        output_bytes = stdout.encode("utf-8", "replace")
-        if len(output_bytes) > min(self.max_output_bytes, current_budget.max_response_bytes):
+        try:
+            output_bytes = stdout.encode("utf-8", "strict")
+            stderr_bytes = stderr.encode("utf-8", "strict")
+        except UnicodeError:
+            return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
+        if len(output_bytes) > min(self.max_output_bytes, current_budget.max_response_bytes) or len(stderr_bytes) > self.max_output_bytes:
             return ProviderResult(self.provider_id, "failed", error_code=MALFORMED_RESPONSE, input_tokens=input_tokens, schema_name=schema_name)
         return_code = getattr(completed, "returncode", 1)
         if type(return_code) is not int or return_code != 0:

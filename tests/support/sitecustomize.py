@@ -620,7 +620,7 @@ function Test-EiSetupArguments {
   if ($arguments.Count -lt 10 -or $arguments.Count -gt 96 -or $arguments[0] -ne '-I' -or $arguments[1] -ne '-B' -or $arguments[2] -ne '-X' -or $arguments[3] -ne 'utf8' -or $arguments[4] -ne '-c' -or $arguments[5] -ne $bootstrap -or -not (Test-Path -LiteralPath ([string]$arguments[6]) -PathType Container) -or ([IO.Path]::GetFileName([string]$arguments[6]) -ne 'src') -or $arguments[7] -ne '--setup') { return $false }
   $valueOptions = @('--python-exe', '--privacy-profile', '--skill-mode', '--repo', '--engine-root', '--knowledge-mode', '--knowledge-root', '--personal-knowledge-root', '--team-knowledge-root', '--team-member-id', '--runtime-root', '--github-repository', '--github-executable', '--remote-name', '--branch', '--confirm-github-create', '--hosts', '--host-home', '--providers', '--organizer-provider', '--organizer-host')
   $repeatableValueOptions = @('--hosts', '--host-home', '--providers')
-  $switchOptions = @('--no-team-knowledge', '--sync', '--no-sync', '--experiment', '--scheduler', '--no-scheduler', '--check-only', '--verify-operation', '--allow-model-test', '--allow-notification-test', '--non-interactive', '--accept-plan', '--skip-venv', '--json')
+  $switchOptions = @('--no-team-knowledge', '--sync', '--no-sync', '--experiment', '--scheduler', '--no-scheduler', '--skill-auto-apply', '--no-skill-auto-apply', '--check-only', '--verify-operation', '--allow-model-test', '--allow-notification-test', '--non-interactive', '--accept-plan', '--skip-venv', '--json')
   $seen = @{}
   for ($index = 8; $index -lt $arguments.Count; $index++) {
     $option = [string]$arguments[$index]
@@ -641,7 +641,35 @@ function Test-EiSetupArguments {
   $setupCount = @($arguments[7..($arguments.Count - 1)] | Where-Object { $_ -eq '--setup' }).Count
   $pythonCount = @($arguments[7..($arguments.Count - 1)] | Where-Object { $_ -eq '--python-exe' }).Count
   $hasRepository = $seen.ContainsKey('--repo') -xor $seen.ContainsKey('--engine-root')
-  return $setupCount -eq 1 -and $pythonCount -eq 1 -and $seen.ContainsKey('--privacy-profile') -and $seen.ContainsKey('--skill-mode') -and $hasRepository -and -not ($seen.ContainsKey('--sync') -and $seen.ContainsKey('--no-sync')) -and -not ($seen.ContainsKey('--scheduler') -and $seen.ContainsKey('--no-scheduler'))
+  return $setupCount -eq 1 -and $pythonCount -eq 1 -and $seen.ContainsKey('--privacy-profile') -and $seen.ContainsKey('--skill-mode') -and $hasRepository -and -not ($seen.ContainsKey('--sync') -and $seen.ContainsKey('--no-sync')) -and -not ($seen.ContainsKey('--scheduler') -and $seen.ContainsKey('--no-scheduler')) -and -not ($seen.ContainsKey('--skill-auto-apply') -and $seen.ContainsKey('--no-skill-auto-apply'))
+}
+function Test-EiUpdateArguments {
+  if ($arguments.Count -lt 8 -or $arguments.Count -gt 96 -or $arguments[0] -ne '-B' -or $arguments[1] -ne '-m' -or $arguments[2] -ne 'ei.installer' -or $arguments[3] -ne '--update') { return $false }
+  $valueOptions = @('--manifest', '--python-exe', '--repo', '--engine-root', '--knowledge-root', '--personal-knowledge-root', '--team-knowledge-root', '--team-member-id', '--runtime-root', '--hosts', '--host-home')
+  $repeatableValueOptions = @('--hosts', '--host-home')
+  $switchOptions = @('--update', '--no-team-knowledge', '--skill-auto-apply', '--no-skill-auto-apply', '--check-only', '--non-interactive', '--json')
+  $seen = @{}
+  for ($index = 3; $index -lt $arguments.Count; $index++) {
+    $option = [string]$arguments[$index]
+    if ($valueOptions -contains $option) {
+      if ($index + 1 -ge $arguments.Count -or [string]::IsNullOrWhiteSpace([string]$arguments[$index + 1]) -or ([string]$arguments[$index + 1]).StartsWith('--')) { return $false }
+      if ($seen.ContainsKey($option) -and $repeatableValueOptions -notcontains $option) { return $false }
+      $value = [string]$arguments[$index + 1]
+      if ($option -eq '--python-exe' -and -not [string]::Equals($value, $shimPath, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+      $seen[$option] = $true
+      $index++
+    } elseif ($switchOptions -contains $option) {
+      if ($seen.ContainsKey($option)) { return $false }
+      $seen[$option] = $true
+    } else {
+      return $false
+    }
+  }
+  $pythonIndex = [Array]::IndexOf([string[]]$arguments, '--python-exe')
+  $hasManifest = $seen.ContainsKey('--manifest')
+  $hasRoot = $seen.ContainsKey('--repo') -xor $seen.ContainsKey('--engine-root')
+  $manifestConflict = $hasManifest -and ($seen.ContainsKey('--engine-root') -or $seen.ContainsKey('--knowledge-root') -or $seen.ContainsKey('--personal-knowledge-root') -or $seen.ContainsKey('--team-knowledge-root') -or $seen.ContainsKey('--team-member-id') -or $seen.ContainsKey('--no-team-knowledge'))
+  return $seen.ContainsKey('--update') -and $pythonIndex -ge 0 -and [string]::Equals([string]$arguments[$pythonIndex + 1], $shimPath, [StringComparison]::OrdinalIgnoreCase) -and ($hasManifest -xor $hasRoot) -and -not $manifestConflict -and -not ($seen.ContainsKey('--knowledge-root') -and -not $seen.ContainsKey('--engine-root')) -and -not ($seen.ContainsKey('--personal-knowledge-root') -and $seen.ContainsKey('--knowledge-root')) -and -not ($seen.ContainsKey('--team-member-id') -and -not $seen.ContainsKey('--team-knowledge-root')) -and -not ($seen.ContainsKey('--skill-auto-apply') -and $seen.ContainsKey('--no-skill-auto-apply'))
 }
 function Write-EiArgumentTrace {
   param([object[]]$RawArguments, [object[]]$ForwardedArguments)
@@ -744,6 +772,38 @@ if (Test-EiSetupArguments) {
   }
   $global:LASTEXITCODE = $childExit
   return
+}
+if (Test-EiUpdateArguments) {
+  $realPython = Get-EiRealPython
+  if ([string]::IsNullOrWhiteSpace([string]$realPython)) {
+    [Console]::Error.WriteLine('EI_TEST_PYTHON_SHIM_REAL_PYTHON_INVALID')
+    $global:LASTEXITCODE = 125
+    if ($MyInvocation.ScriptName) { return }
+    exit 125
+  }
+  $forward = @($arguments)
+  $pythonIndex = [Array]::IndexOf([string[]]$forward, '--python-exe')
+  $forward[$pythonIndex + 1] = $realPython
+  if (-not (Write-EiArgumentTrace -RawArguments $arguments -ForwardedArguments $forward)) {
+    [Console]::Error.WriteLine('EI_TEST_PYTHON_SHIM_TRACE_INVALID')
+    $global:LASTEXITCODE = 125
+    if ($MyInvocation.ScriptName) { return }
+    exit 125
+  }
+  $outerSystemRoot = $env:SystemRoot
+  $childExit = 125
+  try {
+    $env:SystemRoot = Get-EiPrivateSystemRoot
+    & $realPython @forward
+    $childExit = $LASTEXITCODE
+  } catch {
+    [Console]::Error.WriteLine('EI_TEST_PYTHON_SHIM_PRIVATE_SYSTEMROOT_INVALID')
+  } finally {
+    $env:SystemRoot = $outerSystemRoot
+  }
+  $global:LASTEXITCODE = $childExit
+  if ($MyInvocation.ScriptName) { return }
+  exit $childExit
 }
 if (Test-EiUninstallArguments) {
   $realPython = Get-EiRealPython

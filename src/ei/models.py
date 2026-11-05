@@ -415,6 +415,9 @@ class RetrievalHit:
     supersedes: tuple[str, ...] = ()
     precondition: str = ""
     failure_mode: str = ""
+    exceptions: tuple[str, ...] = ()
+    version_constraint: str | None = None
+    knowledge_kind: str = "pattern"
 
 
 @dataclass(frozen=True)

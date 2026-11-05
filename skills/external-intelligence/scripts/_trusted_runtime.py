@@ -87,6 +87,10 @@ class RuntimeBinding:
     runtime_root: Path
     python_exe: Path
     team_knowledge_root: Path | None = None
+    host_id: str | None = None
+    skill_auto_apply: bool = False
+    host_is_work_host: bool = False
+    skill_activation_mode: str | None = None
 
     @property
     def knowledge_root(self) -> Path:
@@ -287,6 +291,11 @@ def load_binding(
         or value.get("root_ownership") != _OWNERSHIP
     ):
         raise BindingError("ACTIVE_INSTALL_MANIFEST_INVALID")
+    if manifest_version != 8 and "skill_auto_apply" in value:
+        raise BindingError("ACTIVE_INSTALL_MANIFEST_INVALID")
+    skill_auto_apply = value.get("skill_auto_apply", False)
+    if type(skill_auto_apply) is not bool:
+        raise BindingError("ACTIVE_INSTALL_MANIFEST_INVALID")
     if manifest_version == 8:
         _canonicalize_transitional_v8_providers(value)
     engine = _directory(value.get("engine_root"), "ACTIVE_MANIFEST_ROOTS_INVALID")
@@ -439,7 +448,20 @@ def load_binding(
         raise BindingError("SKILL_BINDING_DESTINATION_MISMATCH")
     if _tree_hash(skill_destination) != installed_hash:
         raise BindingError("SKILL_BINDING_TREE_HASH_MISMATCH")
-    return RuntimeBinding(engine, knowledge, runtime, python_exe, bound_team)
+    work_hosts = value.get("work_hosts") if manifest_version == 8 else ()
+    host_is_work_host = isinstance(work_hosts, list) and host_id in work_hosts
+    activation_mode = record.get("skill_activation_mode") if isinstance(record.get("skill_activation_mode"), str) else None
+    return RuntimeBinding(
+        engine,
+        knowledge,
+        runtime,
+        python_exe,
+        bound_team,
+        host_id if isinstance(host_id, str) else None,
+        skill_auto_apply,
+        host_is_work_host,
+        activation_mode,
+    )
 
 
 def isolated_environment(binding: RuntimeBinding) -> dict[str, str]:

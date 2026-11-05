@@ -111,6 +111,22 @@ class InstallManifestTests(unittest.TestCase):
 
         self.assertEqual(schema["properties"]["work_hosts"]["minItems"], 1)
 
+    def test_v8_skill_auto_apply_is_optional_and_requires_a_real_boolean(self) -> None:
+        manifest = normalize_install_manifest(valid_v7_manifest())
+        self.assertNotIn("skill_auto_apply", manifest)
+        self.assertEqual(validate_install_manifest(manifest, require_live_personal=False).get("skill_auto_apply", False), False)
+
+        for invalid in ("true", 0, 1, None):
+            with self.subTest(invalid=invalid):
+                invalid_manifest = dict(manifest)
+                invalid_manifest["skill_auto_apply"] = invalid
+                with self.assertRaisesRegex(ValueError, "^ACTIVE_INSTALL_MANIFEST_INVALID$"):
+                    validate_install_manifest(invalid_manifest, require_live_personal=False)
+
+        enabled = dict(manifest)
+        enabled["skill_auto_apply"] = True
+        self.assertIs(validate_install_manifest(enabled, require_live_personal=False)["skill_auto_apply"], True)
+
     def test_v8_empty_work_hosts_fail_closed(self) -> None:
         manifest = normalize_install_manifest(valid_v7_manifest())
         manifest["hosts"] = {}

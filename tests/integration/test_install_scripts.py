@@ -258,6 +258,90 @@ import ei.installer
             self.assertFalse(knowledge.exists())
 
     @unittest.skipUnless(os.name == "nt", "PowerShell wrapper contract is Windows-specific")
+    def test_setup_and_update_wrappers_forward_and_preserve_skill_auto_apply(self):
+        repo = Path.cwd()
+        powershell = shutil.which("pwsh") or "powershell.exe"
+        python_exe = self.powershell_python_shim()
+        environment = self._outer_powershell_environment(allow_notification_helper=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / "codex-home"
+            runtime = root / "runtime"
+            knowledge = root / "knowledge"
+            setup = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "setup.ps1"),
+                    "-Repo", str(repo), "-RuntimeRoot", str(runtime), "-KnowledgeMode", "local",
+                    "-KnowledgeRoot", str(knowledge), "-Hosts", "codex-cli",
+                    "-OrganizerProvider", "subscription-cli", "-OrganizerHost", "codex-cli",
+                    "-HostHome", f"codex-cli={codex_home}", "-PythonExe", str(python_exe),
+                    "-SkipVenv", "-NonInteractive", "-AcceptPlan", "-Json", "-SkillAutoApply",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+            self._skip_if_execution_policy_refused(setup, "setup.ps1 -SkillAutoApply")
+            self.assertEqual(setup.returncode, 0, setup.stdout + setup.stderr)
+            manifest_path = runtime / "install-manifest.json"
+            self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+            enabled = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
+                    "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
+                    "-ManifestPath", str(manifest_path),
+                    "-Json", "-NonInteractive", "-SkillAutoApply",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                env=environment,
+            )
+            self._skip_if_execution_policy_refused(enabled, "update.ps1 -SkillAutoApply")
+            self.assertEqual(enabled.returncode, 0, enabled.stdout + enabled.stderr)
+            self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+            preserved = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
+                    "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
+                    "-ManifestPath", str(manifest_path), "-Json", "-NonInteractive",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                env=environment,
+            )
+            self._skip_if_execution_policy_refused(preserved, "update.ps1 without consent flag")
+            self.assertEqual(preserved.returncode, 0, preserved.stdout + preserved.stderr)
+            self.assertTrue(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+            disabled = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-File", str(repo / "scripts" / "update.ps1"),
+                    "-RuntimeRoot", str(runtime), "-PythonExe", str(python_exe),
+                    "-ManifestPath", str(manifest_path),
+                    "-Json", "-NonInteractive", "-NoSkillAutoApply",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+                env=environment,
+            )
+            self._skip_if_execution_policy_refused(disabled, "update.ps1 -NoSkillAutoApply")
+            self.assertEqual(disabled.returncode, 0, disabled.stdout + disabled.stderr)
+            self.assertFalse(json.loads(manifest_path.read_text(encoding="utf-8"))["skill_auto_apply"])
+
+    @unittest.skipUnless(os.name == "nt", "PowerShell wrapper contract is Windows-specific")
     def test_first_change_creates_same_directory_backup_and_manifest_metadata(self):
         repo = Path.cwd()
         python_exe = self.powershell_python_shim()
@@ -360,6 +444,8 @@ import ei.installer
     def test_setup_wrappers_forward_the_complete_plan_contract_without_eval(self):
         powershell = (Path.cwd() / "scripts" / "setup.ps1").read_text(encoding="utf-8")
         posix = (Path.cwd() / "scripts" / "setup.sh").read_text(encoding="utf-8")
+        powershell_update = (Path.cwd() / "scripts" / "update.ps1").read_text(encoding="utf-8")
+        posix_update = (Path.cwd() / "scripts" / "update.sh").read_text(encoding="utf-8")
         for token in (
             "knowledge-mode",
             "knowledge-root",
@@ -383,6 +469,20 @@ import ei.installer
         self.assertNotIn("invoke-expression", powershell.casefold())
         self.assertNotIn("install-scheduled-task.ps1", powershell.casefold())
         self.assertNotIn("eval ", posix.casefold())
+        for positive, negative, conflict in (
+            ("SkillAutoApply", "NoSkillAutoApply", "SKILL_AUTO_APPLY_SELECTION_CONFLICT"),
+        ):
+            for source in (powershell, powershell_update):
+                self.assertIn(positive, source)
+                self.assertIn(negative, source)
+                self.assertIn(conflict, source)
+        for positive, negative, conflict in (
+            ("--skill-auto-apply", "--no-skill-auto-apply", "SKILL_AUTO_APPLY_SELECTION_CONFLICT"),
+        ):
+            for source in (posix, posix_update):
+                self.assertIn(positive, source)
+                self.assertIn(negative, source)
+                self.assertIn(conflict, source)
 
     def test_setup_wrappers_preserve_legacy_personal_aliases(self):
         powershell = (Path.cwd() / "scripts" / "setup.ps1").read_text(encoding="utf-8")

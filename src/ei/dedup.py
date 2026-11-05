@@ -138,15 +138,28 @@ def _require_text(text: str) -> str:
     return text
 
 
-def normalize_claim(text: str) -> str:
-    """Normalize only comparison material; the stored claim remains unchanged."""
-    value = unicodedata.normalize("NFKC", _require_text(text))
+def _normalize_claim_text(text: str) -> str:
+    value = unicodedata.normalize("NFKC", text)
     value = value.replace("\r\n", "\n").replace("\r", "\n")
     value = re.sub(r"\s+", " ", value).strip()
     value = re.sub(r"\s*([,、。．.!！?？:：;；/／])\s*", r"\1", value)
     value = re.sub(r"\s*([()[\]{}「」『』])\s*", r"\1", value)
     value = re.sub(r"[ \t]*([+＝=])\s*", r"\1", value)
     return value.translate(_ASCII_CASE)
+
+
+@lru_cache(maxsize=8192)
+def _normalize_claim_cached(text: str) -> str:
+    return _normalize_claim_text(text)
+
+
+def normalize_claim(text: str) -> str:
+    """Normalize only comparison material; the stored claim remains unchanged."""
+    validated = _require_text(text)
+    if type(validated) is not str:
+        # Preserve behavior for str subclasses, including unhashable ones.
+        return _normalize_claim_text(validated)
+    return _normalize_claim_cached(validated)
 
 
 def claim_fingerprint(text: str) -> str:

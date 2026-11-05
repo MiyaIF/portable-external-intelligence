@@ -37,15 +37,18 @@ class SetupOnboardingTests(NotificationIsolationMixin, unittest.TestCase):
             )
             output = io.StringIO()
             questions = []
+            answers = iter(("yes", "ollama", "yes"))
 
             def respond():
                 question = output.getvalue().splitlines()[-1]
                 questions.append(question)
-                return "ollama" if len(questions) == 1 else "yes"
+                return next(answers)
 
             with contextlib.redirect_stdout(output), patch("builtins.input", side_effect=respond):
                 selected = _guided_interactive_selection(args)
             self.assertFalse(selected.scheduler)
+            self.assertTrue(selected.skill_auto_apply)
+            self.assertIn("自動保存しますか", questions[0])
             self.assertFalse(any("scheduler" in question for question in questions))
             self.assertFalse((root / "runtime").exists())
 
@@ -288,10 +291,13 @@ class SetupOnboardingTests(NotificationIsolationMixin, unittest.TestCase):
             root = Path(tmp)
             engine = root / "engine"
             engine.mkdir()
-            python = root / "python"
+            python = root / ".venv" / "Scripts" / "python.exe"
+            python.parent.mkdir(parents=True)
             python.write_bytes(b"fixture executable")
+            python.with_name("pythonw.exe").write_bytes(b"fixture windowless executable")
             settings = Settings(paths=RuntimePaths(engine, root / "knowledge", root / "runtime"))
-            action = build_maintenance_action(settings, python)
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                action = build_maintenance_action(settings, python)
             write_scheduler_state(settings, action, True)
             live = {
                 "TaskName": TASK_NAME, "Execute": str(action.executable),
