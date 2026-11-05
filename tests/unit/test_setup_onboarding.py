@@ -291,10 +291,13 @@ class SetupOnboardingTests(NotificationIsolationMixin, unittest.TestCase):
             root = Path(tmp)
             engine = root / "engine"
             engine.mkdir()
-            python = root / "python"
+            python = root / ".venv" / "Scripts" / "python.exe"
+            python.parent.mkdir(parents=True)
             python.write_bytes(b"fixture executable")
+            python.with_name("pythonw.exe").write_bytes(b"fixture windowless executable")
             settings = Settings(paths=RuntimePaths(engine, root / "knowledge", root / "runtime"))
-            action = build_maintenance_action(settings, python)
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                action = build_maintenance_action(settings, python)
             write_scheduler_state(settings, action, True)
             live = {
                 "TaskName": TASK_NAME, "Execute": str(action.executable),

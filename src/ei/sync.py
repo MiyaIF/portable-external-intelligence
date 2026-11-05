@@ -452,13 +452,24 @@ class GitRunner:
                        "env": {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "Never",
                                "GH_PROMPT_DISABLED": "1", "GIT_ASKPASS": "", "SSH_ASKPASS": "",
                                "SSH_ASKPASS_REQUIRE": "never"}}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
         try:
             completed = subprocess.run(values, cwd=self.repo_root, capture_output=True,
-                                       text=True, check=False, shell=False, **options)
+                                       text=False, check=False, shell=False, **options)
         except subprocess.TimeoutExpired as exc:
             raise TimeoutError("OPERATION_BUDGET_EXHAUSTED") from exc
         _check(self.operation_budget)
-        return CommandResult(completed.returncode, completed.stdout or "", completed.stderr or "")
+        try:
+            stdout = completed.stdout.decode("utf-8", "strict") if isinstance(completed.stdout, bytes) else completed.stdout
+            stderr = completed.stderr.decode("utf-8", "strict") if isinstance(completed.stderr, bytes) else completed.stderr
+            if not isinstance(stdout, str) or not isinstance(stderr, str):
+                raise UnicodeError
+            stdout.encode("utf-8", "strict")
+            stderr.encode("utf-8", "strict")
+        except UnicodeError as exc:
+            raise ValueError("GIT_OUTPUT_ENCODING_INVALID") from exc
+        return CommandResult(completed.returncode, stdout, stderr)
 
 
 def _run(runner: GitRunner | object, args: Sequence[str]) -> CommandResult:

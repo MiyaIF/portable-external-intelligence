@@ -1,6 +1,8 @@
 import json
 import inspect
+import os
 import subprocess
+import sys
 import tempfile
 import unittest
 from dataclasses import dataclass
@@ -236,6 +238,7 @@ class InferenceRouterTests(unittest.TestCase):
                     )
 
                     self.assertTrue(result.ok, result.to_dict())
+                    request_wire = runner.call_args.kwargs["input"].decode("utf-8")
                     argv = tuple(runner.call_args.args[0])
                     for expected in required_argv[transport]:
                         self.assertIn(expected, argv)
@@ -264,18 +267,18 @@ class InferenceRouterTests(unittest.TestCase):
                         self.assertEqual(wire_schema["properties"]["reason_code"]["enum"], semantic_schema["properties"]["reason_code"]["enum"])
                         self.assertNotIn("source_host_id", wire_schema["properties"])
                         self.assertNotIn("source_host_family", wire_schema["properties"])
-                        self.assertIn('"allOf"', runner.call_args.kwargs["input"])
-                        self.assertIn("trusted source_host_id and source_host_family must not be emitted", runner.call_args.kwargs["input"])
-                        self.assertNotIn("Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.", runner.call_args.kwargs["input"])
+                        self.assertIn('"allOf"', request_wire)
+                        self.assertIn("trusted source_host_id and source_host_family must not be emitted", request_wire)
+                        self.assertNotIn("Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.", request_wire)
                         self.assertIn(
                             json.dumps(semantic_schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-                            runner.call_args.kwargs["input"],
+                            request_wire,
                         )
                     else:
-                        self.assertIn("Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.", runner.call_args.kwargs["input"])
-                        self.assertNotIn("trusted source_host_id and source_host_family must not be emitted", runner.call_args.kwargs["input"])
+                        self.assertIn("Return exactly one JSON object matching OUTPUT_SCHEMA_JSON.", request_wire)
+                        self.assertNotIn("trusted source_host_id and source_host_family must not be emitted", request_wire)
                     self.assertNotIn("sanitized reusable candidate", argv)
-                    self.assertIn("sanitized reusable candidate", runner.call_args.kwargs["input"])
+                    self.assertIn("sanitized reusable candidate", request_wire)
                     self.assertEqual(runner.call_args.kwargs["env"]["EI_INTERNAL"], "1")
                     self.assertFalse(runner.call_args.kwargs["shell"])
                     self.assertEqual(runner.call_args.kwargs["cwd"], str(working.resolve()))
@@ -500,6 +503,81 @@ class InferenceRouterTests(unittest.TestCase):
         kwargs = runner.call_args.kwargs
         self.assertFalse(kwargs["shell"])
         self.assertEqual(runner.call_args.args[0], ("ollama", "run", "safe-model"))
+
+    def test_cli_and_ollama_subprocesses_use_utf8_for_japanese_input_and_output(self):
+        decision = {
+            "decision": "YES",
+            "reason_code": "evidence_verified",
+            "candidate_title": "日本語のタイトル",
+            "candidate_claim": "This verified finding is suitable to retain for similar future tasks.",
+            "evidence_refs": ["sha256:" + "a" * 64],
+            "benefit": "reduced_rework",
+            "classification": "private-reusable",
+            "confidence": 0.9,
+            "applicability_scope": "universal",
+            "applicable_host_ids": [],
+            "applicable_host_families": [],
+        }
+        response = json.dumps(decision, ensure_ascii=False, separators=(",", ":"))
+
+        def cp932_default_runner(command, **kwargs):
+            # Reproduce the target Windows default decoder while preserving a real child process.
+            if kwargs.get("text") is True:
+                kwargs["encoding"] = "cp932"
+            return subprocess.run(command, **kwargs)
+
+        output_child = (
+            f"import sys;sys.stdout.buffer.write({response.encode('utf-8')!r});"
+            f"sys.stderr.buffer.write({'診断'.encode('utf-8')!r})"
+        )
+        no_decision = {
+            "decision": "NO",
+            "reason_code": "no_evidence",
+            "candidate_title": "No reusable finding",
+            "candidate_claim": "No reusable claim was verified for this candidate.",
+            "evidence_refs": [],
+            "benefit": "no_future_benefit",
+            "classification": "private-reusable",
+            "confidence": 0.5,
+            "applicability_scope": "universal",
+            "applicable_host_ids": [],
+            "applicable_host_families": [],
+        }
+        input_child = (
+            "import sys;raw=sys.stdin.buffer.read();"
+            "sys.stdout.buffer.write(" + repr(json.dumps(no_decision, separators=(",", ":")).encode("utf-8")) + ") "
+            "if bytes.fromhex('e697a5e69cace8aa9e') in raw else sys.exit(9)"
+        )
+        factories = (
+            lambda runner, script: SubscriptionCLIProvider(
+                (sys.executable, "-c", script), transport="configured-json", runner=runner
+            ),
+            lambda runner, script: OllamaProvider(
+                command=(sys.executable, "-c", script), model="safe-model", runner=runner
+            ),
+        )
+        budget = InferenceBudget(max_input_tokens=5000, max_output_tokens=1000)
+
+        for provider_index, factory in enumerate(factories):
+            runner_calls = []
+
+            def observed_runner(command, **kwargs):
+                runner_calls.append(dict(kwargs))
+                return cp932_default_runner(command, **kwargs)
+
+            with self.subTest(provider=("subscription-cli", "ollama")[provider_index], case="unicode_output"):
+                provider = factory(observed_runner, output_child)
+                result = provider.generate("gate-decision", {"candidate_claim": "safe input"}, budget)
+                self.assertTrue(result.ok, result.to_dict())
+                self.assertEqual(result.output["candidate_title"], "日本語のタイトル")
+            with self.subTest(provider=("subscription-cli", "ollama")[provider_index], case="unicode_input"):
+                provider = factory(observed_runner, input_child)
+                result = provider.generate("gate-decision", {"candidate_claim": "日本語の入力"}, budget)
+                self.assertTrue(result.ok, result.to_dict())
+                self.assertEqual(result.output["decision"], "NO")
+            if os.name == "nt":
+                self.assertTrue(runner_calls)
+                self.assertTrue(all(call.get("creationflags") == subprocess.CREATE_NO_WINDOW for call in runner_calls))
 
 
 if __name__ == "__main__":

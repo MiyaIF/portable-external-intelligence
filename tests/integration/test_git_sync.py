@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +16,7 @@ from ei.models import Event
 from ei.remote_assurance import build_remote_assurance_receipt, classify_remote, write_remote_assurance_receipt
 from ei.safe_fs import create_ownership_record, tree_digest, write_ownership_record
 from ei.sync import CommandResult, _cleanup_worktree as cleanup_worktree, _remote_assurance_reason, sync_once
+from ei.sync import GitRunner
 
 
 def git(cwd: Path, *args: str) -> str:
@@ -42,6 +45,43 @@ def settings_for(repo: Path, root: Path) -> Settings:
 
 
 class GitSyncTests(unittest.TestCase):
+    def test_git_runner_decodes_real_child_output_as_utf8_under_cp932_default(self):
+        from ei import sync
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            child = "import sys;sys.stdout.buffer.write('日本語🧪'.encode('utf-8'));sys.stderr.buffer.write('診断'.encode('utf-8'))"
+            real_run = subprocess.run
+            observed_options = []
+
+            def cp932_default_runner(command, **kwargs):
+                observed_options.append(dict(kwargs))
+                if kwargs.get("text") is True:
+                    kwargs["encoding"] = "cp932"
+                return real_run(command, **kwargs)
+
+            with patch.object(sync.subprocess, "run", side_effect=cp932_default_runner):
+                result = GitRunner(repo).run([sys.executable, "-c", child])
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "日本語🧪")
+            self.assertEqual(result.stderr, "診断")
+            if os.name == "nt":
+                self.assertEqual(observed_options[0]["creationflags"], subprocess.CREATE_NO_WINDOW)
+
+    def test_git_runner_rejects_invalid_or_missing_machine_output(self):
+        from ei import sync
+
+        with tempfile.TemporaryDirectory() as tmp:
+            for stdout in (b"\x81", None):
+                with self.subTest(stdout_type=type(stdout).__name__), patch.object(
+                    sync.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess([], 0, stdout, b""),
+                ):
+                    with self.assertRaisesRegex(ValueError, "^GIT_OUTPUT_ENCODING_INVALID$"):
+                        GitRunner(Path(tmp)).run(["git", "status", "--porcelain"])
+
     def test_exact_managed_staging_then_ff_keeps_source_bytes_without_unlink(self):
         from ei import sync
         with tempfile.TemporaryDirectory() as tmp:

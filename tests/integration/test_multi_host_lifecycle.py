@@ -106,6 +106,7 @@ class MultiHostLifecycleTests(NotificationIsolationMixin, unittest.TestCase):
         from ei.operation_runtime import OperationBudget
         from ei.queue import list_queue_items
         from tests.unit.test_pending_capture import observation
+        from types import SimpleNamespace
         from unittest.mock import patch
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -114,14 +115,74 @@ class MultiHostLifecycleTests(NotificationIsolationMixin, unittest.TestCase):
             settings = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
             context = CaptureContext("session", "turn", 1, "codex-cli", "codex-compatible")
             key = InMemoryKeyProvider("test-key", b"s" * 32)
-            with patch("ei.spool.default_key_provider", return_value=key):
+            fake_clock = [0.0]
+
+            def advance_operation_clock():
+                current = fake_clock[0]
+                fake_clock[0] += 0.001
+                return current
+
+            # Replace only OperationBudget's clock reference. Lock wait clocks
+            # in the filesystem/queue modules remain real and bounded.
+            with patch("ei.operation_runtime.time", SimpleNamespace(monotonic=advance_operation_clock)), \
+                    patch("ei.spool.default_key_provider", return_value=key):
                 result = record_agent_observation(observation(), context, settings)
+            self.assertGreater(fake_clock[0], 0)
+            self.assertLess(fake_clock[0], 5.0)
             self.assertEqual(result.reason_code, "PENDING_SECURED", result)
             self.assertEqual(len(list_queue_items(settings)), 1)
             self.assertEqual(list(settings.paths.event_dir.rglob("*.json")), [])
             with patch("ei.capture.iter_events", side_effect=AssertionError("scan after deadline")):
                 stopped = record_agent_observation(observation(), context, settings, budget=OperationBudget(0))
             self.assertEqual(stopped.reason_code, "CAPTURE_BUDGET_EXHAUSTED")
+
+    def test_skill_mid_capture_deadline_does_not_reset_budget_or_ack(self):
+        from ei import pending_capture
+        from ei.capture import record_agent_observation
+        from ei.key_provider import InMemoryKeyProvider
+        from ei.models import CaptureContext
+        from ei.operation_runtime import OperationBudget
+        from ei.queue import list_queue_items
+        from tests.unit.test_pending_capture import observation
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            self.notification_isolation.allow_notification_helper()
+            self.assertTrue(setup(self._selection(root, ("codex-cli",))).ok)
+            settings = load_settings(engine_root=Path.cwd(), runtime_root=root / "runtime")
+            context = CaptureContext("session", "turn", 1, "codex-cli", "codex-compatible")
+            key = InMemoryKeyProvider("test-key", b"s" * 32)
+            fake_clock = [0.0]
+            received_budgets = []
+            original_intents = pending_capture._agent_session_intents
+
+            def advance_operation_clock():
+                current = fake_clock[0]
+                fake_clock[0] += 0.001
+                return current
+
+            def expire_after_history_read(settings_arg, root_arg, session_hash, *, budget):
+                received_budgets.append(budget)
+                intents = original_intents(settings_arg, root_arg, session_hash, budget=budget)
+                fake_clock[0] = budget.deadline
+                return intents
+
+            with patch("ei.operation_runtime.time", SimpleNamespace(monotonic=advance_operation_clock)), \
+                    patch.object(pending_capture, "_agent_session_intents", side_effect=expire_after_history_read), \
+                    patch("ei.spool.default_key_provider", return_value=key):
+                budget = OperationBudget(5000)
+                original_deadline = budget.deadline
+                result = record_agent_observation(observation(), context, settings, budget=budget)
+                self.assertEqual(result.reason_code, "CAPTURE_BUDGET_EXHAUSTED", result)
+                self.assertFalse(result.created)
+                self.assertIsNone(result.event_id)
+                self.assertEqual(budget.deadline, original_deadline)
+                self.assertEqual(received_budgets, [budget])
+                self.assertGreaterEqual(fake_clock[0], original_deadline)
+
+            self.assertEqual(list_queue_items(settings), ())
+            self.assertEqual(list(settings.paths.event_dir.rglob("*.json")), [])
 
     def _selection(self, root: Path, hosts: tuple[str, ...]) -> SetupSelection:
         homes = {host: root / f"{host}-home" for host in hosts}

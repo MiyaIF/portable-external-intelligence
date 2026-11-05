@@ -1,4 +1,7 @@
 import unittest
+from unittest.mock import patch
+
+import ei.dedup as dedup
 
 from ei.dedup import (
     claim_fingerprint,
@@ -14,6 +17,42 @@ from ei.models import ProvenanceRef
 
 
 class DedupTests(unittest.TestCase):
+    # Keep cases independent even when the module is run repeatedly in-process.
+    def setUp(self):
+        dedup._normalize_claim_cached.cache_clear()
+
+    def tearDown(self):
+        dedup._normalize_claim_cached.cache_clear()
+
+    def test_normalize_claim_reuses_the_result_for_repeated_plain_string(self):
+        claim = "  ＣＡＣＨＥ   repeated result 8a6d4f "
+        with patch.object(dedup.unicodedata, "normalize", wraps=dedup.unicodedata.normalize) as normalizer:
+            self.assertEqual(normalize_claim(claim), "cache repeated result 8a6d4f")
+            self.assertEqual(normalize_claim(claim), "cache repeated result 8a6d4f")
+        self.assertEqual(normalizer.call_count, 1)
+
+    def test_normalize_claim_recomputes_after_bounded_cache_eviction(self):
+        first = "dedup-eviction-sentinel-7f1c"
+        with patch.object(dedup.unicodedata, "normalize", wraps=dedup.unicodedata.normalize) as normalizer:
+            self.assertEqual(normalize_claim(first), first)
+            for index in range(8192):
+                normalize_claim(f"dedup-eviction-filler-{index}")
+            self.assertEqual(normalizer.call_count, 8193)
+            self.assertEqual(normalize_claim(first), first)
+        self.assertEqual(normalizer.call_count, 8194)
+
+    def test_normalize_claim_keeps_validation_before_cache_keying(self):
+        with self.assertRaisesRegex(TypeError, "^CLAIM_TEXT_REQUIRED$"):
+            normalize_claim(["mutable", "invalid"])
+
+    def test_normalize_claim_preserves_unhashable_str_subclass_behavior(self):
+        class UnhashableText(str):
+            __hash__ = None
+
+        claim = UnhashableText("  ＣＡＣＨＥ   subclass  ")
+        self.assertEqual(normalize_claim(claim), "cache subclass")
+        self.assertEqual(normalize_claim(claim), "cache subclass")
+
     def test_normalization_is_unicode_line_ending_spacing_and_ascii_case_stable(self):
         left = normalize_claim(" ＡＢＣ\r\n  test ： value ")
         right = normalize_claim("abc\n test: value")

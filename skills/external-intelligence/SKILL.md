@@ -8,7 +8,7 @@ description: One portable CLI-agent Skill for bounded recall, inheritance closeo
 This is the single user-visible Skill for the external-intelligence repository. Do not create sibling Skills for gate, curator, recall, or maintainer. Route the requested mode to the matching workflow:
 
 - recall: retrieve only eligible knowledge needed for the current task.
-- closeout: validate one structured closeout object and run the YES/NO inheritance boundary. By default it returns a ChangeSet proposal; setup consent may allow a validated YES to use the deterministic automatic-apply path.
+- closeout: validate one structured closeout object and run the YES/NO inheritance boundary. For ordinary YES, invoke the generated launcher in `closeout` mode without `--proposal-only`; verified setup consent may allow deterministic application of the validated candidate.
 - maintain: delegate ingestion, reconciliation, projection, and health maintenance to the production CLI.
 - sync: delegate allowlisted conflict-safe Git synchronization to the production CLI.
 - repair: run doctor-guided diagnostics and return a repair plan; never overwrite trusted state automatically.
