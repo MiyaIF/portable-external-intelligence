@@ -54,7 +54,7 @@ class PackageMetadataAcceptanceTests(unittest.TestCase):
         self.assertEqual(author["email"], policy["public_author"]["email"])
         self.assertEqual(project["readme"], "README.md")
         self.assertEqual(project["urls"]["Repository"], "https://github.com/MiyaIF/portable-external-intelligence")
-        self.assertEqual(project["dependencies"], ["cryptography==50.0.1"])
+        self.assertEqual(project["dependencies"], ["cryptography==50.0.2"])
 
     def test_build_metadata_and_artifacts_have_no_local_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
