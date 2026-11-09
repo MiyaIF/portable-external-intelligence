@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import io
 import json
 import unittest
@@ -91,11 +90,9 @@ class WorkRecordCaptureIntegrationTests(unittest.TestCase):
         self.assertFalse(list_queue_items(settings, include_terminal=False))
         self.assertTrue(any(event.event_type == "observation.recorded" for event in iter_events(settings.paths.event_dir)))
 
-        project_hash = "sha256:" + hashlib.sha256(str(project_a.resolve()).casefold().encode("utf-8")).hexdigest()
-        project_domain = "project-" + project_hash[7:23]
         query = "対象範囲を再読込し保存された値と表示状態を照合する"
-        same_project = _run_recall(settings, query=query, project=project_a, domain=project_domain)
-        other_project = _run_recall(settings, query=query, project=unrelated, domain="project-unrelated")
+        same_project = _run_recall(settings, query=query, project=project_a, domain="")
+        other_project = _run_recall(settings, query=query, project=unrelated, domain="")
 
         self.assertTrue(same_project["hits"], msg=str(same_project))
         self.assertTrue(all(hit["knowledge_kind"] == "project-reference" for hit in same_project["hits"]))
