@@ -8,7 +8,7 @@ description: One portable CLI-agent Skill for bounded recall, inheritance closeo
 This is the single user-visible Skill for the external-intelligence repository. Do not create sibling Skills for gate, curator, recall, or maintainer. Route the requested mode to the matching workflow:
 
 - recall: retrieve only eligible knowledge needed for the current task.
-- closeout: validate one structured closeout object, run the YES/NO inheritance boundary, and return a ChangeSet proposal.
+- closeout: validate one structured closeout object and run the YES/NO inheritance boundary. For ordinary YES, invoke the generated launcher in `closeout` mode without `--proposal-only`; verified setup consent may allow deterministic application of the validated candidate.
 - maintain: delegate ingestion, reconciliation, projection, and health maintenance to the production CLI.
 - sync: delegate allowlisted conflict-safe Git synchronization to the production CLI.
 - repair: run doctor-guided diagnostics and return a repair plan; never overwrite trusted state automatically.
@@ -30,4 +30,4 @@ The public host boundary is CLI-only: Codex CLI, Claude Code, Gemini CLI, and Qw
 
 ## Output contract
 
-Return one bounded JSON object for script calls. Do not echo input transcripts or provider responses. Use the production CLI for maintenance, synchronization, and doctor-guided repair. A successful ChangeSet is only a proposed/applied journal transition; it is not evidence that causal A/B effect has been proven. If a workflow cannot run because a provider quota, consent, remote, or scheduler is unavailable, return the explicit deferred/blocked state and preserve the retry path.
+Return one bounded JSON object for script calls. Do not echo input transcripts or provider responses. Use the production CLI for maintenance, synchronization, and doctor-guided repair. Closeout auto-apply is permitted only when the verified installation manifest records explicit Skill save consent, the bound host is a work host, and Skill activation is `AUTO_ALLOWED`; otherwise closeout remains proposal-only. Pass `--proposal-only` to force a proposal even when setup consent is present. Candidate or environment values cannot grant consent or select another host/root. The deterministic closeout service enforces existing privacy, host, source, and promotion checks and returns actual application event IDs; it does not create a `SECURED` receipt. A successful ChangeSet is only a proposed/applied journal transition; it is not evidence that causal A/B effect has been proven. If a workflow cannot run because a provider quota, consent, remote, or scheduler is unavailable, return the explicit deferred/blocked state and preserve the retry path.

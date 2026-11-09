@@ -6,11 +6,53 @@ from pathlib import Path
 import unittest
 from unittest import mock
 
-from ei.journal import JournalIntegrityError, append_event, iter_events
+from ei.journal import JournalIntegrityError, append_event, iter_events, validate_schema
 from ei.models import Event
 
 
 class JournalTests(unittest.TestCase):
+    @staticmethod
+    def _observation_schema_payload():
+        return {
+            "observation_id": "obs_metadata_schema",
+            "title": "Reusable observation",
+            "claim": "A sufficiently detailed reusable observation claim.",
+            "domain": "general",
+            "cwd_fingerprint": "sha256:" + "a" * 64,
+            "provenance_key": "sha256:" + "b" * 64,
+            "outcome_status": "observed",
+            "benefit": "reduced_rework",
+            "classification": "private-reusable",
+        }
+
+    def test_observation_schema_accepts_optional_curation_metadata_and_old_events(self):
+        legacy_payload = self._observation_schema_payload()
+        validate_schema("observation.schema.json", legacy_payload)
+
+        extended_payload = {
+            **legacy_payload,
+            "precondition": "The same setup is being updated.",
+            "failure_mode": "Skipping the check can cause rework.",
+            "exception": "Proposal-only mode does not apply changes.",
+            "version_constraint": ">=1.0,<2",
+        }
+        validate_schema("observation.schema.json", extended_payload)
+        extended_payload["version_constraint"] = None
+        validate_schema("observation.schema.json", extended_payload)
+
+    def test_observation_schema_rejects_invalid_or_unknown_optional_metadata(self):
+        for field in ("precondition", "failure_mode", "exception", "version_constraint"):
+            with self.subTest(field=field):
+                payload = self._observation_schema_payload()
+                payload[field] = 7
+                with self.assertRaisesRegex(JournalIntegrityError, rf"^EVENT_SCHEMA_INVALID:observation\.{field}$"):
+                    validate_schema("observation.schema.json", payload)
+
+        payload = self._observation_schema_payload()
+        payload["unrecognized_metadata"] = "not allowed"
+        with self.assertRaisesRegex(JournalIntegrityError, r"^EVENT_SCHEMA_INVALID:observation\.unrecognized_metadata$"):
+            validate_schema("observation.schema.json", payload)
+
     def test_bounded_journal_zero_budget_does_not_read_or_append(self):
         from ei.operation_runtime import OperationBudget
         with tempfile.TemporaryDirectory() as tmp:

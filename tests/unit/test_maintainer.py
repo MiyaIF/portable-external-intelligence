@@ -93,6 +93,72 @@ def source_hash(label):
 
 
 class MaintainerTests(unittest.TestCase):
+    def test_zero_queue_budget_is_reported_inside_queue_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = make_settings(tmp)
+
+            try:
+                result = run_maintenance(settings, time_budget_ms=0)
+            except TimeoutError as exc:
+                self.fail(f"queue timeout escaped maintenance phase: {exc}")
+
+            self.assertEqual(result.status, "partial")
+            self.assertEqual(result.queue["status"], "partial")
+
+    def test_source_recovery_gets_fresh_deadline_after_work_capture(self):
+        from ei.operation_runtime import OperationBudget
+        from ei.maintainer import QueueDrainResult
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = replace(make_settings(tmp), skill_auto_apply=True)
+            fake_clock = [100.0]
+            observed = {}
+
+            def capture_work(_settings, _provider, *, now, budget):
+                del now
+                observed["work_deadline"] = budget.deadline
+                fake_clock[0] = budget.deadline
+                return {"status": "no_candidates", "reason_code": "WORK_RECORD_NO_COMPLETED_TURN",
+                    "scanned": 0, "secured": 0, "rejected": 0}
+
+            def ingest(*_args, budget, **_kwargs):
+                observed["source_deadline"] = budget.deadline
+                observed["source_remaining_ms"] = budget.remaining_ms()
+                fake_clock[0] = budget.deadline
+                return 0, 0, 0, 0, 0, ()
+
+            def closeout(*_args, budget, **_kwargs):
+                fake_clock[0] = budget.deadline
+                return {"processed": 0, "results": [], "reason_code": "CLOSEOUT_RECOVERY_COMPLETE"}
+
+            def spool_gc(*_args, budget, **_kwargs):
+                fake_clock[0] = budget.deadline
+                return 0
+
+            def queue_drain(*_args, budget, time_budget_ms, **_kwargs):
+                observed["queue_remaining_ms"] = budget.remaining_ms()
+                observed["queue_time_budget_ms"] = time_budget_ms
+                return QueueDrainResult("partial", 0, 0, 0, 0, 0, 0, 0, 0)
+
+            with patch("ei.maintainer.time.monotonic", side_effect=lambda: fake_clock[0]), \
+                    patch("ei.pending_capture.reconcile_pending", return_value={
+                        "inventory_complete": True, "page_complete": True, "waiting": 0,
+                        "reason_code": "PENDING_PAGE_COMPLETE"}), \
+                    patch("ei.work_record_capture.capture_work_records", side_effect=capture_work), \
+                    patch("ei.maintainer._ingest", side_effect=ingest), \
+                    patch("ei.closeout_association.recover_closeout_associations", side_effect=closeout), \
+                    patch("ei.maintainer.gc_expired_spool", side_effect=spool_gc), \
+                    patch("ei.maintainer.drain_queue", side_effect=queue_drain):
+                result = run_maintenance(settings, provider=YesProvider(), source_paths=(), time_budget_ms=300000,
+                    budget=OperationBudget(300000, deadline=400.0), now=datetime(2026, 11, 6, tzinfo=timezone.utc))
+
+            self.assertGreater(observed.get("source_deadline", 0), observed["work_deadline"])
+            self.assertGreater(observed.get("source_remaining_ms", 0), 0)
+            self.assertEqual(observed.get("queue_remaining_ms"), 60_000)
+            self.assertEqual(observed.get("queue_time_budget_ms"), 60_000)
+            self.assertFalse(any(row.get("stage") == "source_recovery" and
+                row.get("error_code") == "OPERATION_BUDGET_EXHAUSTED" for row in result.errors))
+
     def test_maintenance_default_budget_is_five_minutes_and_rejects_larger_values(self):
         import inspect
         from ei.operation_runtime import OperationBudget
@@ -504,14 +570,26 @@ class MaintainerTests(unittest.TestCase):
                 ttl_seconds=1,
                 key_provider=InMemoryKeyProvider("maintainer-test-key", b"m" * 32),
             )
-            result = run_maintenance(
-                settings,
-                source_paths=(valid, invalid),
-                provider=YesProvider(),
-                time_budget_ms=5000,
-                sync_policy="disabled",
-                now=datetime(2020, 1, 2, tzinfo=timezone.utc),
-            )
+            logical_time = [0.0]
+
+            def advance_clock():
+                logical_time[0] += 0.0001
+                return logical_time[0]
+
+            controlled_time = SimpleNamespace(monotonic=advance_clock)
+            with patch("ei.operation_runtime.time", new=controlled_time), \
+                    patch("ei.maintainer.time", new=controlled_time), \
+                    patch("ei.capture_recovery.time", new=controlled_time):
+                result = run_maintenance(
+                    settings,
+                    source_paths=(valid, invalid),
+                    provider=YesProvider(),
+                    time_budget_ms=5000,
+                    sync_policy="disabled",
+                    now=datetime(2020, 1, 2, tzinfo=timezone.utc),
+                )
+            self.assertGreater(logical_time[0], 0.0, "TEST_CLOCK_DID_NOT_ADVANCE")
+            self.assertLess(logical_time[0], 5.0, "TEST_CLOCK_EXCEEDED_MAINTENANCE_BUDGET")
             self.assertEqual(result.status, "partial", "MAINTENANCE_STATUS_UNEXPECTED")
             self.assertGreaterEqual(result.expired_spool, 1, "EXPIRED_SPOOL_NOT_COLLECTED")
             self.assertGreaterEqual(result.ingest_sources, 2, "INGEST_SOURCE_COUNT_INCOMPLETE")

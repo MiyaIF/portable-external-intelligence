@@ -4,6 +4,7 @@ import argparse
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 sys.dont_write_bytecode = True
@@ -83,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
             args.host,
             "--max-chars",
             str(args.max_chars),
+            "--cwd",
+            str(Path.cwd().resolve()),
             "--json",
         ]
         if args.domain:

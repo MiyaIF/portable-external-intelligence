@@ -45,6 +45,7 @@ _TOP_LEVEL_KEYS = frozenset(
         "scheduler_requested",
         "skill_source",
         "skill_source_hash",
+        "skill_auto_apply",
         "hook_schema_hash",
         "skip_venv",
         "venv_created",
@@ -62,9 +63,9 @@ _TOP_LEVEL_KEYS = frozenset(
         "reconciliation",
     }
 )
-_TOP_LEVEL_REQUIRED_V6 = _TOP_LEVEL_KEYS - {"uninstalled_at", "knowledge_retained", "knowledge_stores", "reconciliation", "organizer", "work_hosts"}
-_TOP_LEVEL_REQUIRED_V7 = _TOP_LEVEL_KEYS - {"uninstalled_at", "knowledge_retained", "organizer", "work_hosts"}
-_TOP_LEVEL_REQUIRED_V8 = _TOP_LEVEL_KEYS - {"uninstalled_at", "knowledge_retained"}
+_TOP_LEVEL_REQUIRED_V6 = _TOP_LEVEL_KEYS - {"uninstalled_at", "knowledge_retained", "knowledge_stores", "reconciliation", "organizer", "work_hosts", "skill_auto_apply"}
+_TOP_LEVEL_REQUIRED_V7 = _TOP_LEVEL_KEYS - {"uninstalled_at", "knowledge_retained", "organizer", "work_hosts", "skill_auto_apply"}
+_TOP_LEVEL_REQUIRED_V8 = _TOP_LEVEL_KEYS - {"uninstalled_at", "knowledge_retained", "skill_auto_apply"}
 _KNOWLEDGE_REPOSITORY_KEYS = frozenset(
     {
         "status",
@@ -198,10 +199,10 @@ def _safe_root(value: Any, *, require_exists: bool = False) -> tuple[Path, Path]
 def _validate_document_shape(value: Mapping[str, Any], *, version: int) -> None:
     if version == LEGACY_INSTALL_MANIFEST_SCHEMA_VERSION:
         required = _TOP_LEVEL_REQUIRED_V6
-        allowed = _TOP_LEVEL_KEYS - {"knowledge_stores", "reconciliation", "organizer", "work_hosts"}
+        allowed = _TOP_LEVEL_KEYS - {"knowledge_stores", "reconciliation", "organizer", "work_hosts", "skill_auto_apply"}
     elif version == PREVIOUS_INSTALL_MANIFEST_SCHEMA_VERSION:
         required = _TOP_LEVEL_REQUIRED_V7
-        allowed = _TOP_LEVEL_KEYS - {"organizer", "work_hosts"}
+        allowed = _TOP_LEVEL_KEYS - {"organizer", "work_hosts", "skill_auto_apply"}
     elif version == INSTALL_MANIFEST_SCHEMA_VERSION:
         required = _TOP_LEVEL_REQUIRED_V8
         allowed = _TOP_LEVEL_KEYS
@@ -379,6 +380,8 @@ def _validate_common_fields(value: Mapping[str, Any], *, version: int = INSTALL_
         _invalid()
     for key in ("sync_enabled", "experiment_enabled", "scheduler_requested", "skip_venv", "venv_created"):
         _require_bool(value.get(key))
+    if "skill_auto_apply" in value:
+        _require_bool(value.get("skill_auto_apply"))
     for key in ("skill_source_hash", "hook_schema_hash", "agents_original_sha256", "agents_installed_sha256"):
         _require_hash(value.get(key))
     for key in ("config_backup", "hooks_backup", "agents_backup"):

@@ -894,7 +894,7 @@ def _validate_persisted_event_payload(event: Event) -> None:
 
 def _validate_observation(value: Mapping[str, Any]) -> None:
     name = "observation"
-    _reject_extra(name, value, {"observation_id", "title", "claim", "domain", "cwd_fingerprint", "provenance_key", "outcome_status", "benefit", "classification", "source_hash", "applicability", "source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families"})
+    _reject_extra(name, value, {"observation_id", "title", "claim", "domain", "cwd_fingerprint", "provenance_key", "outcome_status", "benefit", "classification", "source_hash", "applicability", "precondition", "failure_mode", "exception", "version_constraint", "source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families"})
     for field in ("observation_id", "title", "claim", "domain", "cwd_fingerprint", "provenance_key", "outcome_status", "benefit", "classification"):
         if field not in value:
             _schema_error(name, field)
@@ -931,6 +931,11 @@ def _validate_observation(value: Mapping[str, Any]) -> None:
     for field in ("applicable_host_ids", "applicable_host_families"):
         if field in value:
             _require_host_list(name, field, value[field])
+    for field in ("precondition", "failure_mode", "exception"):
+        if field in value and not isinstance(value[field], str):
+            _schema_error(name, field)
+    if "version_constraint" in value and value["version_constraint"] is not None and not isinstance(value["version_constraint"], str):
+        _schema_error(name, "version_constraint")
     if any(field in value for field in ("source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families")):
         _require_host_applicability(name, value, allow_legacy=False, require_source_pair=True)
     _reject_forbidden_content(name, value)

@@ -14,6 +14,9 @@ from .safe_fs import assert_safe_target
 
 
 _ALLOWED_CLASSES = {"public", "private-reusable"}
+_CWD_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
+_RECALL_ITEM_LIMIT = 120000
+_RECALL_SELECTED_BODY_LIMIT = 64 * 1024 * 1024
 
 
 def _sha256(data: bytes) -> str:
@@ -62,11 +65,11 @@ def _read_projection_bytes(path, *, budget=None, maximum=8 * 1024 * 1024):
     return b"".join(chunks)
 
 
-def _load_index_document(index_path: Path, *, budget=None) -> tuple[dict[str, Any], bytes]:
+def _load_index_document(index_path: Path, *, budget=None, safe_read: bool = False) -> tuple[dict[str, Any], bytes]:
     try:
         if index_path.parent.parent.name == ".projection-generations" and not index_path.is_file():
             raise ValueError("INDEX_GENERATION_EXPIRED")
-        raw = _read_projection_bytes(index_path, budget=budget) if budget is not None or index_path.parent.parent.name == ".projection-generations" else index_path.read_bytes()
+        raw = _read_projection_bytes(index_path, budget=budget) if safe_read or budget is not None or index_path.parent.parent.name == ".projection-generations" else index_path.read_bytes()
     except TimeoutError:
         raise
     except OSError as exc:
@@ -257,9 +260,11 @@ def _parse_metadata(lines: list[str], item_id: str, *, budget=None) -> dict[str,
             label, value = stripped[2:].split(":", 1)
             normalized = label.strip().casefold().replace(" ", "_")
             value = value.strip()
-            if normalized in {"status", "classification", "precondition", "failure_mode", "version_constraint", "domain", "provenance", "cluster"}:
+            if normalized in {"status", "classification", "precondition", "failure_mode", "version_constraint", "domain", "provenance", "cluster", "cwd_fingerprint", "recorded_at"}:
                 key = "cluster_id" if normalized == "cluster" else normalized
                 metadata[key] = None if value.casefold() in {"none", "null"} else value
+            elif normalized in {"exception", "exceptions"}:
+                metadata["exceptions"] = [value] if value else []
             elif normalized in {"applicability", "provenances", "scopes"}:
                 metadata[normalized] = [item.strip() for item in value.split(",") if item.strip()]
             elif normalized in {"applicability_scope", "source_host", "source_host_id", "source_host_family"}:
@@ -311,7 +316,16 @@ def _parse_metadata(lines: list[str], item_id: str, *, budget=None) -> dict[str,
     return metadata
 
 
-def _read_item(document: Mapping[str, Any], root: Path, item_id: str, *, budget=None) -> dict[str, Any]:
+def _read_item(
+    document: Mapping[str, Any],
+    root: Path,
+    item_id: str,
+    *,
+    budget=None,
+    require_hash: bool = False,
+    maximum_bytes: int | None = None,
+    return_raw_size: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], int]:
     if budget is not None:
         budget.check()
     if not isinstance(item_id, str) or not item_id or "/" in item_id or "\\" in item_id or item_id in {".", ".."}:
@@ -326,10 +340,16 @@ def _read_item(document: Mapping[str, Any], root: Path, item_id: str, *, budget=
     except ValueError as exc:
         raise ValueError("INDEX_ITEM_PATH_ESCAPE") from exc
     expected = document.get("files", {}).get(relative.as_posix())
+    if require_hash and (not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected)):
+        raise ValueError("INDEX_ITEM_HASH_REQUIRED")
     if not target.is_file() and root.parent.name == ".projection-generations":
         raise ValueError("INDEX_GENERATION_EXPIRED")
     try:
-        raw = _read_projection_bytes(target, budget=budget) if budget is not None or root.parent.name == ".projection-generations" else target.read_bytes()
+        if require_hash or budget is not None or root.parent.name == ".projection-generations":
+            limit = 8 * 1024 * 1024 if maximum_bytes is None else min(8 * 1024 * 1024, maximum_bytes)
+            raw = _read_projection_bytes(target, budget=budget, maximum=limit)
+        else:
+            raw = target.read_bytes()
         if isinstance(expected, str) and _sha256(raw) != expected:
             raise ValueError("INDEX_ITEM_HASH_MISMATCH")
         lines = raw.decode("utf-8", errors="strict").splitlines()
@@ -339,6 +359,8 @@ def _read_item(document: Mapping[str, Any], root: Path, item_id: str, *, budget=
         raise ValueError("INDEX_ITEM_UNREADABLE") from exc
     item = _parse_metadata(lines, item_id, budget=budget)
     item["item_id"] = item_id
+    if return_raw_size:
+        return item, len(raw)
     return item
 
 
@@ -375,4 +397,182 @@ def read_index_items(index: KnowledgeIndex, item_ids: tuple[str, ...] | list[str
     return tuple(_read_item(document, root, item_id, budget=budget) for item_id in ids)
 
 
-__all__ = ["build_index", "read_index_item", "read_index_items"]
+def _manifest_document(root: Path, raw: bytes) -> Mapping[str, Any]:
+    try:
+        manifest = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("PROJECTION_MANIFEST_INVALID") from exc
+    if not isinstance(manifest, Mapping) or not isinstance(manifest.get("files"), Mapping):
+        raise ValueError("PROJECTION_MANIFEST_INVALID")
+    return manifest
+
+
+def _read_bound_manifest(root: Path, index_raw: bytes, *, budget=None, expected_sha256: str = "") -> tuple[Path, str]:
+    manifest_path = root / "manifest.json"
+    target = assert_safe_target(root, manifest_path, allow_missing=True, expected_type="file")
+    if not target.exists():
+        if expected_sha256:
+            raise ValueError("PROJECTION_MANIFEST_MISMATCH")
+        return manifest_path, ""
+    manifest_raw = _read_projection_bytes(manifest_path, budget=budget)
+    manifest_hash = _sha256(manifest_raw)
+    if expected_sha256 and manifest_hash != expected_sha256:
+        raise ValueError("INDEX_GENERATION_INVALID")
+    manifest = _manifest_document(root, manifest_raw)
+    if manifest["files"].get("index.json") != _sha256(index_raw):
+        raise ValueError("PROJECTION_MANIFEST_MISMATCH")
+    return manifest_path, manifest_hash
+
+
+def _index_limits(document: Mapping[str, Any]) -> None:
+    count = sum(len(document[key]) for key in ("active_pattern_ids", "candidate_pattern_ids", "archive_pattern_ids", "observation_ids"))
+    if count > _RECALL_ITEM_LIMIT or len(document["files"]) > _RECALL_ITEM_LIMIT:
+        raise ValueError("PROJECTION_STORAGE_LIMIT")
+    for raw_path, expected_hash in document["files"].items():
+        if _safe_relative(raw_path) is None:
+            raise ValueError("INDEX_FILE_PATH_INVALID")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ValueError("INDEX_FILES_INVALID")
+    references = document.get("project_reference_ids_by_cwd", {})
+    if not isinstance(references, Mapping) or len(references) > _RECALL_ITEM_LIMIT:
+        raise ValueError("INDEX_REFERENCE_INVALID")
+    total_references = 0
+    for cwd_fingerprint, item_ids in references.items():
+        if not isinstance(cwd_fingerprint, str) or not _CWD_FINGERPRINT.fullmatch(cwd_fingerprint):
+            raise ValueError("INDEX_REFERENCE_INVALID")
+        if not isinstance(item_ids, list) or not all(isinstance(item_id, str) and item_id for item_id in item_ids):
+            raise ValueError("INDEX_REFERENCE_INVALID")
+        total_references += len(item_ids)
+        if total_references > _RECALL_ITEM_LIMIT:
+            raise ValueError("PROJECTION_STORAGE_LIMIT")
+
+
+def load_recall_index(knowledge_dir: Path, index_path: Path, *, budget=None) -> KnowledgeIndex:
+    """Load bounded index metadata without reading unselected item bodies."""
+    from .safe_fs import assert_no_reparse_components
+    assert_no_reparse_components(Path(knowledge_dir))
+    assert_no_reparse_components(Path(index_path))
+    if budget is not None:
+        budget.check()
+        budget.check()
+    root = Path(knowledge_dir).resolve()
+    if not root.is_dir():
+        raise ValueError("KNOWLEDGE_DIR_MISSING")
+    requested = Path(index_path).resolve()
+    if requested.parent != root:
+        raise ValueError("INDEX_PATH_OUTSIDE_KNOWLEDGE_DIR")
+    source = root / "index.json" if requested == root / "index.json" or not requested.exists() else requested
+    document, raw = _load_index_document(source, budget=budget, safe_read=True)
+    _index_limits(document)
+    resolved = _resolve_generation(root, document, budget=budget)
+    if resolved is not None:
+        generation_root, document, raw = resolved
+        _index_limits(document)
+        manifest_path = generation_root / "manifest.json"
+        # The generation descriptor binds this snapshot to the published manifest.
+        descriptor = _load_index_document(source, budget=budget, safe_read=True)[0]["projection_generation"]
+        manifest_hash = descriptor["manifest_sha256"]
+        _read_bound_manifest(generation_root, raw, budget=budget, expected_sha256=manifest_hash)
+    else:
+        manifest_path, manifest_hash = _read_bound_manifest(root, raw, budget=budget)
+        if "source_state" in document and not manifest_hash:
+            raise ValueError("PROJECTION_MANIFEST_MISMATCH")
+        # Legacy indexes without a manifest are still bound to this exact index
+        # byte stream, and every selected item must carry its own hash.
+        if not manifest_hash:
+            manifest_hash = ""
+    item_count = sum(len(document[key]) for key in ("active_pattern_ids", "candidate_pattern_ids", "archive_pattern_ids", "observation_ids"))
+    return KnowledgeIndex(
+        index_path=source,
+        generation_hash=manifest_hash or _sha256(raw),
+        item_count=item_count,
+        schema_version="2",
+        manifest_path=manifest_path if manifest_hash else None,
+        manifest_sha256=manifest_hash,
+        active_pattern_ids=tuple(document["active_pattern_ids"]),
+        archive_pattern_ids=tuple(document["archive_pattern_ids"]),
+        observation_count=len(document["observation_ids"]),
+        always_on_chars=int(document.get("always_on_chars", 0) or 0),
+        candidate_pattern_ids=tuple(document.get("candidate_pattern_ids", ())),
+    )
+
+
+def _bound_recall_document(index: KnowledgeIndex, *, budget=None) -> tuple[dict[str, Any], Path]:
+    if budget is not None:
+        budget.check()
+    index_path = Path(index.index_path)
+    root = index_path.resolve().parent
+    document, raw = _load_index_document(index_path, budget=budget, safe_read=True)
+    _index_limits(document)
+    resolved = _resolve_generation(root, document, budget=budget, manifest_hash=index.manifest_sha256 or index.generation_hash)
+    if resolved is not None:
+        root, document, raw = resolved
+        _index_limits(document)
+        _read_bound_manifest(root, raw, budget=budget, expected_sha256=index.manifest_sha256 or index.generation_hash)
+    elif root.parent.name == ".projection-generations":
+        _read_bound_manifest(root, raw, budget=budget, expected_sha256=index.manifest_sha256 or index.generation_hash)
+    elif index.manifest_sha256:
+        _read_bound_manifest(root, raw, budget=budget, expected_sha256=index.manifest_sha256)
+    else:
+        # A pre-manifest legacy index is safe only while its exact bytes remain.
+        target = assert_safe_target(root, root / "manifest.json", allow_missing=True, expected_type="file")
+        if target.exists() or _sha256(raw) != index.generation_hash:
+            raise ValueError("INDEX_BINDING_INVALID")
+    return document, root
+
+
+def read_recall_items(
+    index: KnowledgeIndex,
+    cwd_fingerprint: str,
+    *,
+    include_references: bool = True,
+    budget=None,
+) -> tuple[Mapping[str, Any], ...]:
+    if not isinstance(index, KnowledgeIndex):
+        raise TypeError("KNOWLEDGE_INDEX_REQUIRED")
+    document, root = _bound_recall_document(index, budget=budget)
+    active_ids = tuple(document["active_pattern_ids"])
+    ids = list(active_ids)
+    if include_references and isinstance(cwd_fingerprint, str) and _CWD_FINGERPRINT.fullmatch(cwd_fingerprint):
+        observations = set(document["observation_ids"])
+        selected_ids = set(active_ids)
+        reference_ids = document.get("project_reference_ids_by_cwd", {}).get(cwd_fingerprint, ())
+        for item_id in reference_ids:
+            if budget is not None:
+                budget.check()
+            if item_id not in observations:
+                raise ValueError("INDEX_REFERENCE_INVALID")
+            if item_id not in selected_ids:
+                ids.append(item_id)
+                selected_ids.add(item_id)
+    result = []
+    selected_raw_bytes = 0
+    for item_id in ids:
+        if budget is not None:
+            budget.check()
+        remaining_bytes = _RECALL_SELECTED_BODY_LIMIT - selected_raw_bytes
+        item, raw_size = _read_item(
+            document,
+            root,
+            item_id,
+            budget=budget,
+            require_hash=True,
+            maximum_bytes=remaining_bytes,
+            return_raw_size=True,
+        )
+        selected_raw_bytes += raw_size
+        if selected_raw_bytes > _RECALL_SELECTED_BODY_LIMIT:
+            raise ValueError("PROJECTION_STORAGE_LIMIT")
+        if item_id in active_ids:
+            item["knowledge_kind"] = "pattern"
+        else:
+            expected_cwd = cwd_fingerprint
+            if not isinstance(expected_cwd, str) or not _CWD_FINGERPRINT.fullmatch(expected_cwd) or item.get("cwd_fingerprint") != expected_cwd:
+                raise ValueError("INDEX_REFERENCE_SCOPE_MISMATCH")
+            item["knowledge_kind"] = "project-reference"
+            item["updated_at"] = str(item.get("recorded_at") or "")
+        result.append(item)
+    return tuple(result)
+
+
+__all__ = ["build_index", "load_recall_index", "read_index_item", "read_index_items", "read_recall_items"]

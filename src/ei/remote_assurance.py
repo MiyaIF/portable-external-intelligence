@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -115,6 +116,9 @@ def _probe_github_visibility(owner: str, repository: str, executable: str = "gh"
     if budget is not None:
         budget.check()
     try:
+        options = {}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW
         result = subprocess.run(
             [executable, "api", f"repos/{owner}/{repository}", "--jq", ".visibility"],
             capture_output=True,
@@ -124,6 +128,7 @@ def _probe_github_visibility(owner: str, repository: str, executable: str = "gh"
             shell=False,
             check=False,
             timeout=min(20, budget.remaining_ms() / 1000) if budget is not None else 20,
+            **options,
         )
     except subprocess.TimeoutExpired as exc:
         if budget is not None:

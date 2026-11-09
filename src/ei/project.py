@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
+from .dedup import claim_fingerprint
 from .lifecycle import select_always_on
 from .models import Event, KnowledgeIndex, validate_host_applicability_mapping
 from .safe_fs import SafeFilesystemError, safe_unlink, assert_safe_target, safe_atomic_write, safe_ensure_directory
@@ -18,6 +19,15 @@ from .reconciliation import candidate_diagnostics
 
 
 ProjectionResult = KnowledgeIndex
+_CWD_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _metadata_text(value: Any) -> str:
+    if isinstance(value, (list, tuple, set, frozenset)):
+        value = ", ".join(str(item) for item in value if str(item).strip())
+    return " ".join(str(value or "").split())
+
+
 def _atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     existing_matches = False
@@ -88,23 +98,32 @@ def _observation_markdown(payload: Mapping[str, Any]) -> str:
     source_host_id = payload.get("source_host_id", "")
     source_host_family = payload.get("source_host_family", "")
     host_metadata = ""
-    if isinstance(source_host_id, str) and source_host_id and isinstance(source_host_family, str) and source_host_family:
+    if any(field in payload for field in ("source_host_id", "source_host_family", "applicability_scope", "applicable_host_ids", "applicable_host_families")):
         host_metadata = (
-            f"- Source host: {source_host_id}\n"
-            f"- Source host family: {source_host_family}\n"
-            f"- Applicability scope: {payload.get('applicability_scope', 'universal')}\n"
-            f"- Host families: {', '.join(str(item) for item in payload.get('applicable_host_families', ())) }\n"
-            f"- Host IDs: {', '.join(str(item) for item in payload.get('applicable_host_ids', ())) }\n\n"
+            f"- Source host: {_metadata_text(source_host_id)}\n"
+            f"- Source host family: {_metadata_text(source_host_family)}\n"
+            f"- Applicability scope: {_metadata_text(payload.get('applicability_scope', 'universal'))}\n"
+            f"- Host families: {_metadata_text(payload.get('applicable_host_families', ())) }\n"
+            f"- Host IDs: {_metadata_text(payload.get('applicable_host_ids', ())) }\n\n"
         )
+    applicability = _metadata_text(payload.get("applicability", ()))
+    exception = payload.get("exception", payload.get("exceptions", ""))
     return (
         f"# {title}\n\n"
         f"- Observation: {payload.get('observation_id', '')}\n"
-        f"- Recorded at: {payload.get('recorded_at', '')}\n"
-        f"- Domain: {payload.get('domain', '')}\n"
-        f"- Provenance: {payload.get('provenance_key', '')}\n"
-        f"- Source hash: {payload.get('source_hash', '')}\n"
-        f"- Outcome: {payload.get('outcome_status', '')}\n"
-        f"- Benefit: {payload.get('benefit', '')}\n\n"
+        f"- Recorded at: {_metadata_text(payload.get('recorded_at', ''))}\n"
+        f"- Cwd fingerprint: {_metadata_text(payload.get('cwd_fingerprint', ''))}\n"
+        f"- Domain: {_metadata_text(payload.get('domain', ''))}\n"
+        f"- Classification: {_metadata_text(payload.get('classification', ''))}\n"
+        f"- Applicability: {applicability}\n"
+        f"- Provenance: {_metadata_text(payload.get('provenance_key', ''))}\n"
+        f"- Source hash: {_metadata_text(payload.get('source_hash', ''))}\n"
+        f"- Outcome: {_metadata_text(payload.get('outcome_status', ''))}\n"
+        f"- Benefit: {_metadata_text(payload.get('benefit', ''))}\n"
+        f"- Precondition: {_metadata_text(payload.get('precondition', payload.get('preconditions', '')))}\n"
+        f"- Failure mode: {_metadata_text(payload.get('failure_mode', payload.get('failure_modes', '')))}\n"
+        f"- Exception: {_metadata_text(exception)}\n"
+        f"- Version constraint: {_metadata_text(payload.get('version_constraint', ''))}\n\n"
         f"{host_metadata}"
         f"{payload.get('claim', '')}\n"
     )
@@ -319,6 +338,48 @@ def _index_markdown(patterns: Mapping[str, Mapping[str, Any]], observations: Map
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _project_reference_ids_by_cwd(
+    observations: Mapping[str, Mapping[str, Any]],
+    patterns: Mapping[str, Mapping[str, Any]],
+) -> dict[str, list[str]]:
+    known_claims: set[str] = set()
+    known_provenances: set[str] = set()
+    for pattern in patterns.values():
+        status = str(pattern.get("status", "candidate")).casefold()
+        contradiction_count = pattern.get("contradiction_count", 0)
+        if not (status in {"active", "deprecated", "superseded", "tombstoned"} or
+                isinstance(contradiction_count, (int, float)) and not isinstance(contradiction_count, bool) and contradiction_count > 0):
+            continue
+        claim = pattern.get("claim") or pattern.get("rule")
+        if isinstance(claim, str) and claim.strip():
+            known_claims.add(claim_fingerprint(claim))
+        values = pattern.get("provenances", ())
+        if isinstance(values, str):
+            values = (values,)
+        if isinstance(values, (list, tuple, set, frozenset)):
+            known_provenances.update(str(value).strip().casefold() for value in values if str(value).strip())
+
+    by_cwd: dict[str, list[str]] = {}
+    for observation_id, observation in observations.items():
+        cwd_fingerprint = observation.get("cwd_fingerprint")
+        if not isinstance(cwd_fingerprint, str) or not _CWD_FINGERPRINT.fullmatch(cwd_fingerprint):
+            continue
+        if observation.get("classification") not in {"public", "private-reusable"}:
+            continue
+        claim = observation.get("claim")
+        if not isinstance(claim, str) or not claim.strip() or not _privacy_allowed(observation):
+            continue
+        provenance_values = {
+            str(observation.get(name, "")).strip().casefold()
+            for name in ("provenance_key", "source_hash", "record_fingerprint")
+            if isinstance(observation.get(name, ""), str) and str(observation.get(name, "")).strip()
+        }
+        if claim_fingerprint(claim) in known_claims or provenance_values.intersection(known_provenances):
+            continue
+        by_cwd.setdefault(cwd_fingerprint, []).append(observation_id)
+    return {key: sorted(set(values)) for key, values in sorted(by_cwd.items())}
+
+
 def _project_events_legacy(events: Iterable[Event], knowledge_dir: Path, *, documents=None, budget=None) -> KnowledgeIndex:
     def check():
         if budget is not None:
@@ -348,6 +409,7 @@ def _project_events_legacy(events: Iterable[Event], knowledge_dir: Path, *, docu
         elif event.event_type.startswith("pattern."):
             _apply_pattern_event(patterns, event)
 
+    project_reference_ids_by_cwd = _project_reference_ids_by_cwd(observations, patterns)
     patterns = {
         key: value
         for key, value in patterns.items()
@@ -423,6 +485,7 @@ def _project_events_legacy(events: Iterable[Event], knowledge_dir: Path, *, docu
         "observation_ids": sorted(observations),
         "always_on_pattern_ids": sorted(selected_ids),
         "always_on_chars": len(always_on),
+        "project_reference_ids_by_cwd": project_reference_ids_by_cwd,
         "files": dict(sorted(generated.items())),
     }
     index_content_json = json.dumps(index_document, ensure_ascii=False, sort_keys=True, indent=2) + "\n"

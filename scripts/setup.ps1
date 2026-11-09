@@ -27,6 +27,8 @@ param(
   [switch]$Experiment,
   [switch]$Scheduler,
   [switch]$NoScheduler,
+  [switch]$SkillAutoApply,
+  [switch]$NoSkillAutoApply,
   [switch]$InstallPrerequisites,
   [switch]$CheckOnly,
   [switch]$VerifyOperation,
@@ -40,6 +42,7 @@ param(
 $ErrorActionPreference = "Stop"
 if ($Sync -and $NoSync) { throw "SYNC_SELECTION_CONFLICT" }
 if ($Scheduler -and $NoScheduler) { throw "SCHEDULER_SELECTION_CONFLICT" }
+if ($SkillAutoApply -and $NoSkillAutoApply) { throw "SKILL_AUTO_APPLY_SELECTION_CONFLICT" }
 if ($TeamKnowledgeRoot -and $NoTeamKnowledge) { throw "TEAM_SELECTION_CONFLICT" }
 
 $repoPath = (Resolve-Path -LiteralPath $Repo -ErrorAction Stop).Path
@@ -77,6 +80,8 @@ if ($NoSync) { $cli += "--no-sync" }
 if ($Experiment) { $cli += "--experiment" }
 if ($Scheduler) { $cli += "--scheduler" }
 if ($NoScheduler) { $cli += "--no-scheduler" }
+if ($SkillAutoApply) { $cli += "--skill-auto-apply" }
+if ($NoSkillAutoApply) { $cli += "--no-skill-auto-apply" }
 if ($CheckOnly) { $cli += "--check-only" }
 if ($VerifyOperation) { $cli += "--verify-operation" }
 if ($AllowModelTest) { $cli += "--allow-model-test" }

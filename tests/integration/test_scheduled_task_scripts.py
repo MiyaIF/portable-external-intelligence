@@ -102,7 +102,7 @@ exit $LASTEXITCODE
             self.assertNotIn("TEST_FORBIDDEN_REGISTER_SCHEDULED_TASK", stderr)
             self.assertNotIn("TEST_FORBIDDEN_UNREGISTER_SCHEDULED_TASK", stderr)
             self.assertEqual(output["task_name"], "CodexExternalIntelligenceMaintenance-v1")
-            self.assertEqual(output["argv"][:4], ["-m", "ei.cli", "maintain", "--json"])
+            self.assertEqual(output["argv"][:6], ["-X", "utf8", "-m", "ei.cli", "maintain", "--json"])
             self.assertNotIn("cmd /c", output["arguments"].casefold())
             self.assertIn("registration_preview", output)
             self.assertEqual(output["registration_preview"]["repetition_interval"], "PT30M")

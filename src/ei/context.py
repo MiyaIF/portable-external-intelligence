@@ -35,7 +35,17 @@ def _render(hit: RetrievalHit, compact: bool = False) -> str:
     else:
         evidence = f"  Scope: {scope} | Evidence: {hit.evidence_count} independent observations | Updated: {_date(hit.updated_at)}\n"
         applies_line = f"  Applies: {applies}\n"
-    return f"- [{hit.pattern_id}] {hit.rule}\n" + applies_line + evidence
+    label = "Project-only reference (unpromoted; verify applicability)\n" if hit.knowledge_kind == "project-reference" else ""
+    details = ""
+    if hit.knowledge_kind == "project-reference" and not compact:
+        fields = (
+            ("Precondition", hit.precondition),
+            ("Failure mode", hit.failure_mode),
+            ("Exception", "; ".join(hit.exceptions)),
+            ("Version constraint", hit.version_constraint or ""),
+        )
+        details = "".join(f"  {name}: {value}\n" for name, value in fields if value)
+    return label + f"- [{hit.pattern_id}] {hit.rule}\n" + applies_line + evidence + details
 
 
 def build_context(hits: Iterable[RetrievalHit], max_chars: int = 5000, layer: str = "on-demand") -> str:

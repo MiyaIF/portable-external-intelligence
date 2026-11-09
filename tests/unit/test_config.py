@@ -232,6 +232,30 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "^ACTIVE_INSTALL_MANIFEST_INVALID$"):
                 load_active_install_manifest(runtime)
 
+    def test_settings_restores_optional_skill_auto_apply_as_false_or_explicit_value(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            engine, knowledge, runtime = root / "engine", root / "knowledge", root / "runtime"
+            for path in (engine, knowledge, runtime):
+                path.mkdir()
+            (engine / "config").mkdir()
+            (engine / "config" / "defaults.json").write_text(json.dumps({"retrieval": {"max_chars": 5000, "max_results": 5}}), encoding="utf-8")
+            (engine / "config" / "hosts.json").write_bytes((Path(__file__).resolve().parents[2] / "config" / "hosts.json").read_bytes())
+            manifest_path = runtime / "install-manifest.json"
+            manifest = self._active_manifest(engine, knowledge, runtime)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            self.assertIs(load_settings(engine_root=engine, runtime_root=runtime, host_homes={}).skill_auto_apply, False)
+
+            manifest["skill_auto_apply"] = True
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertIs(load_settings(engine_root=engine, runtime_root=runtime, host_homes={}).skill_auto_apply, True)
+
+            manifest["skill_auto_apply"] = "yes"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "^ACTIVE_INSTALL_MANIFEST_INVALID$"):
+                load_settings(engine_root=engine, runtime_root=runtime, host_homes={})
+
     def test_uninstalled_manifest_requires_explicit_installer_opt_in(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

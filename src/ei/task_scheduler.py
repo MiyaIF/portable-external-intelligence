@@ -99,9 +99,15 @@ def resolve_venv_python(settings: Settings, explicit: Path | None = None) -> Pat
 def build_maintenance_action(settings: Settings, python_exe: Path | None = None) -> MaintenanceAction:
     if settings.scheduler_task_name != TASK_NAME:
         raise ValueError("SCHEDULER_TASK_NAME_INVALID")
-    executable = resolve_venv_python(settings, python_exe)
+    console_executable = resolve_venv_python(settings, python_exe)
+    windows = platform.system().casefold() == "windows"
+    executable = console_executable
+    if windows:
+        executable = console_executable.with_name("pythonw.exe").resolve()
+        if not executable.is_file():
+            raise FileNotFoundError("SCHEDULER_PYTHONW_NOT_FOUND")
     log_file = settings.paths.runtime_dir / "logs" / "maintenance.jsonl"
-    argv: list[str] = [
+    argv: list[str] = (["-X", "utf8"] if windows else []) + [
         "-m",
         "ei.cli",
         "maintain",
@@ -378,8 +384,9 @@ def _recorded_hash(value: object) -> str:
     return text[7:] if text.startswith("sha256:") else text
 
 
-def _expected_action_argv(settings: Settings) -> tuple[str, ...]:
-    argv = [
+def _expected_action_argv(settings: Settings, *, platform_name: str | None = None) -> tuple[str, ...]:
+    windows = _normalise_platform(platform_name) == "windows"
+    argv = (["-X", "utf8"] if windows else []) + [
         "-m",
         "ei.cli",
         "maintain",
@@ -401,7 +408,7 @@ def _expected_action_argv(settings: Settings) -> tuple[str, ...]:
     return tuple(argv)
 
 
-def _state_action_checks(settings: Settings, expected: dict[str, Any], *, budget=None) -> tuple[dict[str, bool], list[str] | None, Path | None]:
+def _state_action_checks(settings: Settings, expected: dict[str, Any], *, budget=None, platform_name: str | None = None) -> tuple[dict[str, bool], list[str] | None, Path | None]:
     if budget is not None:
         budget.check()
     raw_executable = expected.get("executable")
@@ -412,7 +419,7 @@ def _state_action_checks(settings: Settings, expected: dict[str, Any], *, budget
         expected_executable = None
     argv = [item for item in raw_argv] if isinstance(raw_argv, list) and all(isinstance(item, str) for item in raw_argv) else None
     full_argv = [str(expected_executable), *argv] if expected_executable is not None and argv is not None else None
-    base_argv = list(_expected_action_argv(settings))
+    base_argv = list(_expected_action_argv(settings, platform_name=platform_name))
     argv_ok = argv is not None and argv == base_argv
     arguments_ok = argv is not None and expected.get("arguments") == quote_windows_command(argv)
     working_directory_ok = False
@@ -444,8 +451,11 @@ def _state_action_checks(settings: Settings, expected: dict[str, Any], *, budget
 
 def _scheduler_query(argv, budget, *, env=None):
     budget.check()
+    options = {}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
     result = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="strict",
-        stdin=subprocess.DEVNULL, timeout=min(2.0, budget.remaining_ms() / 1000), env=env, check=False)
+        stdin=subprocess.DEVNULL, timeout=min(2.0, budget.remaining_ms() / 1000), env=env, check=False, **options)
     budget.check()
     if len(result.stdout.encode("utf-8")) > 262144 or len(result.stderr.encode("utf-8")) > 65536:
         raise ValueError("SCHEDULER_QUERY_LIMIT")
@@ -509,9 +519,9 @@ def _native_scheduler_sample(settings, *, now, budget):
     expected = state.get("action")
     if state.get("registered") is not True or not isinstance(expected, dict):
         raise ValueError("SCHEDULER_NOT_REGISTERED")
-    checks, argv, _ = _state_action_checks(settings, expected, budget=budget)
     selected = _normalise_platform(None)
     selected = "macos" if selected in {"darwin", "mac", "macos"} else selected
+    checks, argv, _ = _state_action_checks(settings, expected, budget=budget, platform_name=selected)
     boot, continuous, awake = _scheduler_clocks(selected, budget)
     native = {"platform": selected, "identity_verified": all(checks.values()), "registered": False,
         "enabled": False, "running": False, "conditions_verified": False, "generation": None,
@@ -786,7 +796,7 @@ def inspect_registered_task(
     if not isinstance(expected, dict):
         return {"ok": False, "registered": True, "reason_code": "SCHEDULER_STATE_ACTION_MISSING", "task_name": TASK_NAME}
     selected_platform = _normalise_platform(platform_name)
-    state_checks, expected_argv, expected_executable = _state_action_checks(settings, expected)
+    state_checks, expected_argv, expected_executable = _state_action_checks(settings, expected, platform_name=selected_platform)
     if selected_platform in {"darwin", "mac", "macos"}:
         artifact = _launch_agents_dir() / f"{TASK_NAME}.plist"
         artifact_paths = {"plist": str(artifact)}
@@ -880,6 +890,7 @@ def inspect_registered_task(
     if selected_platform != "windows":
         return {"ok": False, "registered": True, "reason_code": "SCHEDULER_PLATFORM_UNSUPPORTED", "task_name": TASK_NAME}
     query = (
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false);"
         "$task=Get-ScheduledTask -TaskName $env:EI_TASK_NAME -ErrorAction Stop;"
         "$info=Get-ScheduledTaskInfo -TaskName $env:EI_TASK_NAME -ErrorAction Stop;"
         "$action=$task.Actions | Select-Object -First 1;"
@@ -895,15 +906,34 @@ def inspect_registered_task(
     )
     environment = os.environ.copy()
     environment["EI_TASK_NAME"] = str(expected.get("task_name", TASK_NAME))
+    options = {}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        completed = subprocess.run([powershell_exe, "-NoProfile", "-Command", query], capture_output=True, text=True, timeout=20, env=environment, check=False)
+        completed = subprocess.run(
+            [powershell_exe, "-NoProfile", "-Command", query],
+            capture_output=True,
+            text=False,
+            stdin=subprocess.DEVNULL,
+            timeout=20,
+            env=environment,
+            check=False,
+            **options,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return {"ok": False, "registered": True, "reason_code": "SCHEDULER_QUERY_FAILED", "error_type": type(exc).__name__, "task_name": TASK_NAME}
     if completed.returncode != 0:
         return {"ok": False, "registered": True, "reason_code": "SCHEDULED_TASK_NOT_FOUND", "task_name": TASK_NAME, "platform": "windows", "identity_verified": False, "manager_present": False, "manager_query_ok": True, "checks": {**state_checks, "manager_status": False}, "artifact_paths": {}, "artifact_digests": {}}
     try:
-        live = json.loads(completed.stdout)
-    except json.JSONDecodeError:
+        raw_stdout = completed.stdout
+        if isinstance(raw_stdout, bytes):
+            output = raw_stdout.decode("utf-8", errors="strict")
+        elif isinstance(raw_stdout, str):
+            output = raw_stdout
+        else:
+            raise TypeError("SCHEDULER_QUERY_OUTPUT_INVALID")
+        live = json.loads(output)
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
         return {"ok": False, "registered": True, "reason_code": "SCHEDULER_QUERY_INVALID", "task_name": TASK_NAME}
     executable = Path(str(live.get("Execute", "")).strip('"')).resolve()
     expected_executable = Path(str(expected.get("executable", ""))).resolve()
@@ -954,6 +984,11 @@ def register_scheduler(
     if selected_platform == "windows":
         script = engine / "scripts" / "install-scheduled-task.ps1"
         executable = shutil.which("powershell.exe") or "powershell.exe"
+        renderer_python = action.executable
+        if action.executable.name.casefold() == "pythonw.exe":
+            renderer_python = action.executable.with_name("python.exe")
+            if not renderer_python.is_file():
+                return {"ok": False, "requested": True, "status": "REGISTRATION_FAILED", "reason_code": "SCHEDULER_PYTHON_NOT_FOUND", "registered": False, "retryable": False, "platform": "windows"}
         command = [
             executable,
             "-NoProfile",
@@ -968,7 +1003,7 @@ def register_scheduler(
             "-RuntimeRoot",
             str(settings.paths.runtime_root),
             "-PythonExe",
-            str(action.executable),
+            str(renderer_python),
         ]
         normalized_platform = "windows"
     elif selected_platform in {"darwin", "mac", "macos"}:

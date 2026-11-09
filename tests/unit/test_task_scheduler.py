@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ei.config import RuntimePaths, Settings, load_settings
-from ei.task_scheduler import TASK_NAME, build_maintenance_action, build_launchd_plist, build_systemd_user_unit, build_systemd_user_timer, inspect_registered_task, register_scheduler, remove_scheduler_state, write_scheduler_state
+from ei.task_scheduler import TASK_NAME, build_maintenance_action, build_launchd_plist, build_systemd_user_unit, build_systemd_user_timer, current_principal, inspect_registered_task, register_scheduler, remove_scheduler_state, write_scheduler_state
 
 
 class TaskSchedulerTests(unittest.TestCase):
@@ -38,7 +38,9 @@ class TaskSchedulerTests(unittest.TestCase):
         python = root / "python"
         python.write_bytes(b"python")
         settings = Settings(paths=RuntimePaths(engine, knowledge, runtime))
-        return settings, build_maintenance_action(settings, python), python
+        with patch("ei.task_scheduler.platform.system", return_value="Linux"):
+            action = build_maintenance_action(settings, python)
+        return settings, action, python
 
     def test_register_scheduler_uses_platform_script_and_verifies_success(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,7 +187,8 @@ class TaskSchedulerTests(unittest.TestCase):
             python.parent.mkdir(parents=True)
             python.write_bytes(b"synthetic-python-executable")
             settings = load_settings(root, home)
-            action = build_maintenance_action(settings)
+            with patch("ei.task_scheduler.platform.system", return_value="Linux"):
+                action = build_maintenance_action(settings)
             self.assertEqual(action.task_name, TASK_NAME)
             self.assertEqual(action.argv[:4], ("-m", "ei.cli", "maintain", "--json"))
             self.assertIn(str(root.resolve()), action.argv)
@@ -205,6 +208,159 @@ class TaskSchedulerTests(unittest.TestCase):
             self.assertIn("--sync", action.argv)
             self.assertEqual(action.executable_sha256, hashlib.sha256(python.read_bytes()).hexdigest())
 
+    def test_windows_maintenance_action_uses_utf8_pythonw_and_requires_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "engine"
+            (root / "config").mkdir(parents=True)
+            (root / "config" / "defaults.json").write_text(
+                '{"retrieval":{"max_chars":5000,"max_results":5}}', encoding="utf-8"
+            )
+            console = root / ".venv" / "Scripts" / "python.exe"
+            windowless = console.with_name("pythonw.exe")
+            console.parent.mkdir(parents=True)
+            console.write_bytes(b"console interpreter")
+            windowless.write_bytes(b"windowless interpreter")
+            settings = load_settings(root, Path(tmp) / "codex")
+
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                action = build_maintenance_action(settings)
+
+            self.assertEqual(action.executable, windowless.resolve())
+            self.assertEqual(action.argv[:3], ("-X", "utf8", "-m"))
+            self.assertEqual(action.executable_sha256, hashlib.sha256(windowless.read_bytes()).hexdigest())
+
+            windowless.unlink()
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                with self.assertRaisesRegex(FileNotFoundError, "SCHEDULER_PYTHONW_NOT_FOUND"):
+                    build_maintenance_action(settings)
+
+    def test_windows_registration_keeps_console_python_for_renderer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            engine = root / "engine"
+            (engine / "config").mkdir(parents=True)
+            (engine / "config" / "defaults.json").write_text(
+                '{"retrieval":{"max_chars":5000,"max_results":5}}', encoding="utf-8"
+            )
+            script = engine / "scripts" / "install-scheduled-task.ps1"
+            script.parent.mkdir()
+            script.write_text("# isolated registration fixture\n", encoding="utf-8")
+            console = engine / ".venv" / "Scripts" / "python.exe"
+            windowless = console.with_name("pythonw.exe")
+            console.parent.mkdir(parents=True)
+            console.write_bytes(b"console interpreter")
+            windowless.write_bytes(b"windowless interpreter")
+            settings = load_settings(engine, root / "codex")
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                action = build_maintenance_action(settings)
+            completed = subprocess.CompletedProcess([], 0, "registered", "")
+            verified = {"ok": True, "registered": True, "reason_code": "OK", "task_name": TASK_NAME}
+            with patch("ei.task_scheduler.subprocess.run", return_value=completed) as process, patch(
+                "ei.task_scheduler.inspect_registered_task", return_value=verified
+            ):
+                result = register_scheduler(settings, action, engine, platform_name="Windows")
+
+            self.assertTrue(result["ok"])
+            command = process.call_args.args[0]
+            python_exe = command[command.index("-PythonExe") + 1]
+            self.assertEqual(Path(python_exe), console.resolve())
+            self.assertNotEqual(Path(python_exe), action.executable)
+
+    def test_saved_windows_action_passes_platform_specific_state_validation(self):
+        from ei.task_scheduler import _expected_action_argv, _state_action_checks
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "engine"
+            (root / "config").mkdir(parents=True)
+            (root / "config" / "defaults.json").write_text(
+                '{"retrieval":{"max_chars":5000,"max_results":5}}', encoding="utf-8"
+            )
+            console = root / ".venv" / "Scripts" / "python.exe"
+            windowless = console.with_name("pythonw.exe")
+            console.parent.mkdir(parents=True)
+            console.write_bytes(b"console interpreter")
+            windowless.write_bytes(b"windowless interpreter")
+            settings = load_settings(root, Path(tmp) / "codex")
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                action = build_maintenance_action(settings)
+            state_path = write_scheduler_state(settings, action, True)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))["action"]
+
+            # The explicit selected platform controls validation, not the host running this test.
+            with patch("ei.task_scheduler.platform.system", return_value="Linux"):
+                checks, full_argv, executable = _state_action_checks(settings, saved, platform_name="Windows")
+                windows_expected = _expected_action_argv(settings, platform_name="Windows")
+                linux_expected = _expected_action_argv(settings, platform_name="Linux")
+
+            self.assertTrue(all(checks.values()), checks)
+            self.assertEqual(executable, windowless.resolve())
+            self.assertEqual(full_argv[:4], [str(windowless.resolve()), "-X", "utf8", "-m"])
+            self.assertEqual(windows_expected[:3], ("-X", "utf8", "-m"))
+            self.assertEqual(linux_expected[:3], ("-m", "ei.cli", "maintain"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows PowerShell query is platform-specific")
+    def test_windows_inspection_uses_utf8_bytes_and_suppresses_child_console(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            engine = root / "エンジン"
+            (engine / "config").mkdir(parents=True)
+            (engine / "config" / "defaults.json").write_text(
+                '{"retrieval":{"max_chars":5000,"max_results":5}}', encoding="utf-8"
+            )
+            console = engine / ".venv" / "Scripts" / "python.exe"
+            windowless = console.with_name("pythonw.exe")
+            console.parent.mkdir(parents=True)
+            console.write_bytes(b"console interpreter")
+            windowless.write_bytes(b"windowless interpreter")
+            settings = load_settings(engine, root / "codex_日本語")
+            with patch("ei.task_scheduler.platform.system", return_value="Windows"):
+                action = build_maintenance_action(settings)
+            write_scheduler_state(settings, action, True)
+            live = {
+                "TaskName": TASK_NAME,
+                "Execute": str(action.executable),
+                "Arguments": action.arguments,
+                "WorkingDirectory": str(engine.resolve()),
+                "UserId": current_principal(),
+                "RunLevel": "Limited",
+                "LastTaskResult": 0,
+                "LastRunTime": None,
+                "NextRunTime": "2030-01-01T00:00:00+00:00",
+                "State": "Ready",
+                "Enabled": True,
+            }
+            successful = subprocess.CompletedProcess(
+                [], 0, json.dumps(live, ensure_ascii=False).encode("utf-8"), b""
+            )
+            invalid_utf8 = subprocess.CompletedProcess([], 0, b"\xff", b"")
+            with patch(
+                "ei.task_scheduler.subprocess.run", side_effect=(successful, invalid_utf8)
+            ) as process:
+                result = inspect_registered_task(settings, platform_name="Windows")
+                malformed = inspect_registered_task(settings, platform_name="Windows")
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(result["identity_verified"])
+            self.assertEqual(malformed["reason_code"], "SCHEDULER_QUERY_INVALID")
+            self.assertEqual(process.call_count, 2)
+            for call in process.call_args_list:
+                kwargs = call.kwargs
+                self.assertTrue(kwargs["capture_output"])
+                self.assertFalse(kwargs["text"])
+                self.assertEqual(kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+                self.assertNotIn("encoding", kwargs)
+                self.assertIn("[Console]::OutputEncoding", call.args[0][-1])
+
+    @unittest.skipUnless(os.name == "nt", "Windows console suppression is platform-specific")
+    def test_windows_scheduler_query_suppresses_console_window(self):
+        from ei.operation_runtime import OperationBudget
+        from ei.task_scheduler import _scheduler_query
+
+        completed = subprocess.CompletedProcess([], 0, "ok", "")
+        with patch("ei.task_scheduler.subprocess.run", return_value=completed) as process:
+            _scheduler_query(["powershell.exe", "-NoProfile"], OperationBudget(1000))
+        self.assertEqual(process.call_args.kwargs["creationflags"], subprocess.CREATE_NO_WINDOW)
+
     def test_scheduler_state_is_local_and_reusable_for_doctor(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -214,7 +370,8 @@ class TaskSchedulerTests(unittest.TestCase):
             python.parent.mkdir(parents=True)
             python.write_bytes(b"python")
             settings = load_settings(root, root / "codex")
-            action = build_maintenance_action(settings)
+            with patch("ei.task_scheduler.platform.system", return_value="Linux"):
+                action = build_maintenance_action(settings)
             state_path = write_scheduler_state(settings, action, False)
             self.assertTrue(state_path.exists())
             state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -235,7 +392,8 @@ class TaskSchedulerTests(unittest.TestCase):
             python.parent.mkdir(parents=True)
             python.write_bytes(b"python")
             settings = load_settings(root, home, runtime_root=Path(tmp) / "runtime")
-            action = build_maintenance_action(settings, python)
+            with patch("ei.task_scheduler.platform.system", return_value="Linux"):
+                action = build_maintenance_action(settings, python)
             plist = build_launchd_plist(action)
             unit = build_systemd_user_unit(action)
             timer = build_systemd_user_timer(action)

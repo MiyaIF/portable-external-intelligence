@@ -148,9 +148,20 @@ def assert_safe_target(
     _reparse_components(root_raw)
     root_path = canonical_path(root)
     target_raw = _absolute_without_following(target)
-    if _is_reparse(root_path):
-        _fail("UNSAFE_REPARSE_POINT")
-    _reparse_components(root_path)
+    root_parts = root_path.parts
+    target_parts = target_raw.parts
+    redundant_root_check = (
+        not allow_root
+        and not allow_final_symlink
+        and root_path != Path(root_path.anchor)
+        and root_parts == root_raw.parts
+        and len(target_parts) > len(root_parts)
+        and target_parts[: len(root_parts)] == root_parts
+    )
+    if not redundant_root_check:
+        if _is_reparse(root_path):
+            _fail("UNSAFE_REPARSE_POINT")
+        _reparse_components(root_path)
     _reparse_components(target_raw, allow_final_reparse=allow_final_symlink)
     try:
         target_resolved = target_raw.resolve(strict=False)

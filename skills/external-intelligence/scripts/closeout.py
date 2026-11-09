@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Any, Mapping
 
 sys.dont_write_bytecode = True
@@ -24,6 +25,20 @@ _MAX_INPUT = 2 * 1024 * 1024
 def _emit(value: Mapping[str, Any], code: int = 0) -> int:
     sys.stdout.write(json.dumps(dict(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
     return code
+
+
+def _bind_verified_cwd_scope(candidate: dict[str, Any]) -> str:
+    candidate.pop("cwd", None)
+    candidate.pop("cwd_fingerprint", None)
+    try:
+        current_directory = Path.cwd().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return "UNKNOWN"
+
+    from ei.ids import fingerprint
+
+    candidate["cwd_fingerprint"] = fingerprint(str(current_directory))
+    return "KNOWN"
 
 
 def _read_input() -> bytes:
@@ -54,6 +69,7 @@ def _one_object(raw: bytes) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="external-intelligence-closeout")
     add_binding_arguments(parser)
+    parser.add_argument("--proposal-only", action="store_true")
     args = parser.parse_args(argv)
     try:
         script_path = invocation_script_path()
@@ -126,6 +142,33 @@ def main(argv: list[str] | None = None) -> int:
             team_knowledge_root=binding.team_knowledge_root,
             runtime_root=binding.runtime_root,
         )
+        auto_apply = (
+            binding.skill_auto_apply is True
+            and binding.host_is_work_host
+            and binding.skill_activation_mode == "AUTO_ALLOWED"
+            and not args.proposal_only
+        )
+        if auto_apply:
+            host = settings.hosts.get(binding.host_id or "")
+            expected_pair = (
+                binding.host_id,
+                getattr(host, "host_family", None),
+            )
+            supplied_pair = (trusted_source_host_id, trusted_source_host_family)
+            if not all(isinstance(value, str) and value for value in expected_pair) or supplied_pair != expected_pair:
+                raise ValueError("CLOSEOUT_SOURCE_HOST_PAIR_MISMATCH")
+            for field, expected in zip(("source_host_id", "source_host_family"), expected_pair):
+                if field in gate and gate[field] != expected:
+                    raise ValueError("CLOSEOUT_SOURCE_HOST_PAIR_MISMATCH")
+            _bind_verified_cwd_scope(candidate)
+            from ei.closeout_service import process_closeout
+
+            applied = process_closeout(
+                {"candidate": candidate, "gate_decision": gate_decision.to_dict()},
+                settings,
+                route_team=False,
+            )
+            return _emit(applied.payload, applied.exit_code)
         knowledge = settings.paths.knowledge_dir
         index = build_index(knowledge, knowledge / "index.json") if (knowledge / "index.json").is_file() else None
         changeset = curate_candidate(candidate, index, {"provider_id": gate_decision.provider_id or "manual"}, None)

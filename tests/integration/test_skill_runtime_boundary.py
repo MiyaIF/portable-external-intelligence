@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -10,8 +11,13 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from ei.command_quote import build_skill_launcher_argv
+from ei.closeout_service import _event_audit
+from ei.gate import GateDecision
+from ei.journal import append_event, iter_events
 from ei.install_manifest import normalize_install_manifest
 from ei.models import Event
 from ei.project import project_events
@@ -179,7 +185,60 @@ def _prepare_install(root: Path, engine: Path = ROOT, *, link: bool = False) -> 
     return skill_destination / "scripts", knowledge, runtime, binding_path
 
 
+def _structured_yes_payload(*, claim: str = "Preserve explicit setup consent when updating managed installation state.") -> dict[str, object]:
+    title = "Verified setup consent"
+    return {
+        "candidate": {
+            "candidate_id": "skill-auto-apply-boundary",
+            "source_host_id": "codex-cli",
+            "source_host_family": "codex-compatible",
+            "title": title,
+            "claim": claim,
+            "domain": "setup",
+            "source_ref": "sha256:" + "b" * 64,
+        },
+        "gate_decision": {
+            "decision": "YES",
+            "reason_code": "evidence_verified",
+            "candidate_title": title,
+            "candidate_claim": claim,
+            "evidence_refs": ["sha256:" + "a" * 64],
+            "benefit": "reduced_rework",
+            "classification": "private-reusable",
+            "confidence": 0.9,
+            "provider_id": "manual",
+            "applicability_scope": "universal",
+            "applicable_host_ids": [],
+            "applicable_host_families": [],
+        },
+    }
+
+
 class SkillRuntimeBoundaryTests(unittest.TestCase):
+    def test_failed_actual_cwd_resolution_discards_caller_claimed_scope(self) -> None:
+        script_path = SCRIPTS / "closeout.py"
+        spec = importlib.util.spec_from_file_location("task14_skill_closeout", script_path)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        closeout_module = importlib.util.module_from_spec(spec)
+        prior_dont_write_bytecode = sys.dont_write_bytecode
+        try:
+            with patch.object(sys, "path", [str(SCRIPTS), *sys.path]):
+                spec.loader.exec_module(closeout_module)
+        finally:
+            sys.dont_write_bytecode = prior_dont_write_bytecode
+
+        candidate = {
+            "cwd": "C:/caller/fake-project",
+            "cwd_fingerprint": "sha256:" + "f" * 64,
+        }
+        with patch.object(closeout_module.Path, "cwd", side_effect=OSError("cwd unavailable")):
+            scope_state = closeout_module._bind_verified_cwd_scope(candidate)
+
+        self.assertEqual(scope_state, "UNKNOWN")
+        self.assertNotIn("cwd", candidate)
+        self.assertNotIn("cwd_fingerprint", candidate)
+
     def test_schema_v2_disabled_team_binding_does_not_require_retained_team_root(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -261,6 +320,7 @@ class SkillRuntimeBoundaryTests(unittest.TestCase):
         input_text: str | None = None,
         environment: dict[str, str] | None = None,
         scripts: Path = SCRIPTS,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         command = [
             *build_skill_launcher_argv(
@@ -274,7 +334,7 @@ class SkillRuntimeBoundaryTests(unittest.TestCase):
         ]
         return subprocess.run(
             command,
-            cwd=ROOT,
+            cwd=cwd or ROOT,
             env=environment,
             input=input_text,
             capture_output=True,
@@ -387,6 +447,49 @@ class SkillRuntimeBoundaryTests(unittest.TestCase):
             payload = json.loads(completed.stdout)
             self.assertEqual(payload["status"], "success")
             self.assertEqual([item["pattern_id"] for item in payload["hits"]], ["pat_manifest_boundary"])
+
+    def test_recall_skill_passes_actual_cwd_for_project_reference_filtering(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts, knowledge, runtime, _binding = _prepare_install(root)
+            project = root / "actual-project"
+            project.mkdir()
+            cwd_fingerprint = "sha256:" + hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()
+            project_events(
+                [
+                    Event.create(
+                        "observation.recorded",
+                        "2026-09-01T00:00:00+00:00",
+                        "test",
+                        "machine",
+                        {
+                            "observation_id": "obs_skill_project_reference",
+                            "title": "Receipt check",
+                            "claim": "Check the receipt before retrying the same operation.",
+                            "cwd_fingerprint": cwd_fingerprint,
+                            "classification": "private-reusable",
+                        },
+                        event_id="evt_skill_project_reference",
+                    )
+                ],
+                knowledge / "knowledge",
+            )
+
+            completed = self._run(
+                "recall.py",
+                ROOT,
+                runtime,
+                ["--query", "check receipt before retrying", "--host", "codex-cli"],
+                scripts=scripts,
+                cwd=project,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual([item["pattern_id"] for item in payload["hits"]], ["obs_skill_project_reference"])
+            self.assertEqual(payload["hits"][0]["knowledge_kind"], "project-reference")
+            self.assertIn("Project-only reference (unpromoted; verify applicability)", payload["context"])
+            self.assertNotIn(str(project), completed.stdout)
 
     def test_recall_uses_enabled_team_store_from_the_bound_install(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -510,6 +613,306 @@ class SkillRuntimeBoundaryTests(unittest.TestCase):
             payload = json.loads(completed.stdout)
             self.assertEqual(payload["status"], "not_inherited")
             self.assertEqual(payload["decision"], "NO")
+
+    def test_consent_enabled_closeout_applies_one_observation_and_replays_the_same_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts, knowledge, runtime, _binding = _prepare_install(root)
+            manifest_path = runtime / "install-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["skill_auto_apply"] = True
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            project = root / "current-project"
+            project.mkdir()
+            payload = {
+                "candidate": {
+                    "candidate_id": "skill-auto-apply-replay",
+                    "source_host_id": "codex-cli",
+                    "source_host_family": "codex-compatible",
+                    "cwd": str(root / "candidate-claimed-project"),
+                    "cwd_fingerprint": "sha256:" + "f" * 64,
+                    "skill_auto_apply": False,
+                    "host_id": "claude-code",
+                    "host_is_work_host": True,
+                    "skill_activation_mode": "AUTO_ALLOWED",
+                    "runtime_root": str(root / "candidate-runtime"),
+                    "title": "Verified setup consent",
+                    "claim": "Preserve explicit setup consent when updating managed installation state.",
+                    "domain": "setup",
+                    "source_ref": "sha256:" + "b" * 64,
+                "precondition": "Explicit setup consent is present.",
+                "failure_mode": "Skipping consent validation can cause unintended writes.",
+                "exception": "Proposal-only mode never applies the candidate.",
+                "version_constraint": ">=1.0,<2",
+                },
+                "gate_decision": {
+                    "decision": "YES",
+                    "reason_code": "evidence_verified",
+                    "candidate_title": "Verified setup consent",
+                    "candidate_claim": "Preserve explicit setup consent when updating managed installation state.",
+                    "evidence_refs": ["sha256:" + "a" * 64],
+                    "benefit": "reduced_rework",
+                    "classification": "private-reusable",
+                    "confidence": 0.9,
+                    "provider_id": "manual",
+                    "applicability_scope": "universal",
+                    "applicable_host_ids": [],
+                    "applicable_host_families": [],
+                },
+            }
+            encoded = json.dumps(payload, ensure_ascii=False)
+
+            first = self._run("closeout.py", ROOT, runtime, input_text=encoded, scripts=scripts, cwd=project)
+
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            first_payload = json.loads(first.stdout)
+            self.assertEqual(first_payload["knowledge"], "APPLIED")
+            self.assertEqual(first_payload["association"]["status"], "UNKNOWN")
+            self.assertTrue(first_payload["curation"]["event_ids"])
+            first_events = list(iter_events(knowledge / "events"))
+            first_observations = [event for event in first_events if event.event_type == "observation.recorded"]
+            self.assertEqual(len(first_observations), 1)
+            for field, expected in {
+                "precondition": "Explicit setup consent is present.",
+                "failure_mode": "Skipping consent validation can cause unintended writes.",
+                "exception": "Proposal-only mode never applies the candidate.",
+                "version_constraint": ">=1.0,<2",
+            }.items():
+                self.assertEqual(first_observations[0].payload.get(field), expected)
+            expected_cwd_fingerprint = "sha256:" + hashlib.sha256(str(project.resolve()).encode("utf-8")).hexdigest()
+            self.assertEqual(first_observations[0].payload["cwd_fingerprint"], expected_cwd_fingerprint)
+            self.assertNotIn(str(project), json.dumps(first_observations[0].to_dict(), ensure_ascii=False))
+
+            project_events(first_events, knowledge / "knowledge")
+            outside_version = self._run(
+                "recall.py",
+                ROOT,
+                runtime,
+                ["--query", "explicit setup consent managed installation", "--host", "codex-cli", "--version", "2.0"],
+                scripts=scripts,
+                cwd=project,
+            )
+            self.assertEqual(outside_version.returncode, 0, outside_version.stdout + outside_version.stderr)
+            self.assertEqual(json.loads(outside_version.stdout)["hits"], [])
+
+            unknown_version = self._run(
+                "recall.py",
+                ROOT,
+                runtime,
+                ["--query", "explicit setup consent managed installation", "--host", "codex-cli"],
+                scripts=scripts,
+                cwd=project,
+            )
+            self.assertEqual(unknown_version.returncode, 0, unknown_version.stdout + unknown_version.stderr)
+            self.assertEqual(json.loads(unknown_version.stdout)["hits"], [])
+
+            inside_version = self._run(
+                "recall.py",
+                ROOT,
+                runtime,
+                ["--query", "explicit setup consent managed installation", "--host", "codex-cli", "--version", "1.5"],
+                scripts=scripts,
+                cwd=project,
+            )
+            self.assertEqual(inside_version.returncode, 0, inside_version.stdout + inside_version.stderr)
+            inside_payload = json.loads(inside_version.stdout)
+            self.assertEqual([item["pattern_id"] for item in inside_payload["hits"]], [first_observations[0].payload["observation_id"]])
+            self.assertEqual(inside_payload["hits"][0]["knowledge_kind"], "project-reference")
+            for detail in (
+                "Precondition: Explicit setup consent is present.",
+                "Failure mode: Skipping consent validation can cause unintended writes.",
+                "Exception: Proposal-only mode never applies the candidate.",
+                "Version constraint: >=1.0,<2",
+            ):
+                self.assertIn(detail, inside_payload["context"])
+
+            second = self._run("closeout.py", ROOT, runtime, input_text=encoded, scripts=scripts, cwd=project)
+
+            self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+            second_payload = json.loads(second.stdout)
+            self.assertTrue(second_payload["curation"]["already_applied"])
+            self.assertEqual(second_payload["curation"]["event_ids"], first_payload["curation"]["event_ids"])
+            final_events = list(iter_events(knowledge / "events"))
+            self.assertEqual(sum(event.event_type == "observation.recorded" for event in final_events), 1)
+
+    def test_closeout_without_verified_consent_or_host_activation_is_proposal_only(self) -> None:
+        cases = (
+            ("missing-consent", None, "AUTO_ALLOWED", ["codex-cli"], False),
+            ("explicit-false", False, "AUTO_ALLOWED", ["codex-cli"], False),
+            ("proposal-only", True, "AUTO_ALLOWED", ["codex-cli"], True),
+            ("consent-required", True, "CONSENT_REQUIRED", ["codex-cli"], False),
+            ("unverified-activation", True, "UNVERIFIED", ["codex-cli"], False),
+            ("not-a-work-host", True, "AUTO_ALLOWED", ["claude-code"], False),
+        )
+        for name, consent, activation, work_hosts, force_proposal in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                scripts, knowledge, runtime, _binding = _prepare_install(root)
+                manifest_path = runtime / "install-manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if consent is not None:
+                    manifest["skill_auto_apply"] = consent
+                manifest["hosts"]["codex-cli"]["skill_activation_mode"] = activation
+                manifest["work_hosts"] = work_hosts
+                if "claude-code" in work_hosts:
+                    other_host = dict(manifest["hosts"]["codex-cli"])
+                    other_host.update({
+                        "host_id": "claude-code",
+                        "skill_activation_mode": "AUTO_ALLOWED",
+                    })
+                    manifest["hosts"]["claude-code"] = other_host
+                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+                payload = _structured_yes_payload()
+                args = ["--proposal-only"] if force_proposal else None
+
+                completed = self._run(
+                    "closeout.py",
+                    ROOT,
+                    runtime,
+                    extra=args,
+                    input_text=json.dumps(payload, ensure_ascii=False),
+                    scripts=scripts,
+                )
+
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                result = json.loads(completed.stdout)
+                self.assertEqual(result["status"], "changeset_ready", result)
+                self.assertEqual(result["decision"], "YES")
+                self.assertTrue(result["validation"]["valid"])
+                self.assertEqual(list(iter_events(knowledge / "events")), [])
+
+    def test_closeout_rejects_a_candidate_bound_to_another_host(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts, knowledge, runtime, _binding = _prepare_install(root)
+            manifest_path = runtime / "install-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["skill_auto_apply"] = True
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            payload = _structured_yes_payload()
+            payload["candidate"]["source_host_id"] = "claude-code"
+            payload["candidate"]["source_host_family"] = "claude-code"
+
+            completed = self._run(
+                "closeout.py",
+                ROOT,
+                runtime,
+                input_text=json.dumps(payload, ensure_ascii=False),
+                scripts=scripts,
+            )
+
+            self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["error_code"], "CLOSEOUT_SOURCE_HOST_PAIR_MISMATCH")
+            self.assertEqual(list(iter_events(knowledge / "events")), [])
+
+    def test_closeout_privacy_rejection_never_appends_observation_or_claim_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts, knowledge, runtime, _binding = _prepare_install(root)
+            manifest_path = runtime / "install-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["skill_auto_apply"] = True
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            marker = "api_key=task14-synthetic-marker-123456789"
+            payload = _structured_yes_payload(claim=marker)
+
+            completed = self._run(
+                "closeout.py",
+                ROOT,
+                runtime,
+                input_text=json.dumps(payload, ensure_ascii=False),
+                scripts=scripts,
+            )
+
+            self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+            self.assertEqual(json.loads(completed.stdout)["error_code"], "SECRET_PATTERN_MATCH")
+            self.assertNotIn(marker, completed.stdout + completed.stderr)
+            events = list(iter_events(knowledge / "events"))
+            self.assertFalse(any(event.event_type == "observation.recorded" for event in events))
+            self.assertNotIn(marker, json.dumps([event.to_dict() for event in events], ensure_ascii=False))
+
+    def test_closeout_sanitizes_audit_event_id_collision_without_traceback_or_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts, knowledge, runtime, _binding = _prepare_install(root)
+            manifest_path = runtime / "install-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["skill_auto_apply"] = True
+            manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+            payload = _structured_yes_payload()
+            gate = payload["gate_decision"]
+            candidate = payload["candidate"]
+            decision = GateDecision.from_mapping(
+                gate,
+                provider_id=gate["provider_id"],
+                source_host_id=candidate["source_host_id"],
+                source_host_family=candidate["source_host_family"],
+            )
+            captured: list[Event] = []
+            audit_settings = SimpleNamespace(paths=SimpleNamespace(event_dir=knowledge / "events"))
+            with patch(
+                "ei.closeout_service.append_event",
+                side_effect=lambda event, _event_root, **_kwargs: captured.append(event),
+            ):
+                _event_audit(audit_settings, decision, candidate)
+            expected_audit = captured[0]
+            conflicting_event = Event.create(
+                "gate.decision",
+                expected_audit.occurred_at,
+                expected_audit.actor,
+                expected_audit.machine_id,
+                {"decision": "NO", "classification": "private-reusable"},
+                event_id=expected_audit.event_id,
+            )
+            append_event(conflicting_event, knowledge / "events")
+
+            completed = self._run(
+                "closeout.py",
+                ROOT,
+                runtime,
+                input_text=json.dumps(payload, ensure_ascii=False),
+                scripts=scripts,
+            )
+
+            result = json.loads(completed.stdout)
+            self.assertEqual(completed.returncode, 2, completed.stdout + completed.stderr)
+            self.assertEqual(result["status"], "rejected")
+            self.assertEqual(result["error_code"], f"EVENT_ID_COLLISION:{expected_audit.event_id}")
+            self.assertNotIn("Traceback", completed.stdout + completed.stderr)
+            self.assertNotIn(str(root), completed.stdout + completed.stderr)
+            events = list(iter_events(knowledge / "events"))
+            self.assertEqual(len(events), 1)
+            self.assertEqual(events[0].canonical_dict(), conflicting_event.canonical_dict())
+
+    def test_personal_auto_apply_skips_team_routing_without_mutating_team_settings(self) -> None:
+        from ei.closeout_service import _team_result
+
+        team_store = {"enabled": True, "store_id": "team_0123456789abcdef"}
+        settings = SimpleNamespace(knowledge_stores=SimpleNamespace(team=team_store))
+        with patch(
+            "ei.team_routing.route_applied_personal_knowledge",
+            side_effect=AssertionError("personal Skill auto-save must not invoke team routing"),
+        ) as route:
+            result = _team_result(
+                settings,
+                applied=True,
+                changeset=None,
+                event_ids=("evt_20261104T000000000000Z_0123456789ab",),
+                candidate={"candidate_id": "task14-team-routing-boundary"},
+                route_team=False,
+            )
+        self.assertEqual(result, {"status": "SKIPPED", "reason_code": "TEAM_ROUTING_NOT_REQUESTED"})
+        self.assertTrue(settings.knowledge_stores.team["enabled"])
+        route.assert_not_called()
+
+    def test_team_routing_suppression_rejects_trusted_context_before_side_effects(self) -> None:
+        from ei.closeout_service import InputError, process_closeout
+
+        with self.assertRaisesRegex(
+            InputError,
+            "CLOSEOUT_TEAM_ROUTING_POLICY_UNSUPPORTED_FOR_TRUSTED_CONTEXT",
+        ):
+            process_closeout({}, SimpleNamespace(), validation=object(), route_team=False)
 
     def test_trusted_child_ignores_parent_pythonpath_sitecustomize(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
