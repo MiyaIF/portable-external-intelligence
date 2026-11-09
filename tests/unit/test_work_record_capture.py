@@ -796,10 +796,15 @@ class WorkRecordCaptureTests(unittest.TestCase):
         self.assertEqual(provider.extraction_calls, [])
         self.assertEqual(second.capture["work_records"]["status"], "rejected")
         self.assertEqual(list_queue_items(settings), ())
-        cursor_files = tuple((settings.paths.local_state_dir / "capture-recovery").glob("work-record-*.json"))
-        cursor_state = json.loads(cursor_files[0].read_text(encoding="utf-8"))
+        capture_recovery = settings.paths.local_state_dir / "capture-recovery"
+        session_cursors = tuple(path for path in capture_recovery.glob("work-record-*.json")
+                                if not path.name.startswith("work-record-page-"))
+        self.assertEqual(len(session_cursors), 1)
+        cursor_state = json.loads(session_cursors[0].read_text(encoding="utf-8"))
+        self.assertEqual(cursor_state["schema_version"], 4)
         self.assertTrue(cursor_state["session_no_save"])
-        self.assertNotIn("このセッション全体を保存しないでください", cursor_files[0].read_text(encoding="utf-8"))
+        self.assertNotIn("このセッション全体を保存しないでください",
+                         session_cursors[0].read_text(encoding="utf-8"))
 
     def test_session_wide_no_save_applies_to_later_turn_in_same_read_page(self):
         fixture = InstalledAdapterFixture(self, turns=0)
@@ -837,16 +842,21 @@ class WorkRecordCaptureTests(unittest.TestCase):
         manifest["skill_auto_apply"] = True
         manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
         settings = replace(fixture.settings, organizer=OrganizerSelection("READY", "ollama", None), skill_auto_apply=True)
-        root = settings.hosts["codex-cli"].hook_config_path.parent / "sessions" / "2026" / "11" / "05"
+        source_root = settings.hosts["codex-cli"].hook_config_path.parent / "sessions"
+        today = datetime.now().astimezone().date()
+        today_folder = source_root / f"{today.year:04d}" / f"{today.month:02d}" / f"{today.day:02d}"
+        yesterday = today - timedelta(days=1)
+        yesterday_folder = source_root / f"{yesterday.year:04d}" / f"{yesterday.month:02d}" / f"{yesterday.day:02d}"
         project = settings.paths.engine_root / "project"
         project.mkdir(parents=True)
-        root.mkdir(parents=True)
+        today_folder.mkdir(parents=True)
+        yesterday_folder.mkdir(parents=True)
         for index in range(64):
-            path = root / f"rollout-empty-{index:02d}.jsonl"
+            path = today_folder / f"rollout-empty-{index:02d}.jsonl"
             path.write_text(json.dumps({"type": "session_meta", "payload": {
                 "id": f"empty-{index}", "cwd": str(project), "originator": "codex_cli_rs", "source": "cli"
             }}, ensure_ascii=False) + "\n", encoding="utf-8")
-        _ordinary_session(root / "rollout-z-candidate.jsonl", project, session_id="session-last")
+        _ordinary_session(yesterday_folder / "rollout-z-candidate.jsonl", project, session_id="session-last")
         provider = WorkRecordProvider()
         patch_key_provider(self)
 
