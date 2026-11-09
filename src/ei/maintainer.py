@@ -1337,10 +1337,6 @@ def run_maintenance(
     def share(fraction):
         return int(initial_budget_ms * fraction)
 
-    # Keep early capture/recovery inside one 20% envelope.  Snapshot and pending
-    # get bounded entry windows; source recovery preserves room for closeout and
-    # GC, while unused source time flows to those later phases.
-    prequeue_budget = child_budget(effective_budget, cap_ms=share(0.20))
     maintenance_run = uuid.uuid4().hex
     moment = _utc(now)
     started_at = _iso(moment)
@@ -1363,24 +1359,49 @@ def run_maintenance(
             budget = previous_budget
         return default
 
+    # Recover queue-before-receipt handoffs before re-reading their source turn.
+    pre_capture_budget = child_budget(effective_budget, cap_ms=share(0.20))
     from .pending_capture import reconcile_pending
     from .operation_runtime import last_maintenance_activity
-    snapshot_budget = child_budget(prequeue_budget, cap_ms=share(0.02))
+    snapshot_budget = child_budget(pre_capture_budget, cap_ms=share(0.02))
     previous_activity = phase("snapshot", lambda: last_maintenance_activity(settings, now=moment, budget=budget), {}, phase_budget=snapshot_budget)
-    pending_budget = child_budget(prequeue_budget, cap_ms=share(0.03))
+    pending_budget = child_budget(pre_capture_budget, cap_ms=share(0.03))
     pending = phase("pending", lambda: reconcile_pending(settings, now=moment, budget=budget, max_records=64), {}, phase_budget=pending_budget)
+
+    # Give verified ordinary Codex work one bounded organizer opportunity
+    # before broad legacy recovery can consume its source allocation. The
+    # fixed 60s cap is the provider's existing practical minimum; the 45%
+    # downstream reserve matches the established 40% queue + 5% post-work.
+    work_capture = {"status": "disabled", "reason_code": "SAVE_CONSENT_REQUIRED", "scanned": 0, "secured": 0, "rejected": 0}
+    if getattr(settings, "skill_auto_apply", False) is True:
+        work_budget = child_budget(effective_budget, cap_ms=60_000, reserve_ms=share(0.45))
+
+        def capture_work():
+            work_provider = provider if provider is not None else _provider_for(settings, None, budget=budget)
+            from .work_record_capture import capture_work_records
+            return capture_work_records(settings, work_provider, now=moment, budget=budget)
+
+        work_capture = phase("work_record_capture", capture_work,
+            {"status": "failed", "reason_code": "WORK_RECORD_CAPTURE_FAILED", "scanned": 0, "secured": 0, "rejected": 0},
+            phase_budget=work_budget)
+        if work_capture.get("status") in {"failed", "unavailable"}:
+            errors.append({"stage": "work_record_capture", "error_code": _safe_code(work_capture.get("reason_code"), "WORK_RECORD_CAPTURE_FAILED")})
+
+    # Reconciliation after capture gets a fresh deadline, while preserving
+    # the existing 40% queue and 5% post-work reserve from the parent run.
+    post_capture_budget = child_budget(effective_budget, cap_ms=share(0.20), reserve_ms=share(0.45))
     source_count = created = skipped = parse_skipped = rejected = 0
     ingest_results_list: list[Mapping[str, Any]] = []
     closeout_reserve_ms = share(0.02)
     gc_reserve_ms = share(0.05)
-    source_budget = child_budget(prequeue_budget, reserve_ms=closeout_reserve_ms + gc_reserve_ms)
+    source_budget = child_budget(post_capture_budget, reserve_ms=closeout_reserve_ms + gc_reserve_ms)
     source_count, created, skipped, parse_skipped, rejected, rows = phase("source_recovery",
         lambda: _ingest(settings, source_paths, errors, now=moment, budget=budget, adapters=adapters), (0, 0, 0, 0, 0, ()), phase_budget=source_budget)
     ingest_results_list.extend(rows)
 
     from .closeout_association import recover_closeout_associations
     from .incidents import closeout_recovery_loss_issue
-    closeout_budget = child_budget(prequeue_budget, reserve_ms=gc_reserve_ms)
+    closeout_budget = child_budget(post_capture_budget, reserve_ms=gc_reserve_ms)
     closeout_recovery = phase("closeout_recovery", lambda: recover_closeout_associations(
         settings, now=moment, budget=budget, max_records=64),
         {"processed": 0, "results": [], "reason_code": "CLOSEOUT_RECOVERY_UNKNOWN"}, phase_budget=closeout_budget)
@@ -1431,17 +1452,18 @@ def run_maintenance(
     elif terminal_closeout_losses:
         errors.append({"stage": "closeout_recovery", "error_code": "CLOSEOUT_RECOVERY_LOSS"})
 
-    spool_gc_budget = child_budget(prequeue_budget)
+    spool_gc_budget = child_budget(post_capture_budget)
     expired = phase("spool_gc", lambda: gc_expired_spool(settings, now=moment, budget=budget), 0, phase_budget=spool_gc_budget)
 
     recovery_result = RecoveryResult(0, 0, 0, False)
     if orphan_host_id:
-        recovery_result = phase("orphan_recovery", lambda: reconcile_orphans(orphan_host_id, None, settings, budget=budget), recovery_result, phase_budget=prequeue_budget)
+        recovery_result = phase("orphan_recovery", lambda: reconcile_orphans(orphan_host_id, None, settings, budget=budget), recovery_result, phase_budget=post_capture_budget)
 
     # Queue work can use all time left after pre-queue work except the 40% post-work reserve.
     queue_budget = child_budget(budget, reserve_ms=share(0.40))
     budget = queue_budget
-    queue_result = phase("queue_drain", lambda: drain_queue(settings, provider=provider,
+    queue_result = phase("queue_drain", lambda: drain_queue(settings,
+        provider=provider if provider is not None else _provider_for(settings, None, budget=budget),
         max_items=max_queue_items, time_budget_ms=budget.remaining_ms(), now=moment,
         run_id=maintenance_run, budget=budget), QueueDrainResult("partial", 0, 0, 0, 0, 0, 0, -1, 0))
     errors.extend(queue_result.errors)
@@ -1543,6 +1565,7 @@ def run_maintenance(
 
     capture = phase("capture_summary", lambda: _capture_summary(events, budget=budget),
         {"direct_count": None, "native_count": None, "primary": "unknown", "coverage_unknown": True}) if events is not None else {"direct_count": None, "native_count": None, "primary": "unknown", "coverage_unknown": True}
+    capture["work_records"] = dict(work_capture)
     metrics = phase("metrics", lambda: _metric_summary(settings, budget=budget), {"status": "unknown", "source_status": "unknown", "error_code": "OPERATION_BUDGET_EXHAUSTED"})
     recovery_summary = recovery_result.to_dict()
     queue_mapping = queue_result.to_dict()

@@ -56,6 +56,11 @@ def _validate(observation: ObservationInput) -> bytes:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def candidate_content_hash(observation: ObservationInput) -> str:
+    """Return the pending-intent content hash without retaining candidate text."""
+    return _hash(_validate(observation))
+
+
 def _policy(settings: Settings):
     path = Path(settings.capture_policy_path)
     return pending_policy(json.loads(path.read_text(encoding="utf-8")) if path.exists() else {})
@@ -293,6 +298,70 @@ def _read_optional_queue(queue_id, settings, budget=None):
         raise
 
 
+def recover_staged_candidate(settings: Settings, capture_id: str, content_hash: str, *,
+                            now: datetime, key_provider: KeyProvider | None = None,
+                            budget=None) -> tuple[str, CaptureReceipt | None]:
+    """Recover one hash-addressed pending intent before any repeat inference.
+
+    A missing deterministic intent path is a safe retry only when both its
+    durable catalog reservation and the file are absent under the capture
+    lock. Any unknown catalog/lock/intent state defers instead.
+    """
+    budget = budget if budget is not None else OperationBudget(5000)
+    if (not isinstance(capture_id, str) or len(capture_id) != 71 or not capture_id.startswith("sha256:")
+            or any(char not in "0123456789abcdef" for char in capture_id[7:])
+            or not isinstance(content_hash, str) or len(content_hash) != 71 or not content_hash.startswith("sha256:")
+            or any(char not in "0123456789abcdef" for char in content_hash[7:])):
+        return "unconfirmed", None
+    try:
+        budget.check()
+        _iso(now)
+        root = ledger._root(settings)
+        descriptor = ledger._acquire(root, budget=budget)
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return "unconfirmed", None
+    try:
+        old = ledger.read_receipt(settings, capture_id, budget=budget)
+        if old is not None:
+            if old.state in {"SECURED", "EVALUATED_NONE"}:
+                return "secured", old
+            return "unconfirmed", old
+        intent_root = _intent_root(root)
+        entry_id = pending_id(capture_id, content_hash)
+        path = _intent_path(intent_root, entry_id, budget=budget)
+        if path.exists():
+            intent = _load(intent_root, path, budget=budget)
+            if intent["capture_id"] != capture_id or intent["content_hash"] != content_hash:
+                return "unconfirmed", None
+            if not _intent_tag(intent):
+                return "unconfirmed", None
+            if intent["queue_id"]:
+                item = _read_optional_queue(intent["queue_id"], settings, budget=budget)
+                if item is not None and item.state in {QueueState.DONE, QueueState.NO_DISCARDED}:
+                    result = _recover_terminal(settings, root, intent_root, path, intent, item, old, now, budget=budget)
+                    return ("secured", result) if result.state == "SECURED" else ("unconfirmed", result)
+            ref = SpoolRef.from_dict(intent["spool_ref"])
+            if datetime.fromisoformat(ref.expires_at.replace("Z", "+00:00")) <= now:
+                result = _expire(settings, root, intent_root, path, intent, now, budget=budget)
+                return "unconfirmed", result
+            result = _complete(settings, root, intent_root, path, intent, now, key_provider, budget=budget)
+            return ("secured", result) if result.state == "SECURED" else ("unconfirmed", result)
+        # An interrupted write records its deterministic ID before creating the
+        # intent file. Its reservation means absence has not been established.
+        reservation = _catalog(intent_root, budget).reservation(entry_id, budget=budget)
+        if reservation is not None:
+            return "unconfirmed", None
+        return "absent", None
+    except TimeoutError:
+        raise
+    except (OSError, ValueError, TypeError, RuntimeError, CatalogUnknown):
+        return "unconfirmed", None
+    finally:
+        ledger._release(root, descriptor)
+
+
 def accept_candidate(settings: Settings, identity: CaptureIdentity, observation: ObservationInput, *, now: datetime, key_provider: KeyProvider | None = None, budget=None, origin="UNKNOWN") -> CaptureReceipt:
     budget = budget if budget is not None else OperationBudget(5000)
     if budget is not None:
@@ -475,4 +544,4 @@ def reconcile_pending(settings: Settings, *, now: datetime, budget=None, max_rec
         ledger._release(root, descriptor)
 
 
-__all__ = ["accept_candidate", "reconcile_pending", "pending_id"]
+__all__ = ["accept_candidate", "reconcile_pending", "pending_id", "candidate_content_hash", "recover_staged_candidate"]
