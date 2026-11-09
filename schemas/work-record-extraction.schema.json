@@ -1,0 +1,10 @@
+{
+  "type": "object",
+  "properties": {
+    "result": {"type": "string", "enum": ["candidate", "none"]},
+    "title": {"type": "string", "maxLength": 160},
+    "claim": {"type": "string", "maxLength": 1200}
+  },
+  "required": ["result", "title", "claim"],
+  "additionalProperties": false
+}
