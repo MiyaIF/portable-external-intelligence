@@ -4209,6 +4209,25 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
     if check_only:
         return replace(check_only_setup_result(reconciliation, manifest_path=manifest_path, knowledge_stores=planned_stores), plan=result_plan, host_migrations=tuple(selected.legacy_host_migrations), knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view), scheduler=planned_scheduler, team=team_view, compatibility_notices=tuple(selected.compatibility_notices))
     if reconciliation.status == "ALREADY_CURRENT":
+        # Host/settings reconciliation does not include the runtime lock.
+        # Reuse bootstrap's lock cache even when no host changes are needed.
+        bootstrap_state = runtime / "venv-bootstrap-state.json"
+        bootstrap_before = _hash_path(bootstrap_state)
+        try:
+            python, _ = _ensure_venv(selected, python)
+        except Exception as exc:
+            code = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
+            return SetupResult(
+                False, "SETUP_BLOCKED", manifest_path,
+                errors=({"error_code": code, "stage": "runtime", "retryable": True},),
+                rollback={"status": "NOT_STARTED", "reason_codes": ["KNOWLEDGE_RETAINED_FOR_RETRY"]},
+                message="Runtime dependency update failed; existing host setup and knowledge were retained",
+                knowledge=knowledge_view, sync=_sync_view(selected, knowledge_view),
+                scheduler=planned_scheduler, team=team_view,
+                reconciliation=_reconciliation_view(reconciliation),
+                knowledge_stores=planned_stores,
+                compatibility_notices=tuple(selected.compatibility_notices),
+            )
         # Setup/update is also the explicit repair path for an owned legacy
         # scheduler definition.  The reconciliation receipt may be current
         # while the OS timer itself is stale; re-inspect and safely reconcile
@@ -4228,6 +4247,8 @@ def _setup_reconciled(selection: SetupSelection | Mapping[str, Any], check_only:
         )
         scheduler_ok = scheduler.get("ok") is True
         changed_items = [Path(str(scheduler["state_path"]))] if scheduler.get("status") == "REGISTERED" and isinstance(scheduler.get("state_path"), str) else []
+        if _hash_path(bootstrap_state) != bootstrap_before:
+            changed_items.append(bootstrap_state)
         if operation_state_created:
             changed_items.append(settings.paths.runtime_root / "automatic-operation.json")
         if new_notification_receipt is not None:
