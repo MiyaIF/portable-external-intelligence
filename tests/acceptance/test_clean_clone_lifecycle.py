@@ -113,6 +113,63 @@ class CleanCloneLifecycleTests(unittest.TestCase):
         self.assertEqual(module._lock_failure_code("requirements-runtime.lock"), "RUNTIME_LOCK_INSTALL_FAILED")
         self.assertEqual(module._lock_failure_code("requirements-ci.lock"), "CI_LOCK_INSTALL_FAILED")
 
+    def test_real_failure_keeps_safe_details_after_temporary_logs_are_deleted(self) -> None:
+        module = _load_certifier()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tests" / "unit").mkdir(parents=True)
+            (root / "tests" / "__init__.py").write_text("", encoding="utf-8")
+            (root / "tests" / "unit" / "__init__.py").write_text("", encoding="utf-8")
+            private = f"PRIVATE_KNOWLEDGE_BODY private-person@example.invalid {root}"
+            (root / "tests" / "unit" / "test_details.py").write_text(
+                "import unittest\n"
+                "class DetailsTest(unittest.TestCase):\n"
+                "    def test_failure(self):\n"
+                f"        raise ValueError({private!r})\n",
+                encoding="utf-8",
+            )
+            for args in (("init", "--quiet"), ("add", "tests")):
+                subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+            with self.assertRaises(module.CertificationError) as caught, redirect_stdout(io.StringIO()):
+                module._bounded_complete_suite(
+                    root, output=root / "summary.json", log_dir=root / "logs",
+                    python_executable=Path(sys.executable), environment=os.environ.copy(), timeout_seconds=10,
+                )
+            failure = caught.exception
+        self.assertFalse(root.exists())
+        output = io.StringIO()
+        with patch.object(module, "certify", side_effect=failure), redirect_stdout(output):
+            result = module.main(["--output", "unused.json", "--offline-fixtures"])
+        self.assertEqual(result, 1)
+        payload = json.loads(output.getvalue())
+        record = payload["diagnostics"]["modules"][0]
+        self.assertEqual(record.get("failure_details"), [
+            {"line": 4, "exception_type": "ValueError", "stage": "test", "kind": "error"},
+        ])
+        self.assertEqual(record["error_code"], "unknown")
+        for secret in ("PRIVATE_KNOWLEDGE_BODY", "private-person@example.invalid", str(root), "raise ValueError"):
+            self.assertNotIn(secret, output.getvalue())
+
+    def test_public_failure_details_reject_payload_fields_and_invalid_metadata(self) -> None:
+        module = _load_certifier()
+        good = {"line": 42, "exception_type": "AssertionError", "stage": "drain", "kind": "failure"}
+        bad = [
+            {**good, "line": value} for value in (True, 0, -1, 1_000_001, 1.5, "PRIVATE_LINE")
+        ] + [
+            {**good, "exception_type": "PRIVATE_EXCEPTION"},
+            {**good, "stage": "private-person@example.invalid"},
+            {**good, "kind": "PRIVATE_KIND"},
+        ]
+        details = [*bad, *({**good, "message": "PRIVATE_BODY", "path": "PRIVATE_PATH"} for _ in range(20))]
+        result = module._sanitize_suite_diagnostics({
+            "modules": [{"module": "tests.unit.test_case", "status": "failed",
+                         "error_code": "PRIVATE_UPPERCASE_PAYLOAD", "failure_details": details}],
+        })
+        record = result["modules"][0]
+        self.assertEqual(record.get("failure_details"), [good] * 5)
+        self.assertEqual(record["error_code"], "unknown")
+        self.assertNotIn("PRIVATE", json.dumps(result))
+
     def test_certifier_installs_the_single_built_wheel_instead_of_the_source_tree(self) -> None:
         module = _load_certifier()
         with tempfile.TemporaryDirectory() as tmp:

@@ -25,6 +25,27 @@ _STABLE_FAILURE_CODE_RE = re.compile(
 )
 _PLATFORM_SKIP_NAMES = frozenset({"PLATFORM_SKIP", "APPROVED_PLATFORM_SKIP", "__ei_platform_skip__"})
 _MAX_JOBS = 32
+_FAILURE_HEADER_RE = re.compile(r"(?m)^(FAIL|ERROR):[^\r\n]{1,512}\r?$")
+_FRAME_RE = re.compile(r'(?m)^[ \t]+File "([^"\r\n]+)", line ([0-9]{1,7}), in ([A-Za-z_][A-Za-z0-9_]*)')
+_EXCEPTION_RE = re.compile(r"(?m)^([A-Za-z_][A-Za-z0-9_.]{0,119})(?::|\r?$)")
+_EXCEPTION_TYPES = frozenset({
+    "AssertionError", "ValueError", "TypeError", "RuntimeError", "TimeoutError",
+    "FileNotFoundError", "PermissionError", "OSError", "ImportError", "ModuleNotFoundError",
+    "UnicodeDecodeError", "UnicodeEncodeError", "KeyError", "IndexError", "AttributeError",
+    "NameError", "ZeroDivisionError", "RecursionError", "MemoryError", "OverflowError",
+    "SystemExit", "OtherError",
+})
+_FAILURE_STAGES = frozenset({"test", "setup", "teardown", "capture", "drain", "recall"})
+_STAGE_MARKERS = {
+    "capture": "capture", "multi_cli_captures": "capture", "drain": "drain",
+    **{name: "recall" for name in (
+        "universal", "family", "family_other_host", "host", "host_other_host",
+        "family_after_outage", "family_after_host_removal", "family_after_restore",
+        "host_after_restore_other_host", "team_recall",
+    )},
+}
+_FRAME_STAGES = {"setUp": "setup", "setUpClass": "setup", "tearDown": "teardown",
+                 "tearDownClass": "teardown", "_capture": "capture", "_recall": "recall"}
 
 
 class TestRunnerError(ValueError):
@@ -48,6 +69,7 @@ class TestModuleResult:
     duration_seconds: float
     log_path: str
     error_code: str | None = None
+    failure_details: tuple[dict[str, object], ...] = ()
 
     def to_dict(self, *, repo_root: Path | None = None) -> dict[str, object]:
         log_path = Path(self.log_path)
@@ -58,7 +80,7 @@ class TestModuleResult:
                 log_value = log_path.name
         else:
             log_value = str(log_path)
-        return {
+        value: dict[str, object] = {
             "module": self.module_name,
             "relative_path": self.relative_path,
             "status": self.status,
@@ -69,6 +91,9 @@ class TestModuleResult:
             "log_path": log_value,
             "error_code": self.error_code,
         }
+        if self.failure_details:
+            value["failure_details"] = sanitize_failure_details(self.failure_details)
+        return value
 
 
 @dataclass(frozen=True)
@@ -234,6 +259,67 @@ def _stable_failure_code(output: bytes) -> str | None:
     return "TEST_ASSERTION_FAILED" + case_suffix
 
 
+def sanitize_failure_details(value: object) -> list[dict[str, object]]:
+    """Keep only bounded location metadata and fixed vocabulary, never messages."""
+    result: list[dict[str, object]] = []
+    if not isinstance(value, (list, tuple)):
+        return result
+    for item in value[:100]:
+        if not isinstance(item, Mapping):
+            continue
+        line = item.get("line")
+        exception = item.get("exception_type")
+        stage = item.get("stage")
+        kind = item.get("kind")
+        if (
+            type(line) is not int or not 1 <= line <= 1_000_000
+            or not isinstance(exception, str) or exception not in _EXCEPTION_TYPES
+            or not isinstance(stage, str) or stage not in _FAILURE_STAGES
+            or not isinstance(kind, str) or kind not in {"failure", "error"}
+        ):
+            continue
+        result.append({"line": line, "exception_type": exception, "stage": stage, "kind": kind})
+        if len(result) == 5:
+            break
+    return result
+
+
+def _failure_details(output: bytes, source_path: Path) -> tuple[dict[str, object], ...]:
+    # Parse only unittest's bounded failure sections. Source text and raw paths
+    # are used for validation, never copied to the public diagnostic record.
+    text = output[-256 * 1024:].decode("utf-8", "replace")
+    try:
+        line_count = len(source_path.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeError):
+        return ()
+    expected_path = os.path.normcase(os.path.abspath(source_path))
+    headers = list(_FAILURE_HEADER_RE.finditer(text))
+    result: list[dict[str, object]] = []
+    for index, header in enumerate(headers[:5]):
+        end = headers[index + 1].start() if index + 1 < len(headers) else len(text)
+        body = text[header.end():end]
+        frames = list(_FRAME_RE.finditer(body))
+        own_frames = [frame for frame in frames if os.path.normcase(os.path.abspath(frame[1])) == expected_path]
+        if not own_frames:
+            continue
+        frame = own_frames[-1]
+        line = int(frame[2])
+        if not 1 <= line <= line_count:
+            continue
+        exception_match = _EXCEPTION_RE.search(body, frames[-1].end())
+        exception = exception_match[1] if exception_match else "OtherError"
+        if exception not in _EXCEPTION_TYPES:
+            exception = "OtherError"
+        stage = _FRAME_STAGES.get(frame[3], "test")
+        if exception_match:
+            marker = re.search(r"\bstage=([a-z_]{1,60})(?:[;\s]|$)", body[exception_match.end():])
+            if marker:
+                stage = _STAGE_MARKERS.get(marker[1], stage)
+        result.append({"line": line, "exception_type": exception, "stage": stage,
+                       "kind": "failure" if header[1] == "FAIL" else "error"})
+    return tuple(sanitize_failure_details(result))
+
+
 def _environment(repo_root: Path, base_environment: Mapping[str, str] | None = None) -> dict[str, str]:
     env = dict(base_environment) if base_environment is not None else os.environ.copy()
     env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -323,7 +409,8 @@ def run_test_module(
         error_code = _stable_failure_code(stdout + b"\n" + stderr) or "TEST_ASSERTION_FAILED"
     else:
         status, error_code = "crashed", "TEST_CHILD_CRASHED"
-    return TestModuleResult(module.module_name, module.relative_path, status, returncode, tests_run, tests_skipped, duration, str(log_path), error_code)
+    details = _failure_details(stderr, source_path) if status == "failed" else ()
+    return TestModuleResult(module.module_name, module.relative_path, status, returncode, tests_run, tests_skipped, duration, str(log_path), error_code, details)
 
 
 def _atomic_write_json(path: Path, value: dict[str, object]) -> None:

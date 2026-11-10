@@ -170,6 +170,92 @@ class TestRunnerTests(unittest.TestCase):
             with self.subTest(output_prefix=output[:32]):
                 self.assertEqual(test_runner._stable_failure_code(output), "TEST_ASSERTION_FAILED")
 
+    def test_failure_details_keep_test_line_type_and_stage_without_payload(self) -> None:
+        root = self._module_root()
+        relative = "tests/test_details.py"
+        private = "private-person@example.invalid PRIVATE_KNOWLEDGE_BODY"
+        (root / relative).write_text(
+            "import unittest\n"
+            "class DetailsTest(unittest.TestCase):\n"
+            "    def _capture(self):\n"
+            f"        self.fail('stage=capture; ' + {private!r})\n"
+            "    def test_a_assertion(self):\n"
+            "        self._capture()\n"
+            "    def test_b_exception(self):\n"
+            f"        raise ValueError({private!r})\n",
+            encoding="utf-8",
+        )
+        result = run_test_module(
+            TestModule("tests.test_details", relative), root,
+            timeout_seconds=10, python_executable=Path(sys.executable), log_dir=root / "logs",
+        )
+        details = result.to_dict().get("failure_details")
+        self.assertCountEqual(details, [
+            {"line": 4, "exception_type": "AssertionError", "stage": "capture", "kind": "failure"},
+            {"line": 8, "exception_type": "ValueError", "stage": "test", "kind": "error"},
+        ])
+        self.assertNotIn(private, json.dumps(details))
+        self.assertNotIn(str(root), json.dumps(details))
+
+    def test_failure_details_bound_unknown_exceptions_and_private_stage(self) -> None:
+        root = self._module_root()
+        relative = "tests/test_unknown_details.py"
+        (root / relative).write_text(
+            "import unittest\n"
+            "class PRIVATE_KNOWLEDGE_ERROR(Exception): pass\n"
+            "class DetailsTest(unittest.TestCase):\n"
+            "    def test_unknown(self):\n"
+            "        raise PRIVATE_KNOWLEDGE_ERROR('stage=private_person; PRIVATE_BODY')\n",
+            encoding="utf-8",
+        )
+        result = run_test_module(
+            TestModule("tests.test_unknown_details", relative), root,
+            timeout_seconds=10, python_executable=Path(sys.executable), log_dir=root / "logs",
+        )
+        self.assertEqual(result.to_dict().get("failure_details"), [
+            {"line": 5, "exception_type": "OtherError", "stage": "test", "kind": "error"},
+        ])
+
+    def test_success_does_not_report_traceback_shaped_stdout_as_failure(self) -> None:
+        root = self._module_root()
+        relative = "tests/test_success_details.py"
+        (root / relative).write_text(
+            "import unittest\n"
+            "class DetailsTest(unittest.TestCase):\n"
+            "    def test_success(self):\n"
+            "        print('FAIL: test_fake (tests.test_fake)\\nAssertionError: PRIVATE_BODY')\n",
+            encoding="utf-8",
+        )
+        result = run_test_module(
+            TestModule("tests.test_success_details", relative), root,
+            timeout_seconds=10, python_executable=Path(sys.executable), log_dir=root / "logs",
+        )
+        self.assertEqual(result.status, "passed")
+        self.assertFalse(result.to_dict().get("failure_details"))
+
+    def test_failure_details_reject_foreign_locations_and_bound_multiple_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "test_case.py"
+            source.write_text("# fixture\n" * 5, encoding="utf-8")
+
+            def failure(path: Path, line: int) -> bytes:
+                return (
+                    "FAIL: test_case (tests.unit.test_case)\n"
+                    "Traceback (most recent call last):\n"
+                    f'  File "{path}", line {line}, in test_case\n'
+                    "    PRIVATE_SOURCE_BODY\n"
+                    "AssertionError: stage=private_person; PRIVATE_KNOWLEDGE_BODY\n"
+                ).encode("utf-8")
+
+            for path, line in ((source.parent / "private.py", 3), (source, 0), (source, 6), (source, 1_000_001)):
+                self.assertEqual(test_runner._failure_details(failure(path, line), source), ())
+            details = test_runner._failure_details(failure(source, 3) * 10, source)
+            self.assertEqual(list(details), [
+                {"line": 3, "exception_type": "AssertionError", "stage": "test", "kind": "failure"},
+            ] * 5)
+            self.assertNotIn("PRIVATE", json.dumps(details))
+            self.assertNotIn(str(source), json.dumps(details))
+
     def test_missing_dependency_reason_includes_only_the_safe_test_case_name(self) -> None:
         root = self._module_root()
         relative = "tests/test_missing.py"

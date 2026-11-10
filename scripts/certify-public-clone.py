@@ -41,7 +41,7 @@ from ei.safe_fs import (  # noqa: E402
     safe_replace,
     safe_unlink,
 )
-from ei.test_runner import TestRunnerError, discover_test_modules, run_complete_suite  # noqa: E402
+from ei.test_runner import TestRunnerError, discover_test_modules, run_complete_suite, sanitize_failure_details  # noqa: E402
 
 
 RECEIPT_TYPE = "public_clone_certification"
@@ -52,6 +52,11 @@ _SAFE_CODE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,120}$")
 _SAFE_IMAGE_RE = re.compile(r"^[A-Za-z0-9_.:/-]{1,120}$")
 _SAFE_TEST_MODULE_RE = re.compile(r"^tests(?:\.[A-Za-z_][A-Za-z0-9_]*){2,20}$")
 _FAILURE_STATUSES = frozenset({"failed", "crashed", "timed_out", "missing", "zero_test"})
+_PUBLIC_TEST_FAILURE_CODES = (
+    "TEST_ASSERTION_FAILED", "TEST_DEPENDENCY_MISSING", "TEST_TEXT_ENCODING_FAILED",
+    "TEST_CHILD_TIMEOUT", "TEST_CHILD_CRASHED", "TEST_CHILD_START_FAILED",
+    "TEST_MODULE_MISSING", "TEST_MODULE_ZERO_TESTS",
+)
 _LOCK_FAILURE_CODES = {
     "requirements-build.lock": "BUILD_LOCK_INSTALL_FAILED",
     "requirements-runtime.lock": "RUNTIME_LOCK_INSTALL_FAILED",
@@ -97,7 +102,7 @@ def _sanitize_suite_diagnostics(value: Mapping[str, Any]) -> dict[str, Any]:
             raw = raw_counts.get(key, 0)
             if type(raw) is int and 0 <= raw <= 1_000_000:
                 counts[key] = raw
-    modules: list[dict[str, str]] = []
+    modules: list[dict[str, Any]] = []
     raw_modules = value.get("modules", [])
     if isinstance(raw_modules, list):
         for item in raw_modules:
@@ -110,8 +115,15 @@ def _sanitize_suite_diagnostics(value: Mapping[str, Any]) -> dict[str, Any]:
                 continue
             if not isinstance(status, str) or not _SAFE_CODE_RE.fullmatch(status):
                 continue
-            safe_error = error_code if isinstance(error_code, str) and _SAFE_CODE_RE.fullmatch(error_code) else "unknown"
-            modules.append({"module": module, "status": status, "error_code": safe_error})
+            # Message-derived uppercase strings can still contain private data.
+            # Keep the runner category, not arbitrary reasons or case suffixes.
+            safe_error = next((code for code in _PUBLIC_TEST_FAILURE_CODES
+                               if isinstance(error_code, str) and (error_code == code or error_code.startswith(code + "_TEST_"))), "unknown")
+            record: dict[str, Any] = {"module": module, "status": status, "error_code": safe_error}
+            details = sanitize_failure_details(item.get("failure_details"))
+            if details:
+                record["failure_details"] = details
+            modules.append(record)
             if len(modules) >= 50:
                 break
     result: dict[str, Any] = {}
